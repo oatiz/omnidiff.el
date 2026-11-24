@@ -37,7 +37,6 @@
 (require 'omnidiff-image)
 
 (declare-function nxml-mode "nxml-mode" ())
-(declare-function xml-mode "nxml-mode" ())
 (declare-function omnidiff-toggle-fold "omnidiff" ())
 (declare-function omnidiff-jump-to-source "omnidiff" ())
 
@@ -45,6 +44,7 @@
 (defvar enable-dir-local-variables)
 (defvar rng-nxml-auto-validate-flag)
 (defvar font-lock-mode-hook)
+(defvar omnidiff-default-preset)
 
 ;;; Customization & buffer-local state
 
@@ -119,10 +119,12 @@ When nil, uses the buffer's `tab-width'."
 (defvar-local omnidiff--command nil)
 (defvar-local omnidiff--repo-dir nil)
 (defvar-local omnidiff--label nil)
-(defvar-local omnidiff--preset 'default)
+(defvar-local omnidiff--preset nil)
 (defvar-local omnidiff--layout nil)
 (defvar-local omnidiff--highlight-style nil)
 (defvar-local omnidiff--file-count 0)
+(defvar-local omnidiff--last-sbs-width nil
+  "Last window body width used to render `side-by-side' layout.")
 (defvar-local omnidiff--reviewed-files nil
   "Hash table mapping reviewed file target paths to content signatures.")
 
@@ -145,11 +147,26 @@ When nil, uses the buffer's `tab-width'."
   "Return the active highlight style for the current Overview buffer."
   (or omnidiff--highlight-style omnidiff-overview-highlight-style))
 
-(defvar omnidiff-render--style-cache nil
-  "Per-render cache mapping `(OP . MOVED-P)' to `omnidiff-op-style'.")
+(define-hash-table-test 'omnidiff-render--props-equal
+                        #'equal-including-properties
+                        #'sxhash-equal-including-properties)
+
+(defvar omnidiff-render--pixel-width-cache nil
+  "Per-render cache mapping propertized strings to `string-pixel-width'.")
 
 (defvar omnidiff-render--sbs-metrics-cache nil
   "Per-render cache mapping NUM-WIDTH to `omnidiff-render--sbs-metrics'.")
+
+(defun omnidiff-render-call-with-batch-caches (fn)
+  "Invoke FN with shared SBS metrics and pixel-width caches dynamically bound.
+Reuses already-active caches when nested."
+  (let ((omnidiff-render--sbs-metrics-cache
+         (or omnidiff-render--sbs-metrics-cache
+             (make-hash-table :test #'eql :size 4)))
+        (omnidiff-render--pixel-width-cache
+         (or omnidiff-render--pixel-width-cache
+             (make-hash-table :test 'omnidiff-render--props-equal :size 64))))
+    (funcall fn)))
 
 (defvar omnidiff-render--hints-cache nil
   "Cached `(KEY HINTS . HINTS-PX)' for `omnidiff-render-header-line'.")
@@ -157,9 +174,8 @@ When nil, uses the buffer's `tab-width'."
 ;;; Internal render structures
 
 (cl-defstruct (omnidiff-op-style (:copier nil))
-  "Face and gutter decoration bundle for a diff operation."
-  gutter-face rail-face rail-char sign-str rail-sign-str cont-rail-str
-  line-face newline-str refine-face)
+  "Static gutter face and rail strings for a diff operation."
+  gutter-face rail-sign-str cont-rail-str)
 
 (cl-defstruct (omnidiff-header-span (:copier nil))
   "Buffer region and disclosure overlay of a rendered hunk header."
@@ -167,12 +183,29 @@ When nil, uses the buffer's `tab-width'."
 
 ;;; Shared formatting primitives
 
-(defun omnidiff-render--right-align-px (str extra-px)
-  "Compute pixel width of STR plus EXTRA-PX padding for `:align-to'."
-  (+ (if (fboundp 'string-pixel-width)
-         (string-pixel-width str)
-       (* (length str) (frame-char-width)))
-     extra-px))
+(defun omnidiff-render--string-pixel-width (str)
+  "Return `string-pixel-width' of STR, using the per-render cache when active."
+  (if omnidiff-render--pixel-width-cache
+      (or (gethash str omnidiff-render--pixel-width-cache)
+          (puthash str (string-pixel-width str)
+                   omnidiff-render--pixel-width-cache))
+    (string-pixel-width str)))
+
+(defun omnidiff-render--right-margin-units (extra-px &optional frame)
+  "Return right-edge padding in display units for GUI pixel padding EXTRA-PX.
+On graphic displays returns EXTRA-PX directly; on TTY displays converts
+EXTRA-PX to a compact column margin (minimum 1 when EXTRA-PX > 0)."
+  (cond
+   ((<= extra-px 0) 0)
+   ((display-graphic-p frame) extra-px)
+   (t (max 1 (/ (+ extra-px 7) 8)))))
+
+(defun omnidiff-render--right-align-px (str extra-px &optional frame)
+  "Compute right-alignment offset for STR plus EXTRA-PX padding for `:align-to'.
+In GUI FRAME both width and EXTRA-PX are pixels; in TTY FRAME
+`string-pixel-width' returns columns and EXTRA-PX is scaled to columns."
+  (+ (omnidiff-render--string-pixel-width str)
+     (omnidiff-render--right-margin-units extra-px frame)))
 
 (defun omnidiff-render--format-range (start-line end-line)
   "Format hunk line range label from START-LINE and END-LINE."
@@ -189,58 +222,46 @@ When nil, uses the buffer's `tab-width'."
       (length str)
     (string-width str)))
 
-(defun omnidiff-render--make-op-style (op moved-p)
-  "Construct an `omnidiff-op-style' for diff operation OP and MOVED-P."
-  (let* ((gutter-face (cl-ecase op
-                        (insert 'omnidiff-lineno-added)
-                        (delete 'omnidiff-lineno-removed)
-                        (update 'omnidiff-lineno-changed)
-                        (move 'omnidiff-lineno-moved)
-                        (context 'omnidiff-lineno)))
-         (rail-face (if (and moved-p (not (eq op 'move)))
-                        (list 'omnidiff-moved-indicator gutter-face)
-                      gutter-face))
-         (rail-char (if (or moved-p (not (eq op 'context))) "┃" "│"))
-         (sign-str (cl-ecase op
-                     (insert " + ")
-                     (delete " - ")
-                     (update " ~ ")
-                     (move " > ")
-                     (context "   ")))
-         (line-face (cl-ecase op
-                      (insert 'omnidiff-added)
-                      (delete 'omnidiff-removed)
-                      (update 'omnidiff-changed)
-                      (move 'omnidiff-moved)
-                      (context 'default)))
-         (refine-face (cl-ecase op
-                        (insert 'omnidiff-added-refine)
-                        (delete 'omnidiff-removed-refine)
-                        (update 'omnidiff-changed-refine)
-                        ((move context) nil))))
-    (make-omnidiff-op-style
-     :gutter-face gutter-face
-     :rail-face rail-face
-     :rail-char rail-char
-     :sign-str sign-str
-     :rail-sign-str (concat (propertize rail-char 'face rail-face)
-                            (propertize sign-str 'face gutter-face))
-     :cont-rail-str (concat (propertize rail-char 'face rail-face)
-                            (propertize "   " 'face gutter-face))
-     :line-face line-face
-     :newline-str (if (eq line-face 'default)
-                      "\n"
-                    (propertize "\n" 'face line-face))
-     :refine-face refine-face)))
+(defconst omnidiff-render--op-styles
+  (cl-flet ((mk (op moved-p)
+              (let* ((gutter-face (cl-ecase op
+                                    (insert 'omnidiff-lineno-added)
+                                    (delete 'omnidiff-lineno-removed)
+                                    (update 'omnidiff-lineno-changed)
+                                    (move 'omnidiff-lineno-moved)
+                                    (context 'omnidiff-lineno)))
+                     (rail-face (if (and moved-p (not (eq op 'move)))
+                                    (list 'omnidiff-moved-indicator gutter-face)
+                                  gutter-face))
+                     (rail-char (if (or moved-p (not (eq op 'context))) "┃" "│"))
+                     (sign-str (cl-ecase op
+                                 (insert " + ")
+                                 (delete " - ")
+                                 (update " ~ ")
+                                 (move " > ")
+                                 (context "   "))))
+                (make-omnidiff-op-style
+                 :gutter-face gutter-face
+                 :rail-sign-str (concat (propertize rail-char 'face rail-face)
+                                        (propertize sign-str 'face gutter-face))
+                 :cont-rail-str (concat (propertize rail-char 'face rail-face)
+                                        (propertize "   " 'face gutter-face))))))
+    (vector
+     ;; Index 0..4: moved-p = nil; index 5..9: moved-p = t.
+     (mk 'insert nil) (mk 'delete nil) (mk 'update nil) (mk 'move nil) (mk 'context nil)
+     (mk 'insert t)   (mk 'delete t)   (mk 'update t)   (mk 'move t)   (mk 'context t)))
+  "Static table of the 10 `(OP, MOVED-P)' `omnidiff-op-style' entries.")
 
-(defun omnidiff-render--op-style (op moved-p)
-  "Return a cached `omnidiff-op-style' for OP and MOVED-P."
-  (let ((key (cons op (and moved-p t))))
-    (if omnidiff-render--style-cache
-        (or (gethash key omnidiff-render--style-cache)
-            (puthash key (omnidiff-render--make-op-style op moved-p)
-                     omnidiff-render--style-cache))
-      (omnidiff-render--make-op-style op moved-p))))
+(defsubst omnidiff-render--op-style (op moved-p)
+  "Return the static `omnidiff-op-style' for OP and MOVED-P."
+  (aref omnidiff-render--op-styles
+        (+ (if moved-p 5 0)
+           (cl-ecase op
+             (insert 0)
+             (delete 1)
+             (update 2)
+             (move 3)
+             (context 4)))))
 
 (defun omnidiff-render--insert-preamble (preamble)
   "Insert formatted commit metadata PREAMBLE for `git show'."
@@ -302,29 +323,6 @@ When nil, uses the buffer's `tab-width'."
     map)
   "Keymap allowing mouse clicks to drill down into container members.")
 
-(defun omnidiff-render--truncate-single-path (path max-cols)
-  "Truncate single PATH to at most MAX-COLS columns, keeping trailing segments."
-  (let ((w (omnidiff-render--display-width path)))
-    (cond
-     ((or (<= max-cols 0) (<= w max-cols)) path)
-     ((<= max-cols 4) (truncate-string-to-width path max-cols nil nil "…"))
-     ((string-search "/" path)
-      (let* ((parts (split-string path "/"))
-             (tail (car (last parts)))
-             (rest (nreverse (butlast parts)))
-             (acc tail))
-        (while (and rest
-                    (<= (+ 2 (omnidiff-render--display-width (car rest))
-                           1 (omnidiff-render--display-width acc))
-                        max-cols))
-          (setq acc (concat (pop rest) "/" acc)))
-        (let ((cand (concat "…/" acc)))
-          (if (<= (omnidiff-render--display-width cand) max-cols)
-              cand
-            (truncate-string-to-width cand max-cols nil nil "…")))))
-     (t
-      (truncate-string-to-width path max-cols nil nil "…")))))
-
 (defun omnidiff-render--truncate-path (path max-cols)
   "Truncate PATH (including `old → new' renames) to at most MAX-COLS columns."
   (let ((w (omnidiff-render--display-width path)))
@@ -338,11 +336,11 @@ When nil, uses the buffer's `tab-width'."
              (rhs-budget (min (omnidiff-render--display-width rhs)
                               (max 4 (/ (* avail 3) 5))))
              (lhs-budget (max 4 (- avail rhs-budget))))
-        (concat (omnidiff-render--truncate-single-path lhs lhs-budget)
+        (concat (omnidiff-engine-truncate-path lhs lhs-budget)
                 " → "
-                (omnidiff-render--truncate-single-path rhs rhs-budget))))
+                (omnidiff-engine-truncate-path rhs rhs-budget))))
      (t
-      (omnidiff-render--truncate-single-path path max-cols)))))
+      (omnidiff-engine-truncate-path path max-cols)))))
 
 
 ;;; Hunk chrome
@@ -415,20 +413,15 @@ Return an `omnidiff-header-span'."
                                'help-echo "Click or press TAB to fold/unfold hunk"
                                'keymap omnidiff-render--fold-header-map))))
 
-(defun omnidiff-render--insert-side-label (side num-width &optional scope-item)
+(defun omnidiff-render--insert-side-label (side num-width)
   "Insert a full-width BEFORE or AFTER sub-header for SIDE.
-Aligns with the code column past NUM-WIDTH gutter and optional SCOPE-ITEM."
+Aligns with the code column past the NUM-WIDTH gutter."
   (let ((label (cl-ecase side (before " BEFORE ") (after " AFTER  ")))
         (face (cl-ecase side (before 'omnidiff-side-before) (after 'omnidiff-side-after)))
         (pad (make-string (+ num-width 6) ?\s)))
     (insert (propertize pad 'face 'omnidiff-side-bar)
-            (propertize label 'face face))
-    (when scope-item
-      (insert (propertize (format "  @ %d: %s"
-                                  (omnidiff-scope-item-line scope-item)
-                                  (omnidiff-scope-item-text scope-item))
-                          'face 'omnidiff-side-bar)))
-    (insert (propertize "\n" 'face 'omnidiff-side-bar))))
+            (propertize label 'face face)
+            (propertize "\n" 'face 'omnidiff-side-bar))))
 
 ;;; Side-by-side layout
 
@@ -447,14 +440,15 @@ Aligns with the code column past NUM-WIDTH gutter and optional SCOPE-ITEM."
              (frame (if win (window-frame win) (selected-frame)))
              (win-w (or (and win (window-body-width win)) 140))
              (gutter-w (+ num-width 6))
-             (gui-p (and (display-graphic-p frame) (fboundp 'string-pixel-width)))
+             (gui-p (display-graphic-p frame))
              (char-w (max 1 (frame-char-width frame)))
              (left-gutter-px (when gui-p
-                               (string-pixel-width
+                               (omnidiff-render--string-pixel-width
                                 (propertize (make-string gutter-w ?\s)
                                             'face 'omnidiff-lineno))))
              (div-px (when gui-p
-                       (string-pixel-width (propertize " │ " 'face 'omnidiff-lineno))))
+                       (omnidiff-render--string-pixel-width
+                        (propertize " │ " 'face 'omnidiff-lineno))))
              (win-px (when (and gui-p win)
                        (window-body-width win t)))
              (code-w (if (and gui-p win-px)
@@ -508,13 +502,13 @@ Aligns with the code column past NUM-WIDTH gutter and optional SCOPE-ITEM."
   (moved 0 :type integer)
   (rows nil :type list))
 
-(cl-defstruct (omnidiff-json-side-index (:copier nil))
-  "Per-row hunk metadata indexed over one side of a JSON diff."
-  (row-spans nil)
-  (row-ops nil)
-  (row-moved nil)
-  (row-move-ref nil)
-  (row-ref-line nil))
+(cl-defstruct (omnidiff-json-row-meta (:copier nil))
+  "Per-row hunk metadata for a single changed row on one JSON diff side."
+  (op nil :type symbol)
+  (moved nil :type boolean)
+  (spans nil :type list)
+  (move-ref nil)
+  (ref-line nil))
 
 (cl-defstruct (omnidiff-json-render-plan (:copier nil))
   "Precomputed JSON overview hunks and aggregate counts for one file."
@@ -524,24 +518,6 @@ Aligns with the code column past NUM-WIDTH gutter and optional SCOPE-ITEM."
   (updated 0 :type integer)
   (moved 0 :type integer)
   (max-line 0 :type integer))
-
-(defun omnidiff-render--op-priority (op)
-  "Return precedence rank for diff operation OP (higher wins)."
-  (pcase op
-    ('update 3)
-    ('insert 2)
-    ('delete 2)
-    ('move 1)
-    (_ 0)))
-
-(defun omnidiff-render--token-face (op)
-  "Return semantic token face for diff operation OP."
-  (pcase op
-    ('insert 'omnidiff-token-insert)
-    ('delete 'omnidiff-token-delete)
-    ('update 'omnidiff-token-update)
-    ('move 'omnidiff-token-move)
-    (_ 'omnidiff-token-update)))
 
 (defun omnidiff-render--traditional-refine-face (op)
   "Return traditional inline refine face for diff operation OP."
@@ -564,7 +540,7 @@ In `token' style, or for `context' lines, always returns `default' so no
       (update 'omnidiff-changed)
       (move 'omnidiff-moved))))
 
-(defun omnidiff-render--split-source-lines (source)
+(defun omnidiff-render-split-source-lines (source)
   "Split decoded SOURCE string into a vector of logical 0-based lines.
 Empty SOURCE yields an empty vector `[]'; a single trailing newline is
 treated as a line terminator rather than a phantom empty final line."
@@ -574,6 +550,95 @@ treated as a line terminator rather than a phantom empty final line."
                        (substring source 0 -1)
                      source)))
       (vconcat (split-string trimmed "\n")))))
+
+(defun omnidiff-render--source-line-count (source)
+  "Return the number of logical lines in SOURCE without splitting."
+  (if (or (null source) (string-empty-p source))
+      0
+    (let ((len (length source))
+          (count 0)
+          (pos 0))
+      (while (setq pos (string-search "\n" source pos))
+        (setq count (1+ count)
+              pos (1+ pos)))
+      (if (eq (aref source (1- len)) ?\n)
+          count
+        (1+ count)))))
+
+(defun omnidiff-render--side-row-counts (hunks &optional num-rows)
+  "Return `(INS DEL UPD MOV MAX-LINE)' for JSON HUNKS clamped to NUM-ROWS."
+  (cond
+   ((or (null hunks) (and num-rows (<= num-rows 0)))
+    (list 0 0 0 0 0))
+   ((null (cdr hunks))
+    ;; O(1) fast path for single-hunk sides (e.g. newly added/deleted files).
+    (let* ((h (car hunks))
+           (op (omnidiff-json-hunk-operation h))
+           (rng (omnidiff-json-hunk-range h))
+           (sr (omnidiff-json-range-start-row rng))
+           (last (omnidiff-engine-range-last-row rng num-rows)))
+      (if (null last)
+          (list 0 0 0 0 0)
+        (let ((cnt (1+ (- last sr)))
+              (max-ln (1+ last)))
+          (pcase op
+            ('insert (list cnt 0 0 0 max-ln))
+            ('delete (list 0 cnt 0 0 max-ln))
+            ('update (list 0 0 cnt 0 max-ln))
+            ('move   (list 0 0 0 cnt max-ln))
+            (_       (list 0 0 0 0 max-ln)))))))
+   (t
+    (let ((ops (make-hash-table :test #'eql :size (max 16 (* 2 (length hunks)))))
+          (moved (make-hash-table :test #'eql :size 16))
+          (max-r -1)
+          (ins 0) (del 0) (upd 0))
+      (dolist (h hunks)
+        (let* ((op (omnidiff-json-hunk-operation h))
+               (prio (omnidiff-theme-op-priority op))
+               (rng (omnidiff-json-hunk-range h))
+               (sr (omnidiff-json-range-start-row rng))
+               (last (omnidiff-engine-range-last-row rng num-rows)))
+          (when last
+            (when (> last max-r) (setq max-r last))
+            (let ((r sr))
+              (while (<= r last)
+                (let ((cur (gethash r ops)))
+                  (when (or (null cur) (> prio (omnidiff-theme-op-priority cur)))
+                    (puthash r op ops)))
+                (when (eq op 'move)
+                  (puthash r t moved))
+                (setq r (1+ r)))))))
+      (maphash (lambda (_r op)
+                 (pcase op
+                   ('insert (setq ins (1+ ins)))
+                   ('delete (setq del (1+ del)))
+                   ('update (setq upd (1+ upd)))))
+               ops)
+      (list ins del upd (hash-table-count moved) (if (>= max-r 0) (1+ max-r) 0))))))
+
+(defun omnidiff-render-compute-json-file-stats (json-diff &optional before-lines after-lines)
+  "Return file-level line stat plist for JSON-DIFF.
+The returned plist has keys `:added', `:removed', `:updated', `:moved',
+and `:max-line'.  Optional BEFORE-LINES and AFTER-LINES are integer line
+counts used to clamp hunk ranges and bound `:max-line'; when nil, ranges
+are counted unclamped and `:max-line' reflects the highest hunk line."
+  (if (null json-diff)
+      (list :added 0 :removed 0 :updated 0 :moved 0
+            :max-line (max (or before-lines 0) (or after-lines 0)))
+    (let* ((b-side (omnidiff-json-diff-before json-diff))
+           (a-side (omnidiff-json-diff-after json-diff))
+           (bc (omnidiff-render--side-row-counts
+                (and b-side (omnidiff-json-side-hunks b-side)) before-lines))
+           (ac (omnidiff-render--side-row-counts
+                (and a-side (omnidiff-json-side-hunks a-side)) after-lines)))
+      (list :added (+ (nth 0 bc) (nth 0 ac))
+            :removed (+ (nth 1 bc) (nth 1 ac))
+            :updated (max (nth 2 bc) (nth 2 ac))
+            :moved (max (nth 3 bc) (nth 3 ac))
+            :max-line (max (or before-lines 0)
+                           (or after-lines 0)
+                           (nth 4 bc)
+                           (nth 4 ac))))))
 
 (defun omnidiff-render--extract-face-only-line (beg end)
   "Return buffer text from BEG to END retaining only `face' properties."
@@ -590,86 +655,110 @@ treated as a line terminator rather than a phantom empty final line."
         (setq pos next)))
     str))
 
-(defun omnidiff-render--fontify-lines (source path-hint)
-  "Fontify SOURCE using PATH-HINT's major mode and return a line vector.
-Each line retains only `face' text properties so foreign mode keymaps,
-invisibility, and display properties never leak into Overview buffers.
-Falls back to plain lines when `omnidiff-overview-syntax-highlight' is
-nil, SOURCE is empty or exceeds `omnidiff-syntax-highlight-max-bytes', or
-PATH-HINT resolves to a binary, viewer, or fundamental major mode."
+(defun omnidiff-render--fontify-lines (source path-hint &optional needed-rows)
+  "Fontify SOURCE using PATH-HINT's major mode.
+When NEEDED-ROWS is nil, return a vector of all lines retaining only `face'
+text properties (falling back to `omnidiff-render-split-source-lines').
+When NEEDED-ROWS is a non-empty sorted list of 0-based row indices, fontify
+only through the last needed row and return an `eql' hash table mapping
+each requested row index to its face-propertized string, or nil when
+highlighting is skipped (so the caller falls back to raw lines)."
   (cond
    ((or (null source) (string-empty-p source))
-    [])
+    (if needed-rows nil []))
    ((or (not omnidiff-overview-syntax-highlight)
         (> (string-bytes source) omnidiff-syntax-highlight-max-bytes)
         (null path-hint)
         (not (stringp path-hint))
         (string-empty-p path-hint)
         (string= path-hint "/dev/null"))
-    (omnidiff-render--split-source-lines source))
+    (if needed-rows nil (omnidiff-render-split-source-lines source)))
    (t
-    (with-temp-buffer
-      (let ((change-major-mode-hook nil)
-            (font-lock-mode-hook nil))
-        (insert source)
-        (goto-char (point-min))
-        (let* ((safe-hint (if (string-prefix-p "~" path-hint)
-                              (concat "./" path-hint)
-                            path-hint))
-               (buffer-file-name (expand-file-name safe-hint))
-               (enable-local-variables nil)
-               (enable-dir-local-variables nil)
-               (rng-nxml-auto-validate-flag nil)
-               (inhibit-message t)
-               (message-log-max nil))
-          (ignore-errors
-            (delay-mode-hooks
-              (if (let ((case-fold-search t))
-                    (string-match-p "\\.svgz?\\'" path-hint))
-                  (if (fboundp 'nxml-mode) (nxml-mode) (xml-mode))
-                (set-auto-mode t))))
-          (setq delayed-mode-hooks nil))
-        (if (or (eq major-mode 'fundamental-mode)
-                (derived-mode-p 'image-mode 'archive-mode 'tar-mode
-                                'doc-view-mode 'pdf-view-mode 'hexl-mode))
-            (omnidiff-render--split-source-lines source)
-          (let ((inhibit-message t)
-                (message-log-max nil))
-            (ignore-errors
-              (font-lock-mode 1)
-              (font-lock-ensure)))
-          (widen)
-          (if (= (point-max) (point-min))
-              (omnidiff-render--split-source-lines source)
-            (let* ((limit (if (string-suffix-p "\n" source)
-                              (1- (length source))
-                            (length source)))
-                   (expected-count 1)
-                   (idx 0)
-                   (end-pos (if (and (string-suffix-p "\n" source)
-                                     (> (point-max) (point-min)))
-                                (1- (point-max))
-                              (point-max)))
-                   (pos (point-min))
-                   (lines nil)
-                   (done nil))
-              (while (and (< idx limit)
-                          (setq idx (string-search "\n" source idx))
-                          (< idx limit))
-                (setq expected-count (1+ expected-count)
-                      idx (1+ idx)))
-              (goto-char pos)
-              (while (not done)
-                (if (search-forward "\n" end-pos t)
-                    (progn
-                      (push (omnidiff-render--extract-face-only-line pos (1- (point))) lines)
-                      (setq pos (point)))
-                  (push (omnidiff-render--extract-face-only-line pos end-pos) lines)
-                  (setq done t)))
-              (let ((result (vconcat (nreverse lines))))
-                (if (= (length result) expected-count)
-                    result
-                  (omnidiff-render--split-source-lines source)))))))))))
+    (let* ((src-len (length source))
+           (end-idx src-len))
+      (when needed-rows
+        ;; Slice SOURCE through the last visible row so neither mode startup
+        ;; (e.g. `python-indent-guess-indent-offset') nor `font-lock-ensure'
+        ;; ever scans lines past the last visible hunk.
+        (let ((max-row (car (last needed-rows)))
+              (pos 0)
+              (r 0))
+          (while (and (< r max-row)
+                      (setq pos (string-search "\n" source pos)))
+            (setq pos (1+ pos)
+                  r (1+ r)))
+          (when (= r max-row)
+            (when-let* ((nl (string-search "\n" source pos)))
+              (setq end-idx (1+ nl))))))
+      (let ((probe-end (min end-idx 2048)))
+        (with-temp-buffer
+          (let ((change-major-mode-hook nil)
+                (font-lock-mode-hook nil)
+                (inhibit-field-text-motion t))
+            (insert (if (= probe-end src-len)
+                        source
+                      (substring source 0 probe-end)))
+            (goto-char (point-min))
+            (let ((buffer-file-name
+                   (omnidiff-engine-expand-repo-path path-hint default-directory))
+                  (enable-local-variables nil)
+                  (enable-dir-local-variables nil)
+                  (rng-nxml-auto-validate-flag nil)
+                  (inhibit-message t)
+                  (message-log-max nil))
+              (ignore-errors
+                (delay-mode-hooks
+                  (if (let ((case-fold-search t))
+                        (string-match-p "\\.svgz?\\'" path-hint))
+                      (nxml-mode)
+                    (set-auto-mode t))))
+              (setq delayed-mode-hooks nil))
+            (widen)
+            (if (or (eq major-mode 'fundamental-mode)
+                    (derived-mode-p 'image-mode 'archive-mode 'tar-mode
+                                    'doc-view-mode 'pdf-view-mode 'hexl-mode)
+                    (/= (- (point-max) (point-min)) probe-end))
+                (if needed-rows nil (omnidiff-render-split-source-lines source))
+              (when (< probe-end end-idx)
+                (goto-char (point-max))
+                (insert (substring source probe-end end-idx)))
+              (let ((inhibit-message t)
+                    (message-log-max nil))
+                (ignore-errors
+                  (font-lock-mode 1)
+                  (font-lock-ensure (point-min) (point-max))))
+              (widen)
+              (if (/= (- (point-max) (point-min)) end-idx)
+                  (if needed-rows nil (omnidiff-render-split-source-lines source))
+                (if needed-rows
+                    (let ((table (make-hash-table :test #'eql :size (length needed-rows)))
+                          (cur-row 0))
+                      (goto-char (point-min))
+                      (dolist (row needed-rows)
+                        (let ((delta (- row cur-row)))
+                          (when (> delta 0)
+                            (forward-line delta)
+                            (setq cur-row row)))
+                        (puthash row
+                                 (omnidiff-render--extract-face-only-line
+                                  (point) (line-end-position))
+                                 table))
+                      table)
+                  (let* ((end-pos (if (string-suffix-p "\n" source)
+                                      (1- (point-max))
+                                    (point-max)))
+                         (pos (point-min))
+                         (lines nil)
+                         (done nil))
+                    (goto-char pos)
+                    (while (not done)
+                      (if (search-forward "\n" end-pos t)
+                          (progn
+                            (push (omnidiff-render--extract-face-only-line pos (1- (point))) lines)
+                            (setq pos (point)))
+                        (push (omnidiff-render--extract-face-only-line pos end-pos) lines)
+                        (setq done t)))
+                    (vconcat (nreverse lines)))))))))))))
 
 (defun omnidiff-render--resolve-json-source (source disk-path encoding)
   "Return decoded text string from SOURCE, else read DISK-PATH with ENCODING."
@@ -683,36 +772,13 @@ PATH-HINT resolves to a binary, viewer, or fundamental major mode."
     (or (ignore-errors (omnidiff-engine-read-file-decoded disk-path encoding)) ""))
    (t "")))
 
-(defun omnidiff-render--pick-path-hint (&rest candidates)
-  "Return the first usable non-empty, non-`/dev/null' path in CANDIDATES."
-  (cl-find-if
-   (lambda (p)
-     (and (stringp p) (not (string-empty-p p)) (not (string= p "/dev/null"))))
-   candidates))
-
-(defun omnidiff-render--range-last-row (range num-rows)
-  "Return inclusive 0-based last row covered by RANGE in NUM-ROWS, or nil."
-  (when (and range (> num-rows 0))
-    (let ((sr (omnidiff-json-range-start-row range))
-          (sc (omnidiff-json-range-start-col range))
-          (er (omnidiff-json-range-end-row range))
-          (ec (omnidiff-json-range-end-col range)))
-      (when (and (< sr num-rows)
-                 (<= sr er)
-                 (or (> er sr) (> ec sc)))
-        (let ((last (if (and (> er sr) (= ec 0))
-                        (1- (min er num-rows))
-                      (min er (1- num-rows)))))
-          (when (>= last sr)
-            last))))))
-
 (defun omnidiff-render--normalize-row-spans (spans)
   "Order SPANS by op priority and start offset, merging touching same-op spans."
   (when spans
     (let* ((sorted (sort (copy-sequence spans)
                          (lambda (a b)
-                           (let ((pa (omnidiff-render--op-priority (omnidiff-json-span-op a)))
-                                 (pb (omnidiff-render--op-priority (omnidiff-json-span-op b))))
+                           (let ((pa (omnidiff-theme-op-priority (omnidiff-json-span-op a)))
+                                 (pb (omnidiff-theme-op-priority (omnidiff-json-span-op b))))
                              (cond
                               ((/= pa pb) (< pa pb))
                               ((/= (omnidiff-json-span-start a) (omnidiff-json-span-start b))
@@ -735,132 +801,168 @@ PATH-HINT resolves to a binary, viewer, or fundamental major mode."
 
 (defun omnidiff-render--index-side-hunks (hunks raw-lines side-sym)
   "Index JSON HUNKS over RAW-LINES for SIDE-SYM (`before' or `after').
-Preserves exact per-span operations, move target `→ L<n>' / `← L<n>' labels,
-and enclosing `reference-line' breadcrumbs."
-  (let* ((n (length raw-lines))
-         (row-spans (make-vector n nil))
-         (row-ops (make-vector n nil))
-         (row-moved (make-vector n nil))
-         (row-move-ref (make-vector n nil))
-         (row-ref-line (make-vector n nil))
-         (arrow (if (eq side-sym 'before) "→" "←")))
-    (dolist (h hunks)
-      (let* ((op (omnidiff-json-hunk-operation h))
-             (prio (omnidiff-render--op-priority op))
-             (rng (omnidiff-json-hunk-range h))
-             (sr (omnidiff-json-range-start-row rng))
-             (last-row (omnidiff-render--range-last-row rng n))
-             (mt (omnidiff-json-hunk-move-target h))
-             (ref-line (omnidiff-json-hunk-reference-line h)))
-        (when last-row
-          (let ((r sr))
-            (while (<= r last-row)
-              (let ((cur (aref row-ops r)))
-                (when (or (null cur) (> prio (omnidiff-render--op-priority cur)))
-                  (aset row-ops r op)))
-              (when (eq op 'move)
-                (aset row-moved r t)
-                (when (and (= r sr) mt (null (aref row-move-ref r)))
-                  (aset row-move-ref r
-                        (format "%s L%d" arrow (1+ (omnidiff-json-range-start-row mt))))))
-              (when (and (integerp ref-line) (null (aref row-ref-line r)))
-                (aset row-ref-line r ref-line))
-              (setq r (1+ r)))))
-        (dolist (seg (omnidiff-engine-range-line-spans rng raw-lines))
-          (pcase-let ((`(,row ,sc ,ec) seg))
-            (when (and (>= row 0) (< row n) (< sc ec))
-              (push (make-omnidiff-json-span :start sc :end ec :op op)
-                    (aref row-spans row)))))))
-    (dotimes (r n)
-      (when (aref row-spans r)
-        (aset row-spans r (omnidiff-render--normalize-row-spans (aref row-spans r)))))
-    (make-omnidiff-json-side-index
-     :row-spans row-spans
-     :row-ops row-ops
-     :row-moved row-moved
-     :row-move-ref row-move-ref
-     :row-ref-line row-ref-line)))
+Return an `eql' hash table mapping only changed 0-based rows to
+`omnidiff-json-row-meta', or nil when HUNKS is empty."
+  (when hunks
+    (let* ((n (length raw-lines))
+           (table (make-hash-table :test #'eql :size (max 16 (* 2 (length hunks)))))
+           (arrow (if (eq side-sym 'before) "→" "←")))
+      (cl-flet ((ensure-meta (r)
+                  (or (gethash r table)
+                      (puthash r (make-omnidiff-json-row-meta) table))))
+        (dolist (h hunks)
+          (let* ((op (omnidiff-json-hunk-operation h))
+                 (prio (omnidiff-theme-op-priority op))
+                 (rng (omnidiff-json-hunk-range h))
+                 (sr (omnidiff-json-range-start-row rng))
+                 (last-row (omnidiff-engine-range-last-row rng n))
+                 (mt (omnidiff-json-hunk-move-target h))
+                 (ref-line (omnidiff-json-hunk-reference-line h)))
+            (when last-row
+              (let ((r sr))
+                (while (<= r last-row)
+                  (let* ((meta (ensure-meta r))
+                         (cur (omnidiff-json-row-meta-op meta)))
+                    (when (or (null cur) (> prio (omnidiff-theme-op-priority cur)))
+                      (setf (omnidiff-json-row-meta-op meta) op))
+                    (when (eq op 'move)
+                      (setf (omnidiff-json-row-meta-moved meta) t)
+                      (when (and (= r sr) mt (null (omnidiff-json-row-meta-move-ref meta)))
+                        (setf (omnidiff-json-row-meta-move-ref meta)
+                              (format "%s L%d" arrow (1+ (omnidiff-json-range-start-row mt))))))
+                    (when (and (integerp ref-line)
+                               (null (omnidiff-json-row-meta-ref-line meta)))
+                      (setf (omnidiff-json-row-meta-ref-line meta) ref-line)))
+                  (setq r (1+ r)))))
+            (dolist (seg (omnidiff-engine-range-line-spans rng raw-lines))
+              (pcase-let ((`(,row ,sc ,ec) seg))
+                (when (and (>= row 0) (< row n) (< sc ec))
+                  (let ((meta (ensure-meta row)))
+                    (push (make-omnidiff-json-span :start sc :end ec :op op)
+                          (omnidiff-json-row-meta-spans meta)))))))))
+      (maphash (lambda (_r meta)
+                 (when-let* ((sp (omnidiff-json-row-meta-spans meta)))
+                   (setf (omnidiff-json-row-meta-spans meta)
+                         (omnidiff-render--normalize-row-spans sp))))
+               table)
+      table)))
 
-(defun omnidiff-render--make-json-cell (row fontified-lines side-idx)
+(defun omnidiff-render--make-json-cell (row raw-lines font-map row-meta)
   "Construct an `omnidiff-json-line-cell' for 0-based ROW."
-  (make-omnidiff-json-line-cell
-   :row row
-   :line (1+ row)
-   :text (aref fontified-lines row)
-   :op (or (aref (omnidiff-json-side-index-row-ops side-idx) row) 'context)
-   :moved (and (aref (omnidiff-json-side-index-row-moved side-idx) row) t)
-   :spans (aref (omnidiff-json-side-index-row-spans side-idx) row)
-   :move-ref (aref (omnidiff-json-side-index-row-move-ref side-idx) row)
-   :ref-line (aref (omnidiff-json-side-index-row-ref-line side-idx) row)))
+  (let ((meta (and row-meta (gethash row row-meta))))
+    (make-omnidiff-json-line-cell
+     :row row
+     :line (1+ row)
+     :text (or (and font-map (gethash row font-map))
+               (aref raw-lines row))
+     :op (or (and meta (omnidiff-json-row-meta-op meta)) 'context)
+     :moved (and meta (omnidiff-json-row-meta-moved meta) t)
+     :spans (and meta (omnidiff-json-row-meta-spans meta))
+     :move-ref (and meta (omnidiff-json-row-meta-move-ref meta))
+     :ref-line (and meta (omnidiff-json-row-meta-ref-line meta)))))
 
-(defun omnidiff-render--row-changed-p (left right b-raw a-raw)
-  "Return non-nil when aligned pair LEFT/RIGHT represents a changed row."
-  (cond
-   ((or (null left) (null right)) t)
-   ((not (eq (omnidiff-json-line-cell-op left) 'context)) t)
-   ((not (eq (omnidiff-json-line-cell-op right) 'context)) t)
-   ((omnidiff-json-line-cell-moved left) t)
-   ((omnidiff-json-line-cell-moved right) t)
-   ((omnidiff-json-line-cell-spans left) t)
-   ((omnidiff-json-line-cell-spans right) t)
-   ((not (equal (aref b-raw (omnidiff-json-line-cell-row left))
-                (aref a-raw (omnidiff-json-line-cell-row right))))
-    t)
-   (t nil)))
-
-(defun omnidiff-render--build-aligned-rows (b-raw a-raw b-font a-font b-idx a-idx alignment)
-  "Build a vector of `omnidiff-json-aligned-row's from ALIGNMENT anchors."
+(defun omnidiff-render--plan-visible-intervals (b-raw a-raw b-meta a-meta alignment)
+  "Compute visible context-bounded hunk intervals from ALIGNMENT without cells.
+Return nil when no rows differ, else a plist:
+`(:b-rows VEC :a-rows VEC :changed BOOL-VEC :intervals LIST
+  :b-vis SORTED-ROWS :a-vis SORTED-ROWS)'."
   (let* ((nb (length b-raw))
          (na (length a-raw))
          (anchors (omnidiff-line-alignment-anchors alignment))
+         (m 0)
          (cur-b 0)
-         (cur-a 0)
-         (rows nil))
-    (dolist (bound (append anchors (list (cons nb na))))
+         (cur-a 0))
+    (dolist (bound anchors)
       (let* ((next-b (car bound))
              (next-a (cdr bound))
-             (b-gap (- next-b cur-b))
-             (a-gap (- next-a cur-a))
-             (paired (min b-gap a-gap)))
-        ;; Gap before anchor: zip overlapping positions, emit remaining one-sided rows.
-        (dotimes (k paired)
-          (let* ((br (+ cur-b k))
-                 (ar (+ cur-a k))
-                 (lcell (omnidiff-render--make-json-cell br b-font b-idx))
-                 (rcell (omnidiff-render--make-json-cell ar a-font a-idx)))
-            (push (make-omnidiff-json-aligned-row
-                   :left lcell
-                   :right rcell
-                   :changed-p (omnidiff-render--row-changed-p lcell rcell b-raw a-raw))
-                  rows)))
-        (let ((br (+ cur-b paired)))
-          (while (< br next-b)
-            (push (make-omnidiff-json-aligned-row
-                   :left (omnidiff-render--make-json-cell br b-font b-idx)
-                   :right nil
-                   :changed-p t)
-                  rows)
-            (setq br (1+ br))))
-        (let ((ar (+ cur-a paired)))
-          (while (< ar next-a)
-            (push (make-omnidiff-json-aligned-row
-                   :left nil
-                   :right (omnidiff-render--make-json-cell ar a-font a-idx)
-                   :changed-p t)
-                  rows)
-            (setq ar (1+ ar))))
-        ;; Anchor row itself (skipped for the trailing (NB . NA) sentinel).
+             (b-gap (max 0 (- next-b cur-b)))
+             (a-gap (max 0 (- next-a cur-a))))
+        (setq m (+ m (max b-gap a-gap)))
         (when (and (< next-b nb) (< next-a na))
-          (let* ((lcell (omnidiff-render--make-json-cell next-b b-font b-idx))
-                 (rcell (omnidiff-render--make-json-cell next-a a-font a-idx)))
-            (push (make-omnidiff-json-aligned-row
-                   :left lcell
-                   :right rcell
-                   :changed-p (omnidiff-render--row-changed-p lcell rcell b-raw a-raw))
-                  rows)))
+          (setq m (1+ m)))
         (setq cur-b (1+ next-b)
               cur-a (1+ next-a))))
-    (vconcat (nreverse rows))))
+    (setq m (+ m (max (max 0 (- nb cur-b)) (max 0 (- na cur-a)))))
+    (when (> m 0)
+      (let ((b-rows (make-vector m nil))
+            (a-rows (make-vector m nil))
+            (changed (make-bool-vector m nil))
+            (any-changed nil)
+            (idx 0))
+        (setq cur-b 0
+              cur-a 0)
+        (cl-labels ((emit-pair (br ar)
+                      (aset b-rows idx br)
+                      (aset a-rows idx ar)
+                      (when (or (and b-meta (gethash br b-meta))
+                                (and a-meta (gethash ar a-meta))
+                                (not (equal (aref b-raw br) (aref a-raw ar))))
+                        (aset changed idx t)
+                        (setq any-changed t))
+                      (setq idx (1+ idx)))
+                    (emit-gap (next-b next-a)
+                      (let* ((b-gap (max 0 (- next-b cur-b)))
+                             (a-gap (max 0 (- next-a cur-a)))
+                             (paired (min b-gap a-gap)))
+                        (dotimes (k paired)
+                          (emit-pair (+ cur-b k) (+ cur-a k)))
+                      (let ((br (+ cur-b paired)))
+                        (while (< br next-b)
+                          (aset b-rows idx br)
+                          (aset changed idx t)
+                          (setq any-changed t
+                                idx (1+ idx)
+                                br (1+ br))))
+                      (let ((ar (+ cur-a paired)))
+                        (while (< ar next-a)
+                          (aset a-rows idx ar)
+                          (aset changed idx t)
+                          (setq any-changed t
+                                idx (1+ idx)
+                                ar (1+ ar)))))))
+          (dolist (bound anchors)
+            (let ((next-b (car bound))
+                  (next-a (cdr bound)))
+              (emit-gap next-b next-a)
+              (when (and (< next-b nb) (< next-a na))
+                (emit-pair next-b next-a))
+              (setq cur-b (1+ next-b)
+                    cur-a (1+ next-a))))
+          (emit-gap nb na))
+        (when any-changed
+          (let ((keep (make-bool-vector m nil))
+                (ctx (max 0 omnidiff-overview-context-lines)))
+            (dotimes (i m)
+              (when (aref changed i)
+                (let ((lo (max 0 (- i ctx)))
+                      (hi (min (1- m) (+ i ctx))))
+                  (while (<= lo hi)
+                    (aset keep lo t)
+                    (setq lo (1+ lo))))))
+            (let ((intervals nil)
+                  (b-vis nil)
+                  (a-vis nil)
+                  (i 0)
+                  (skipped 0))
+              (while (< i m)
+                (if (not (aref keep i))
+                    (setq skipped (1+ skipped)
+                          i (1+ i))
+                  (let ((h-start i))
+                    (while (and (< i m) (aref keep i))
+                      (when-let* ((br (aref b-rows i)))
+                        (push br b-vis))
+                      (when-let* ((ar (aref a-rows i)))
+                        (push ar a-vis))
+                      (setq i (1+ i)))
+                    (push (list h-start i skipped) intervals)
+                    (setq skipped 0))))
+              (list :b-rows b-rows
+                    :a-rows a-rows
+                    :changed changed
+                    :intervals (nreverse intervals)
+                    :b-vis (nreverse b-vis)
+                    :a-vis (nreverse a-vis)))))))))
 
 (defun omnidiff-render--pick-hunk-scope (rows b-raw a-raw)
   "Pick an enclosing `omnidiff-scope-item' for hunk ROWS if elided above hunk."
@@ -891,78 +993,10 @@ and enclosing `reference-line' breadcrumbs."
       (or (make-scope cand-a first-a-row a-raw)
           (make-scope cand-b first-b-row b-raw)))))
 
-(defun omnidiff-render--group-aligned-rows (rows-vec b-raw a-raw)
-  "Group ROWS-VEC into context-bounded `omnidiff-json-overview-hunk's."
-  (let* ((m (length rows-vec))
-         (ctx (max 0 omnidiff-overview-context-lines))
-         (keep (make-vector m nil))
-         (any-changed nil))
-    (dotimes (i m)
-      (when (omnidiff-json-aligned-row-changed-p (aref rows-vec i))
-        (setq any-changed t)
-        (let ((lo (max 0 (- i ctx)))
-              (hi (min (1- m) (+ i ctx))))
-          (while (<= lo hi)
-            (aset keep lo t)
-            (setq lo (1+ lo))))))
-    (when any-changed
-      (let ((hunks nil)
-            (i 0)
-            (skipped 0))
-        (while (< i m)
-          (if (not (aref keep i))
-              (setq skipped (1+ skipped)
-                    i (1+ i))
-            (let ((hrows nil)
-                  (a-start nil) (a-end nil)
-                  (b-start nil) (b-end nil)
-                  (added 0) (removed 0) (updated 0) (moved 0))
-              (while (and (< i m) (aref keep i))
-                (let* ((row (aref rows-vec i))
-                       (l (omnidiff-json-aligned-row-left row))
-                       (r (omnidiff-json-aligned-row-right row))
-                       (lop (and l (omnidiff-json-line-cell-op l)))
-                       (rop (and r (omnidiff-json-line-cell-op r))))
-                  (when l
-                    (let ((ln (omnidiff-json-line-cell-line l)))
-                      (setq b-start (if b-start (min b-start ln) ln)
-                            b-end (if b-end (max b-end ln) ln))))
-                  (when r
-                    (let ((ln (omnidiff-json-line-cell-line r)))
-                      (setq a-start (if a-start (min a-start ln) ln)
-                            a-end (if a-end (max a-end ln) ln))))
-                  (cond
-                   ((or (eq lop 'update) (eq rop 'update))
-                    (setq updated (1+ updated)))
-                   (t
-                    (when (or (eq lop 'delete) (eq rop 'delete))
-                      (setq removed (1+ removed)))
-                    (when (or (eq lop 'insert) (eq rop 'insert))
-                      (setq added (1+ added)))))
-                  (when (or (and l (omnidiff-json-line-cell-moved l))
-                            (and r (omnidiff-json-line-cell-moved r)))
-                    (setq moved (1+ moved)))
-                  (push row hrows))
-                (setq i (1+ i)))
-              (setq hrows (nreverse hrows))
-              (push (make-omnidiff-json-overview-hunk
-                     :start-line (or a-start b-start)
-                     :end-line (or a-end b-end)
-                     :gap-text (when (> skipped 0)
-                                 (format "%d unchanged %s"
-                                         skipped (if (= skipped 1) "line" "lines")))
-                     :scope (omnidiff-render--pick-hunk-scope hrows b-raw a-raw)
-                     :added added
-                     :removed removed
-                     :updated updated
-                     :moved moved
-                     :rows hrows)
-                    hunks)
-              (setq skipped 0))))
-        (nreverse hunks)))))
-
 (defun omnidiff-render--build-json-plan (file json-diff)
-  "Build an `omnidiff-json-render-plan' for JSON-backed FILE and JSON-DIFF."
+  "Build an `omnidiff-json-render-plan' for JSON-backed FILE and JSON-DIFF.
+Determines visible hunk intervals before fontifying or allocating cells so
+only rows appearing in visible hunks are font-locked and materialized."
   (let* ((b-side (or (omnidiff-json-diff-before json-diff)
                      (make-omnidiff-json-side)))
          (a-side (or (omnidiff-json-diff-after json-diff)
@@ -985,39 +1019,105 @@ and enclosing `reference-line' breadcrumbs."
                  (omnidiff-file-after-source file)
                  (omnidiff-file-after-disk-path file)
                  (omnidiff-json-side-encoding a-side)))
-         (b-hint (omnidiff-render--pick-path-hint
-                  (omnidiff-file-path file)
-                  (omnidiff-file-target-path file)
-                  (omnidiff-json-side-path b-side)))
-         (a-hint (omnidiff-render--pick-path-hint
-                  (omnidiff-file-target-path file)
-                  (omnidiff-file-path file)
-                  (omnidiff-json-side-path a-side)))
-         (b-raw (omnidiff-render--split-source-lines b-src))
-         (a-raw (omnidiff-render--split-source-lines a-src))
-         (b-font (omnidiff-render--fontify-lines b-src b-hint))
-         (a-font (omnidiff-render--fontify-lines a-src a-hint))
-         (b-idx (omnidiff-render--index-side-hunks
-                 (omnidiff-json-side-hunks b-side) b-raw 'before))
-         (a-idx (omnidiff-render--index-side-hunks
-                 (omnidiff-json-side-hunks a-side) a-raw 'after))
+         (b-raw (omnidiff-render-split-source-lines b-src))
+         (a-raw (omnidiff-render-split-source-lines a-src))
+         (max-line (max (length b-raw) (length a-raw)))
+         (b-meta (omnidiff-render--index-side-hunks
+                  (omnidiff-json-side-hunks b-side) b-raw 'before))
+         (a-meta (omnidiff-render--index-side-hunks
+                  (omnidiff-json-side-hunks a-side) a-raw 'after))
          (alignment (omnidiff-engine-compute-alignment b-raw a-raw norm-diff))
-         (rows-vec (omnidiff-render--build-aligned-rows
-                    b-raw a-raw b-font a-font b-idx a-idx alignment))
-         (hunks (omnidiff-render--group-aligned-rows rows-vec b-raw a-raw))
-         (added 0) (removed 0) (updated 0) (moved 0))
-    (dolist (h hunks)
-      (setq added (+ added (omnidiff-json-overview-hunk-added h))
-            removed (+ removed (omnidiff-json-overview-hunk-removed h))
-            updated (+ updated (omnidiff-json-overview-hunk-updated h))
-            moved (+ moved (omnidiff-json-overview-hunk-moved h))))
-    (make-omnidiff-json-render-plan
-     :hunks hunks
-     :added added
-     :removed removed
-     :updated updated
-     :moved moved
-     :max-line (max (length b-raw) (length a-raw)))))
+         (vis (omnidiff-render--plan-visible-intervals
+               b-raw a-raw b-meta a-meta alignment)))
+    (if (null vis)
+        (make-omnidiff-json-render-plan :hunks nil :max-line max-line)
+      (let* ((b-hint (omnidiff-engine-pick-path-hint
+                      (omnidiff-file-path file)
+                      (omnidiff-file-target-path file)
+                      (omnidiff-json-side-path b-side)))
+             (a-hint (omnidiff-engine-pick-path-hint
+                      (omnidiff-file-target-path file)
+                      (omnidiff-file-path file)
+                      (omnidiff-json-side-path a-side)))
+             (b-vis (plist-get vis :b-vis))
+             (a-vis (plist-get vis :a-vis))
+             (b-font (when b-vis (omnidiff-render--fontify-lines b-src b-hint b-vis)))
+             (a-font (when a-vis (omnidiff-render--fontify-lines a-src a-hint a-vis)))
+             (b-rows (plist-get vis :b-rows))
+             (a-rows (plist-get vis :a-rows))
+             (changed (plist-get vis :changed))
+             (hunks nil)
+             (total-ins 0) (total-del 0)
+             (total-upd-l 0) (total-upd-r 0)
+             (total-mov-l 0) (total-mov-r 0))
+        (dolist (iv (plist-get vis :intervals))
+          (pcase-let* ((`(,h-start ,h-end ,skipped) iv)
+                       (hrows nil)
+                       (a-start nil) (a-end nil)
+                       (b-start nil) (b-end nil)
+                       (ins-l 0) (ins-r 0)
+                       (del-l 0) (del-r 0)
+                       (upd-l 0) (upd-r 0)
+                       (mov-l 0) (mov-r 0)
+                       (i h-start))
+            (while (< i h-end)
+              (let* ((br (aref b-rows i))
+                     (ar (aref a-rows i))
+                     (l (when br (omnidiff-render--make-json-cell br b-raw b-font b-meta)))
+                     (r (when ar (omnidiff-render--make-json-cell ar a-raw a-font a-meta))))
+                (when l
+                  (let ((ln (omnidiff-json-line-cell-line l)))
+                    (setq b-start (if b-start (min b-start ln) ln)
+                          b-end (if b-end (max b-end ln) ln)))
+                  (pcase (omnidiff-json-line-cell-op l)
+                    ('insert (setq ins-l (1+ ins-l)))
+                    ('delete (setq del-l (1+ del-l)))
+                    ('update (setq upd-l (1+ upd-l))))
+                  (when (omnidiff-json-line-cell-moved l)
+                    (setq mov-l (1+ mov-l))))
+                (when r
+                  (let ((ln (omnidiff-json-line-cell-line r)))
+                    (setq a-start (if a-start (min a-start ln) ln)
+                          a-end (if a-end (max a-end ln) ln)))
+                  (pcase (omnidiff-json-line-cell-op r)
+                    ('insert (setq ins-r (1+ ins-r)))
+                    ('delete (setq del-r (1+ del-r)))
+                    ('update (setq upd-r (1+ upd-r))))
+                  (when (omnidiff-json-line-cell-moved r)
+                    (setq mov-r (1+ mov-r))))
+                (push (make-omnidiff-json-aligned-row
+                       :left l
+                       :right r
+                       :changed-p (and (aref changed i) t))
+                      hrows))
+              (setq i (1+ i)))
+            (setq hrows (nreverse hrows)
+                  total-ins (+ total-ins ins-l ins-r)
+                  total-del (+ total-del del-l del-r)
+                  total-upd-l (+ total-upd-l upd-l)
+                  total-upd-r (+ total-upd-r upd-r)
+                  total-mov-l (+ total-mov-l mov-l)
+                  total-mov-r (+ total-mov-r mov-r))
+            (push (make-omnidiff-json-overview-hunk
+                   :start-line (or a-start b-start)
+                   :end-line (or a-end b-end)
+                   :gap-text (when (> skipped 0)
+                               (format "%d unchanged %s"
+                                       skipped (if (= skipped 1) "line" "lines")))
+                   :scope (omnidiff-render--pick-hunk-scope hrows b-raw a-raw)
+                   :added (+ ins-l ins-r)
+                   :removed (+ del-l del-r)
+                   :updated (max upd-l upd-r)
+                   :moved (max mov-l mov-r)
+                   :rows hrows)
+                  hunks)))
+        (make-omnidiff-json-render-plan
+         :hunks (nreverse hunks)
+         :added total-ins
+         :removed total-del
+         :updated (max total-upd-l total-upd-r)
+         :moved (max total-mov-l total-mov-r)
+         :max-line max-line)))))
 
 (defun omnidiff-render--json-plan-key (json-diff)
   "Return cache key for `omnidiff-json-render-plan' derived from JSON-DIFF."
@@ -1047,8 +1147,10 @@ and enclosing `reference-line' breadcrumbs."
               (omnidiff-render--json-plan-key json-diff))
         plan)))
 
-(defun omnidiff-render--insert-json-body (file num-width &optional json-plan)
-  "Insert rendered JSON hunks or fallback note for FILE using NUM-WIDTH."
+(defun omnidiff-render--insert-json-body (file num-width &optional json-plan hunk-offset)
+  "Insert rendered JSON hunks or fallback note for FILE using NUM-WIDTH.
+Optional JSON-PLAN avoids rebuilding an already-computed render plan.
+Optional HUNK-OFFSET shifts hunk numbering (e.g. 1 after an SVG preview)."
   (let* ((status (omnidiff-file-status file))
          (old-mode (omnidiff-file-old-mode file))
          (new-mode (omnidiff-file-new-mode file))
@@ -1056,15 +1158,22 @@ and enclosing `reference-line' breadcrumbs."
                               (not (string= old-mode new-mode))
                               (not (memq status '(added deleted)))))
          (json-diff (omnidiff-file-json-diff file))
-         (summary (or (omnidiff-file-summary file)
-                      (and json-diff (omnidiff-json-diff-summary json-diff))))
+         (summary (omnidiff-engine-file-summary file))
          (summary-label (omnidiff-engine-summary-label summary))
-         (binary-p (or (omnidiff-file-binary-p file)
-                       (and json-diff (omnidiff-json-diff-binary-p json-diff))))
+         (binary-p (omnidiff-engine-file-binary-p file))
          (note (omnidiff-file-note file))
          (plan (or json-plan
-                   (and json-diff (omnidiff-render--get-json-plan file json-diff))))
+                   (and json-diff
+                        (not (and binary-p
+                                  (null (and (omnidiff-json-diff-before json-diff)
+                                             (omnidiff-json-side-hunks
+                                              (omnidiff-json-diff-before json-diff))))
+                                  (null (and (omnidiff-json-diff-after json-diff)
+                                             (omnidiff-json-side-hunks
+                                              (omnidiff-json-diff-after json-diff))))))
+                        (omnidiff-render--get-json-plan file json-diff))))
          (json-hunks (and plan (omnidiff-json-render-plan-hunks plan)))
+         (offset (or hunk-offset 0))
          (eff-num-width (max num-width
                              (if plan
                                  (length (number-to-string
@@ -1072,8 +1181,8 @@ and enclosing `reference-line' breadcrumbs."
                                0))))
     (cond
      (json-hunks
-      (let ((hunk-total (length json-hunks))
-            (hunk-idx 0)
+      (let ((hunk-total (+ offset (length json-hunks)))
+            (hunk-idx offset)
             (layout (or omnidiff--layout omnidiff-default-layout))
             (hstyle (omnidiff-render-effective-highlight-style)))
         (dolist (hunk json-hunks)
@@ -1119,22 +1228,31 @@ and enclosing `reference-line' breadcrumbs."
           (let* ((inhibit-read-only t)
                  (gc-cons-threshold most-positive-fixnum)
                  (gc-cons-percentage 0.8)
-                 (omnidiff-render--style-cache
-                  (or omnidiff-render--style-cache
-                      (make-hash-table :test #'equal :size 16)))
                  (omnidiff-render--sbs-metrics-cache
                   (or omnidiff-render--sbs-metrics-cache
                       (make-hash-table :test #'eql :size 4)))
+                 (omnidiff-render--pixel-width-cache
+                  (or omnidiff-render--pixel-width-cache
+                      (make-hash-table :test 'omnidiff-render--props-equal :size 32)))
                  (start (overlay-start ov))
                  (end (overlay-end ov))
-                 (tail-len (- end start)))
+                 (tail-len (- end start))
+                 (orig-inhibit inhibit-modification-hooks)
+                 (body-end start))
+            (unless orig-inhibit
+              (run-hook-with-args 'before-change-functions start start))
             (save-excursion
               (goto-char start)
-              (omnidiff-render--insert-json-body file num-width)
-              (let ((body-end (point)))
-                (put-text-property start body-end 'omnidiff-file
-                                   (omnidiff-file-target-path file))
+              (let ((inhibit-modification-hooks t))
+                (omnidiff-render--insert-json-body file num-width)
+                (setq body-end (point))
+                (add-text-properties
+                 start body-end
+                 (list 'omnidiff-file (omnidiff-file-target-path file)
+                       'omnidiff-file-obj file))
                 (move-overlay ov start (+ body-end tail-len))))
+            (unless orig-inhibit
+              (run-hook-with-args 'after-change-functions start body-end 0))
             (set-buffer-modified-p nil)))))))
 
 (defun omnidiff-render--expand-tabs-propertized (str)
@@ -1189,7 +1307,7 @@ HIGHLIGHT-STYLE is `token', `subtle-line', or `traditional'."
                  (e (max 0 (min (omnidiff-json-span-end sp) len))))
              (when (< s e)
                (add-face-text-property
-                s e (omnidiff-render--token-face (omnidiff-json-span-op sp))
+                s e (omnidiff-theme-token-face (omnidiff-json-span-op sp))
                 nil str)))))
         (subtle-line
          (unless (eq line-face 'default)
@@ -1199,7 +1317,7 @@ HIGHLIGHT-STYLE is `token', `subtle-line', or `traditional'."
                  (e (max 0 (min (omnidiff-json-span-end sp) len))))
              (when (< s e)
                (add-face-text-property
-                s e (omnidiff-render--token-face (omnidiff-json-span-op sp))
+                s e (omnidiff-theme-token-face (omnidiff-json-span-op sp))
                 nil str)))))
         (traditional
          (unless (eq line-face 'default)
@@ -1293,7 +1411,7 @@ Return a non-empty list of `(SEGMENT-STRING . SEGMENT-MOVE-REF)' cons cells."
                               (>= (- col-width show-w) suffix-w))))
         (if want-suffix
             (let* ((sfx-str (propertize suffix 'face move-face))
-                   (sfx-px (string-pixel-width sfx-str))
+                   (sfx-px (omnidiff-render--string-pixel-width sfx-str))
                    (pre-px (max 0 (- align-px sfx-px))))
               (insert (propertize " " 'face line-face
                                   'display `(space :align-to (,pre-px)))
@@ -1592,14 +1710,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
 
 ;;; Structured container diff cards
 
-(defun omnidiff-render--format-bytes (bytes)
-  "Format byte count BYTES into a compact human-readable string."
-  (cond
-   ((< bytes 1024) (format "%d B" bytes))
-   ((< bytes (* 1024 1024)) (format "%.1f KiB" (/ bytes 1024.0)))
-   (t (format "%.1f MiB" (/ bytes 1048576.0)))))
-
-(defun omnidiff-render--container-family-label (family)
+(defun omnidiff-render-container-family-label (family)
   "Return human-readable label for container FAMILY symbol."
   (pcase family
     ('archives "Archive")
@@ -1632,7 +1743,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
       (format "%s (%d %s, %s)"
               (if (string-empty-p fmt) "container" fmt)
               cnt (if (= cnt 1) "member" "members")
-              (omnidiff-render--format-bytes bytes)))))
+              (omnidiff-engine-format-bytes bytes)))))
 
 (defun omnidiff-render--format-picture-detail (pic)
   "Format concise summary string for `omnidiff-picture' PIC."
@@ -1674,7 +1785,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
            "image")))
       (_ (or (omnidiff-picture-raw-comparison pic) "image changed")))))
 
-(defun omnidiff-render--format-container-detail (kind detail)
+(defun omnidiff-render-format-container-detail (kind detail)
   "Format human-readable member detail string from KIND and DETAIL."
   (pcase kind
     ('picture
@@ -1715,7 +1826,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
       ((omnidiff-json-container-p detail)
        (let ((cnts (omnidiff-render--container-counts detail)))
          (format "%s: %d changed · %d added · %d removed · %d unchanged"
-                 (omnidiff-render--container-family-label
+                 (omnidiff-render-container-family-label
                   (omnidiff-json-container-family detail))
                  (plist-get cnts :changed)
                  (plist-get cnts :added)
@@ -1726,7 +1837,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
 
 (defun omnidiff-render--insert-container-card (file container counts hunk-idx hunk-total)
   "Insert a structured container diff card for FILE and CONTAINER."
-  (let* ((family-lbl (omnidiff-render--container-family-label
+  (let* ((family-lbl (omnidiff-render-container-family-label
                       (omnidiff-json-container-family container)))
          (b-lbl (omnidiff-render--container-side-label (omnidiff-json-container-before container)))
          (a-lbl (omnidiff-render--container-side-label (omnidiff-json-container-after container)))
@@ -1766,7 +1877,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
                           (_ (propertize (format " %s " mstatus) 'face 'omnidiff-commit-meta))))
                  (key (omnidiff-render--display-path
                        (omnidiff-json-container-member-key member)))
-                 (detail (omnidiff-render--format-container-detail
+                 (detail (omnidiff-render-format-container-detail
                           (omnidiff-json-container-member-detail-kind member)
                           (omnidiff-json-container-member-detail member))))
             (insert "  " badge " " key)
@@ -1785,7 +1896,7 @@ Automatically falls back to stacked layout when per-side code width < 20."
             "\n")
     (omnidiff-render--finalize-hunk hdr body-start nil)))
 
-(defun omnidiff-render--trivial-summary-p (summary)
+(defun omnidiff-render-trivial-summary-p (summary)
   "Return non-nil if SUMMARY should auto-fold.
 Controlled by `omnidiff-overview-auto-fold-trivial'."
   (pcase omnidiff-overview-auto-fold-trivial
@@ -1812,14 +1923,13 @@ Controlled by `omnidiff-overview-auto-fold-trivial'."
     path))
 
 (defun omnidiff-render--insert-picture-hunk (file pic hunk-idx hunk-total)
-  "Insert a foldable picture diff or SVG preview hunk for FILE and PIC.
+  "Insert a foldable SVG preview hunk for FILE and PIC.
 Return the `omnidiff-image-ov' overlay owning the interactive image body."
-  (pcase-let* ((pre-start (point))
-               (`(,label . ,meta) (omnidiff-image-hunk-summary pic))
-               (hdr (omnidiff-render--insert-hunk-header
-                     label 0 0 0 0 meta nil hunk-idx hunk-total))
-               (body-start (point))
-               (card-ov (omnidiff-image-insert-body file pic)))
+  (let* ((pre-start (point))
+         (hdr (omnidiff-render--insert-hunk-header
+               "SVG preview" 0 0 0 0 nil nil hunk-idx hunk-total))
+         (body-start (point))
+         (card-ov (omnidiff-image-insert-body file pic)))
     (omnidiff-render--finalize-hunk hdr body-start nil)
     ;; Cover leading spacer line too so moving down from the file header stays active.
     (add-text-properties pre-start
@@ -1830,6 +1940,7 @@ Return the `omnidiff-image-ov' overlay owning the interactive image body."
 
 (defun omnidiff-render--insert-file (file idx total &optional folded-files)
   "Insert formatted `omnidiff-file' card (IDX of TOTAL) with foldable body.
+When IDX is nil (commit placeholder without a target path), omit the card index.
 Optional FOLDED-FILES controls initial fold state: when a hash table, folds
 exactly the target paths present in it; when a list, folds those paths in
 addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
@@ -1845,15 +1956,11 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
                               (not (string= old-mode new-mode))
                               (not (memq status '(added deleted)))))
          (json-diff (omnidiff-file-json-diff file))
-         (container (or (omnidiff-file-container file)
-                        (and json-diff (omnidiff-json-diff-container json-diff))))
-         (summary (or (omnidiff-file-summary file)
-                      (and json-diff (omnidiff-json-diff-summary json-diff))))
+         (container (omnidiff-engine-file-container file))
+         (summary (omnidiff-engine-file-summary file))
          (summary-label (omnidiff-engine-summary-label summary))
-         (large-residual (or (omnidiff-file-large-residual file)
-                             (and json-diff (omnidiff-json-diff-large-residual json-diff))))
-         (binary-p (or (omnidiff-file-binary-p file)
-                       (and json-diff (omnidiff-json-diff-binary-p json-diff))))
+         (large-residual (omnidiff-engine-file-large-residual file))
+         (binary-p (omnidiff-engine-file-binary-p file))
          (pic (omnidiff-image-file-picture file))
          (render-pic-p (and pic (omnidiff-image-should-render-preview-p pic)))
          (svg-preview-p (and render-pic-p (omnidiff-picture-svg-p pic)))
@@ -1869,10 +1976,10 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
            ((consp folded-files)
             (or (not (null (member target folded-files)))
                 auto-fold-count-p
-                (omnidiff-render--trivial-summary-p summary)))
+                (omnidiff-render-trivial-summary-p summary)))
            (t
             (or auto-fold-count-p
-                (omnidiff-render--trivial-summary-p summary)))))
+                (omnidiff-render-trivial-summary-p summary)))))
          (json-eligible-p
           (and json-diff
                (null container)
@@ -1893,28 +2000,41 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
                                  (= (omnidiff-file-removed file) 0)
                                  (= (omnidiff-file-updated file) 0)
                                  (= (omnidiff-file-moved file) 0)))
+         (lazy-stats (when (and file-stats-zero-p (null json-plan) json-eligible-p)
+                       (let* ((b-src (omnidiff-file-before-source file))
+                              (a-src (omnidiff-file-after-source file))
+                              (b-cnt (when (stringp b-src)
+                                       (omnidiff-render--source-line-count b-src)))
+                              (a-cnt (when (stringp a-src)
+                                       (omnidiff-render--source-line-count a-src))))
+                         (omnidiff-render-compute-json-file-stats json-diff b-cnt a-cnt))))
          (added (cond
                  ((not file-stats-zero-p) (omnidiff-file-added file))
                  (json-plan (omnidiff-json-render-plan-added json-plan))
+                 (lazy-stats (plist-get lazy-stats :added))
                  (container-counts (plist-get container-counts :added))
                  (t 0)))
          (removed (cond
                    ((not file-stats-zero-p) (omnidiff-file-removed file))
                    (json-plan (omnidiff-json-render-plan-removed json-plan))
+                   (lazy-stats (plist-get lazy-stats :removed))
                    (container-counts (plist-get container-counts :removed))
                    (t 0)))
          (updated (cond
                    ((not file-stats-zero-p) (omnidiff-file-updated file))
                    (json-plan (omnidiff-json-render-plan-updated json-plan))
+                   (lazy-stats (plist-get lazy-stats :updated))
                    (container-counts (plist-get container-counts :changed))
                    (t 0)))
          (moved (cond
                  ((not file-stats-zero-p) (omnidiff-file-moved file))
                  (json-plan (omnidiff-json-render-plan-moved json-plan))
+                 (lazy-stats (plist-get lazy-stats :moved))
                  (t 0)))
          (max-line (max 1
                         (omnidiff-file-max-line file)
-                        (if json-plan (omnidiff-json-render-plan-max-line json-plan) 0)))
+                        (if json-plan (omnidiff-json-render-plan-max-line json-plan) 0)
+                        (if lazy-stats (plist-get lazy-stats :max-line) 0)))
          (num-width (max 4 (length (number-to-string max-line))))
          (badge (cl-ecase status
                   (added (propertize " NEW " 'face 'omnidiff-file-status-added))
@@ -1935,35 +2055,40 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
                  (list badge)
                  pic-stats
                  (list
-                      (when (> added 0)
-                        (propertize (format "+%d" added) 'face 'omnidiff-stat-added))
-                      (when (> removed 0)
-                        (propertize (format "-%d" removed) 'face 'omnidiff-stat-removed))
-                      (when (> updated 0)
-                        (propertize (format "~%d" updated) 'face 'omnidiff-stat-changed))
-                      (when (> moved 0)
-                        (propertize (format ">%d" moved) 'face 'omnidiff-stat-moved))
-                      (when mode-changed-p
-                        (propertize (format "%s→%s" old-mode new-mode)
-                                    'face 'omnidiff-stat-index))
-                      (propertize (format idx-fmt idx total) 'face 'omnidiff-stat-index)))))
+                  (when (> added 0)
+                    (propertize (format "+%d" added) 'face 'omnidiff-stat-added))
+                  (when (> removed 0)
+                    (propertize (format "-%d" removed) 'face 'omnidiff-stat-removed))
+                  (when (> updated 0)
+                    (propertize (format "~%d" updated) 'face 'omnidiff-stat-changed))
+                  (when (> moved 0)
+                    (propertize (format ">%d" moved) 'face 'omnidiff-stat-moved))
+                  (when mode-changed-p
+                    (propertize (format "%s→%s" old-mode new-mode)
+                                'face 'omnidiff-stat-index))
+                  (when (integerp idx)
+                    (propertize (format idx-fmt idx total) 'face 'omnidiff-stat-index))))))
          (stats-str (string-join stat-parts (propertize "  " 'face 'omnidiff-file-header)))
-         (stats-px (omnidiff-render--right-align-px stats-str 16))
          (win (or (get-buffer-window (current-buffer) t) (selected-window)))
          (win-cols (if (window-live-p win) (window-body-width win) 120))
-         (extra-cols (+ 8 ; "▎ ▼ " + trailing spacing
+         (frame (if (window-live-p win) (window-frame win) (selected-frame)))
+         (stats-px (omnidiff-render--right-align-px stats-str 16 frame))
+         (right-margin-cols (if (display-graphic-p frame)
+                                (max 1 (/ (+ 16 (1- (max 1 (frame-char-width frame))))
+                                          (max 1 (frame-char-width frame))))
+                              (omnidiff-render--right-margin-units 16 frame)))
+         (reviewed-p (and (hash-table-p omnidiff--reviewed-files)
+                          (not (null (gethash target omnidiff--reviewed-files)))))
+         (extra-cols (+ 6 ; "▎ ▼ " (4) + min "  " gap before stats (2)
+                        right-margin-cols
                         (omnidiff-render--display-width stats-str)
                         (if summary-label (+ 4 (omnidiff-render--display-width summary-label)) 0)
                         (if large-residual 18 0)
-                        (if (and (hash-table-p omnidiff--reviewed-files)
-                                 (gethash target omnidiff--reviewed-files))
-                            2
-                          0)))
+                        (if reviewed-p 2 0)))
          (shown-title (omnidiff-render--truncate-path
-                       title (max 20 (- win-cols extra-cols))))
-         (file-label (format "%s [%d/%d]" title idx total))
-         (reviewed-p (and (hash-table-p omnidiff--reviewed-files)
-                          (not (null (gethash target omnidiff--reviewed-files)))))
+                       title (max 16 (- win-cols extra-cols))))
+         (file-label (when (integerp idx)
+                       (format "%s [%d/%d]" title idx total)))
          (header-start (point))
          (fold-ov nil)
          (review-ov nil))
@@ -1984,20 +2109,18 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
               (propertize (concat " " summary-label " ") 'face 'omnidiff-summary-badge)))
     (when large-residual
       (insert (propertize "  · large residual" 'face 'omnidiff-stat-index)))
-    (insert
-            (propertize "  " 'face 'omnidiff-file-header)
+    (insert (propertize "  " 'face 'omnidiff-file-header)
             (propertize " " 'face 'omnidiff-file-header
                         'display `(space :align-to (- right (,stats-px))))
             stats-str
             (propertize "\n" 'face 'omnidiff-file-header))
     (let ((header-end (point))
           (body-start (point))
-          (note (omnidiff-file-note file))
-          (json-hunks (and json-plan (omnidiff-json-render-plan-hunks json-plan)))
           (header-img-ov nil))
       (add-text-properties header-start header-end
                            (list 'omnidiff-file-header t
                                  'omnidiff-file target
+                                 'omnidiff-file-obj file
                                  'omnidiff-file-label file-label
                                  'omnidiff-review-ov review-ov
                                  'mouse-face 'highlight
@@ -2016,51 +2139,20 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
           (omnidiff-render--insert-container-card file container container-counts 1 1))
          (t
           (when svg-preview-p
-            (let ((text-total (if json-hunks (length json-hunks) 0)))
+            (let ((text-total (if json-plan
+                                  (length (omnidiff-json-render-plan-hunks json-plan))
+                                0)))
               (setq header-img-ov
                     (omnidiff-render--insert-picture-hunk
                      file pic 1 (+ 1 text-total)))))
-          (cond
-           (json-hunks
-            (let ((hunk-total (+ hunk-offset (length json-hunks)))
-                  (hunk-idx hunk-offset)
-                  (layout (or omnidiff--layout omnidiff-default-layout))
-                  (hstyle (omnidiff-render-effective-highlight-style)))
-              (dolist (hunk json-hunks)
-                (setq hunk-idx (1+ hunk-idx))
-                (cl-ecase layout
-                  (side-by-side
-                   (omnidiff-render--insert-json-sbs-hunk
-                    hunk status num-width hstyle hunk-idx hunk-total))
-                  (stacked
-                   (omnidiff-render--insert-json-stacked-hunk
-                    hunk status num-width hstyle hunk-idx hunk-total))
-                  (unified
-                   (omnidiff-render--insert-json-unified-hunk
-                    hunk num-width hstyle hunk-idx hunk-total))))))
-           ((or note mode-changed-p binary-p (and json-diff summary-label))
-            (let ((display-note
-                   (cond
-                    ((and mode-changed-p
-                          (or (null note)
-                              (string= note "No changes - files are identical")))
-                     (format "Mode changed: %s → %s" old-mode new-mode))
-                    (note note)
-                    (binary-p "Binary files differ")
-                    (summary-label
-                     (concat (upcase (substring summary-label 0 1))
-                             (substring summary-label 1)))
-                    (t "No changes")))
-                  (note-start (point)))
-              (insert (propertize (concat (make-string (+ num-width 2) ?\s) display-note "\n")
-                                  'face 'omnidiff-gap))
-              (put-text-property note-start (min (1+ note-start) (point))
-                                 'omnidiff-hunk t)))))))
+          (omnidiff-render--insert-json-body file num-width json-plan hunk-offset))))
       (when header-img-ov
         (add-text-properties header-start header-end
                              (list 'omnidiff-image-ov header-img-ov
                                    'keymap omnidiff-render--image-fold-header-map)))
-      (put-text-property body-start (point) 'omnidiff-file target)
+      (add-text-properties body-start (point)
+                           (list 'omnidiff-file target
+                                 'omnidiff-file-obj file))
       (insert "\n")
       (let ((ov (make-overlay body-start (point))))
         (overlay-put ov 'omnidiff-file-body t)
@@ -2114,7 +2206,7 @@ addition to `omnidiff-overview-auto-fold-trivial'; when nil, uses only
   "Return cached `(HINTS-STRING . HINTS-PX)' for header-line CONTEXT.
 CONTEXT is `default', `image', `container', or `standalone'."
   (let* ((ctx (or context 'default))
-         (key (list omnidiff-theme--revision
+         (key (list (omnidiff-theme-revision)
                     (selected-frame)
                     (display-graphic-p)
                     (frame-char-width)
@@ -2141,7 +2233,7 @@ CONTEXT is `default', `image', `container', or `standalone'."
 (defun omnidiff-render--header-context ()
   "Detect active UI context at point for dynamic Overview header-line hints."
   (cond
-   ((omnidiff-image--card-ov-at) 'image)
+   ((omnidiff-image-card-ov-at) 'image)
    ((or (get-text-property (point) 'omnidiff-container-member)
         (get-text-property (point) 'omnidiff-container-file))
     'container)
@@ -2154,7 +2246,10 @@ CONTEXT is `default', `image', `container', or `standalone'."
                        (side-by-side "side-by-side")
                        (stacked "stacked")
                        (unified "unified")))
-         (preset-tag (cl-ecase omnidiff--preset
+         (preset-tag (cl-ecase (or omnidiff--preset
+                                   (and (boundp 'omnidiff-default-preset)
+                                        omnidiff-default-preset)
+                                   'minimal)
                        (minimal "minimal")
                        (full "full")
                        (default "default")))
@@ -2209,21 +2304,21 @@ CONTEXT is `default', `image', `container', or `standalone'."
 
 ;;; Top-level render entry point
 
-(defun omnidiff-render-buffer (raw-or-diff &optional folded-files)
-  "Render RAW-OR-DIFF into the current `omnidiff-mode' buffer.
-RAW-OR-DIFF may be a raw CLI output string or a parsed `omnidiff-diff'.
+(defun omnidiff-render-buffer (diff &optional folded-files)
+  "Render parsed `omnidiff-diff' DIFF into the current `omnidiff-mode' buffer.
 Optional FOLDED-FILES is a hash table of exact folded target paths, a list
 of additional folded target paths, or nil for default auto-folding."
   (let* ((gc-cons-threshold most-positive-fixnum)
          (gc-cons-percentage 0.8)
-         (diff (if (omnidiff-diff-p raw-or-diff)
-                   raw-or-diff
-                 (make-omnidiff-diff :preamble raw-or-diff :files nil)))
          (preamble (omnidiff-diff-preamble diff))
          (files (omnidiff-diff-files diff))
-         (total (length files))
-         (omnidiff-render--style-cache (make-hash-table :test #'equal :size 16))
+         (total (cl-count-if
+                 (lambda (f)
+                   (not (string-empty-p (or (omnidiff-file-target-path f) ""))))
+                 files))
          (omnidiff-render--sbs-metrics-cache (make-hash-table :test #'eql :size 4))
+         (omnidiff-render--pixel-width-cache
+          (make-hash-table :test 'omnidiff-render--props-equal :size 64))
          (inhibit-read-only t)
          (old-size (- (point-max) (point-min))))
     (run-hook-with-args 'before-change-functions (point-min) (point-max))
@@ -2234,15 +2329,21 @@ of additional folded target paths, or nil for default auto-folding."
       (omnidiff-image-prefetch-blobs files omnidiff--repo-dir)
       (setq omnidiff--file-count total)
       (omnidiff-render--insert-preamble preamble)
-      (if (= total 0)
+      (if (null files)
           (when (or (null preamble) (string-blank-p preamble))
             (insert (propertize "\n  No changes to display.\n" 'face 'omnidiff-commit-meta)))
         (let ((idx 0))
           (dolist (file files)
-            (setq idx (1+ idx))
-            (omnidiff-render--insert-file file idx total folded-files)))))
+            (if (string-empty-p (or (omnidiff-file-target-path file) ""))
+                (omnidiff-render--insert-file file nil total folded-files)
+              (setq idx (1+ idx))
+              (omnidiff-render--insert-file file idx total folded-files))))))
     (run-hook-with-args 'after-change-functions (point-min) (point-max) old-size)
     (setq-local header-line-format '(:eval (omnidiff-render-header-line)))
+    (setq omnidiff--last-sbs-width
+          (when (eq (or omnidiff--layout omnidiff-default-layout) 'side-by-side)
+            (when-let* ((win (get-buffer-window (current-buffer) t)))
+              (window-body-width win))))
     (set-buffer-modified-p nil)
     (goto-char (point-min))))
 

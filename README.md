@@ -86,7 +86,7 @@ Calling `(omnidiff-magit-setup)` idempotently appends three suffixes to the `mag
 
 ## Requirements
 
-- Emacs 29.1 or later
+- Emacs 30.1 or later
 - [`omnidiff`](https://github.com/ivankovic/omnidiff) CLI (`0.5.0+` for `--mode json`) in `exec-path`
 - `git` in `exec-path` (required for Git/Magit commands; `omnidiff-files` and `omnidiff-buffers` work without Git)
 - Optional:
@@ -99,7 +99,7 @@ Calling `(omnidiff-magit-setup)` idempotently appends three suffixes to the `mag
 
 ## Installation
 
-### `use-package` + `package-vc` (Emacs 29+)
+### `use-package` + `package-vc` (Emacs 30+)
 
 ```elisp
 (use-package omnidiff
@@ -296,7 +296,6 @@ All options belong to `M-x customize-group RET omnidiff RET`.
 |---|---|---|
 | `omnidiff-image-enabled` | `t` | Render inline visual image diffs in graphical frames |
 | `omnidiff-image-unified-mode` | `'swipe` | Default comparison mode in `unified` layout: `'swipe`, `'side-by-side`, `'diff`, `'onion`, `'blink`, or `'stacked` |
-| `omnidiff-image-diff-backend` | `'auto` | Backend for `diff` mode: `'auto` (async ImageMagick with immediate SVG delta preview), `'magick`, or `'svg` |
 | `omnidiff-image-diff-style` | `'spotlight-sbs` | Visual style for `4:diff` mode: `'spotlight-sbs`, `'spotlight`, `'mask`, or `'delta` |
 | `omnidiff-image-diff-gain` | `4.0` | Default amplification factor for built-in SVG difference output |
 | `omnidiff-image-diff-fuzz` | `0` | Default percentage `-fuzz` tolerance passed to ImageMagick `compare` |
@@ -305,8 +304,6 @@ All options belong to `M-x customize-group RET omnidiff RET`.
 | `omnidiff-image-max-bytes` | `(* 16 1024 1024)` | Max compressed bytes per side auto-loaded (larger images wait for `L`) |
 | `omnidiff-image-auto-load-limit` | `12` | Max image cards auto-loaded inline per buffer (extra cards wait for `L`) |
 | `omnidiff-image-max-height` | `0.65` | Max rendered image height as window height fraction (float) or pixels (integer) |
-| `omnidiff-image-swipe-step` | `0.05` | Coarse swipe step for `h`/`l` |
-| `omnidiff-image-onion-step` | `0.1` | Opacity step for `h`/`l` in onion mode |
 | `omnidiff-image-external-viewer` | `nil` | Custom viewer command string or argv list (`nil` uses system `open` / `xdg-open`) |
 
 ## Development

@@ -49,13 +49,14 @@
 (declare-function image-type-available-p "image" (type))
 (declare-function create-image "image"
                   (file-or-data &optional type data-p &rest props))
-(declare-function tab-bar-new-tab "tab-bar" (&optional arg))
+(declare-function tab-bar-new-tab "tab-bar" (&optional arg from-number))
 (declare-function tab-bar-close-tab "tab-bar" (&optional arg to-index))
 (declare-function tab-bar-tabs "tab-bar" (&optional frame))
 
 (defvar display-line-numbers-mode)
 (defvar delayed-mode-hooks)
 (defvar enable-dir-local-variables)
+(defvar tab-bar-mode)
 
 ;;; Customization
 
@@ -153,33 +154,26 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
   :type 'hook
   :group 'omnidiff)
 
-;;; Session & buffer-local state
+;;; Pane, session & buffer-local state
+
+(cl-defstruct (omnidiff-dual--pane (:copier nil))
+  "Per-side runtime state for one pane (`before' or `after') of a dual session."
+  (buf nil)
+  (win nil)
+  (owns-buf-p nil :type boolean)
+  (path nil)
+  (label nil)
+  (line-starts nil)
+  (lines-tick nil)
+  (has-bom nil :type boolean)
+  (orig-state nil :type list)
+  (header-cache nil))
 
 (cl-defstruct (omnidiff-dual--session (:copier nil))
   "Runtime state for a dual semantic source viewer session."
   (id 0 :type integer)
-  (before-buf nil)
-  (after-buf nil)
-  (before-win nil)
-  (after-win nil)
-  (before-owns-buf-p nil :type boolean)
-  (after-owns-buf-p nil :type boolean)
-  (before-orig-read-only nil)
-  (after-orig-read-only nil)
-  (before-orig-line-numbers nil)
-  (after-orig-line-numbers nil)
-  (before-orig-header-line nil)
-  (after-orig-header-line nil)
-  (before-orig-header-line-local-p nil :type boolean)
-  (after-orig-header-line-local-p nil :type boolean)
-  (before-orig-font-lock nil)
-  (after-orig-font-lock nil)
-  (before-hl-remap-cookie nil)
-  (after-hl-remap-cookie nil)
-  (before-path nil)
-  (after-path nil)
-  (before-label nil)
-  (after-label nil)
+  (before-pane (make-omnidiff-dual--pane))
+  (after-pane (make-omnidiff-dual--pane))
   (display-path nil)
   (json-diff nil)
   (alignment nil)
@@ -195,6 +189,7 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
   (show-syntax t :type boolean)
   (show-cross-highlight t :type boolean)
   (saved-winconf nil)
+  (saved-winconf-tab nil)
   (created-tab-p nil :type boolean)
   (created-tab-frame nil)
   (created-tab-id nil)
@@ -205,16 +200,11 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
   (editable-after-p nil :type boolean)
   (editing-p nil :type boolean)
   (nav-callbacks nil :type list)
-  (before-line-starts nil)
-  (after-line-starts nil)
-  (before-lines-tick nil)
-  (after-lines-tick nil)
-  (before-lines nil)
-  (after-lines nil)
   (minimap-cache nil)
   (active-ovs nil :type list)
   (cross-ovs nil :type list)
   (last-cursor-state nil)
+  (sync-cache nil)
   (last-jump nil)
   (mutated-p nil :type boolean)
   (tearing-down-p nil :type boolean))
@@ -249,35 +239,64 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
   (or (omnidiff-dual-active-session)
       (user-error "No active OmniDiff dual session in this buffer")))
 
+;;; Public session accessors
+
+(defsubst omnidiff-dual--pane (session side)
+  "Return the `omnidiff-dual--pane' on SIDE (`before' or `after') for SESSION."
+  (if (eq side 'before)
+      (omnidiff-dual--session-before-pane session)
+    (omnidiff-dual--session-after-pane session)))
+
+(defalias 'omnidiff-dual-session-p #'omnidiff-dual--session-p)
+(defalias 'omnidiff-dual-session-display-path #'omnidiff-dual--session-display-path)
+(defalias 'omnidiff-dual-session-mutated-p #'omnidiff-dual--session-mutated-p)
+(defalias 'omnidiff-dual-session-editable-after-p #'omnidiff-dual--session-editable-after-p)
+
+(defun omnidiff-dual-session-before-buf (session)
+  "Return the BEFORE buffer for dual SESSION."
+  (omnidiff-dual--pane-buf (omnidiff-dual--session-before-pane session)))
+
+(defun omnidiff-dual-session-after-buf (session)
+  "Return the AFTER buffer for dual SESSION."
+  (omnidiff-dual--pane-buf (omnidiff-dual--session-after-pane session)))
+
+(defun omnidiff-dual-session-before-path (session)
+  "Return the BEFORE path string for dual SESSION, or nil."
+  (omnidiff-dual--pane-path (omnidiff-dual--session-before-pane session)))
+
+(defun omnidiff-dual-session-after-path (session)
+  "Return the AFTER path string for dual SESSION, or nil."
+  (omnidiff-dual--pane-path (omnidiff-dual--session-after-pane session)))
+
+(defun omnidiff-dual-session-before-label (session)
+  "Return the BEFORE header label for dual SESSION, or nil."
+  (omnidiff-dual--pane-label (omnidiff-dual--session-before-pane session)))
+
+(defun omnidiff-dual-session-after-label (session)
+  "Return the AFTER header label for dual SESSION, or nil."
+  (omnidiff-dual--pane-label (omnidiff-dual--session-after-pane session)))
+
 ;;; Small side accessors & coordinate helpers
 
-(defun omnidiff-dual--other-side (side)
+(defsubst omnidiff-dual--other-side (side)
   "Return the opposite pane symbol for SIDE (`before' or `after')."
   (if (eq side 'before) 'after 'before))
 
 (defun omnidiff-dual--side-buf (session side)
   "Return the buffer on SIDE (`before' or `after') for SESSION."
-  (if (eq side 'before)
-      (omnidiff-dual--session-before-buf session)
-    (omnidiff-dual--session-after-buf session)))
+  (omnidiff-dual--pane-buf (omnidiff-dual--pane session side)))
 
 (defun omnidiff-dual--side-win (session side)
   "Return the recorded window on SIDE (`before' or `after') for SESSION."
-  (if (eq side 'before)
-      (omnidiff-dual--session-before-win session)
-    (omnidiff-dual--session-after-win session)))
+  (omnidiff-dual--pane-win (omnidiff-dual--pane session side)))
 
 (defun omnidiff-dual--side-line-starts (session side)
   "Return the cached line-offset vector on SIDE for SESSION."
-  (if (eq side 'before)
-      (omnidiff-dual--session-before-line-starts session)
-    (omnidiff-dual--session-after-line-starts session)))
+  (omnidiff-dual--pane-line-starts (omnidiff-dual--pane session side)))
 
 (defun omnidiff-dual--side-lines-tick (session side)
   "Return the cached `buffer-chars-modified-tick' on SIDE for SESSION."
-  (if (eq side 'before)
-      (omnidiff-dual--session-before-lines-tick session)
-    (omnidiff-dual--session-after-lines-tick session)))
+  (omnidiff-dual--pane-lines-tick (omnidiff-dual--pane session side)))
 
 (defun omnidiff-dual--line-starts-fresh-p (buf line-starts tick)
   "Return non-nil when LINE-STARTS still matches BUF at TICK."
@@ -290,18 +309,16 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
            (with-current-buffer buf
              (save-restriction (widen) (point-max))))))
 
-(defun omnidiff-dual--side-lines (session side)
-  "Return the cached line-strings vector on SIDE for SESSION."
-  (if (eq side 'before)
-      (omnidiff-dual--session-before-lines session)
-    (omnidiff-dual--session-after-lines session)))
-
 (defun omnidiff-dual--side-json (session side)
   "Return the `omnidiff-json-side' on SIDE for SESSION, or nil."
   (when-let* ((diff (omnidiff-dual--session-json-diff session)))
     (if (eq side 'before)
         (omnidiff-json-diff-before diff)
       (omnidiff-json-diff-after diff))))
+
+(defun omnidiff-dual--range-nonempty-p (range)
+  "Return non-nil when `omnidiff-json-range' RANGE covers at least one byte."
+  (and (omnidiff-engine-range-last-row range) t))
 
 (defun omnidiff-dual--logical-line-count (buf line-starts)
   "Return the number of logical lines in BUF given LINE-STARTS."
@@ -344,18 +361,25 @@ Ephemeral revision buffers larger than this skip `set-auto-mode' and
           (setq hi (1- mid)))))
     lo))
 
-(defun omnidiff-dual--resolve-line-starts-tick (buf line-starts tick)
-  "Return TICK or the matching session tick for LINE-STARTS in BUF."
-  (or tick
-      (when (and line-starts (buffer-live-p buf))
-        (with-current-buffer buf
-          (when (and (omnidiff-dual--session-p omnidiff-dual--session)
-                     omnidiff-dual--side
-                     (eq line-starts
-                         (omnidiff-dual--side-line-starts
-                          omnidiff-dual--session omnidiff-dual--side)))
-            (omnidiff-dual--side-lines-tick
-             omnidiff-dual--session omnidiff-dual--side))))))
+(defun omnidiff-dual--cancel-live-timer (session)
+  "Cancel and clear any pending idle live-update timer on SESSION."
+  (when-let* ((timer (omnidiff-dual--session-live-timer session)))
+    (when (timerp timer) (cancel-timer timer))
+    (setf (omnidiff-dual--session-live-timer session) nil)))
+
+(defun omnidiff-dual--table-usable-p (buf line-starts tick pmax)
+  "Return non-nil when LINE-STARTS matches current widened BUF up to PMAX."
+  (when (and line-starts (> (length line-starts) 0))
+    (let ((eff-tick (or tick
+                        (when (and (omnidiff-dual--session-p omnidiff-dual--session)
+                                   omnidiff-dual--side)
+                          (let ((pane (omnidiff-dual--pane
+                                       omnidiff-dual--session omnidiff-dual--side)))
+                            (when (eq line-starts (omnidiff-dual--pane-line-starts pane))
+                              (omnidiff-dual--pane-lines-tick pane)))))))
+      (and (integerp eff-tick)
+           (= eff-tick (buffer-chars-modified-tick buf))
+           (<= (aref line-starts (1- (length line-starts))) pmax)))))
 
 (defun omnidiff-dual--point-to-row-byte-col (buf line-starts pos &optional tick)
   "Convert buffer position POS in BUF to `(ROW . BYTE-COL)' (0-based).
@@ -366,12 +390,7 @@ Falls back to `line-number-at-pos' when LINE-STARTS is stale against TICK."
       (let* ((pmin (point-min))
              (pmax (point-max))
              (p (max pmin (min pos pmax)))
-             (eff-tick (omnidiff-dual--resolve-line-starts-tick buf line-starts tick))
-             (use-table (and line-starts
-                             (> (length line-starts) 0)
-                             (integerp eff-tick)
-                             (= eff-tick (buffer-chars-modified-tick buf))
-                             (<= (aref line-starts (1- (length line-starts))) pmax)))
+             (use-table (omnidiff-dual--table-usable-p buf line-starts tick pmax))
              (row (if use-table
                       (omnidiff-dual--find-row-for-pos line-starts p)
                     (1- (line-number-at-pos p t))))
@@ -379,9 +398,8 @@ Falls back to `line-number-at-pos' when LINE-STARTS is stale against TICK."
                           (max pmin (min p (aref line-starts row)))
                         (save-excursion
                           (goto-char p)
-                          (max pmin (min p (line-beginning-position))))))
-             (byte-col (string-bytes (buffer-substring-no-properties row-beg p))))
-        (cons row byte-col)))))
+                          (max pmin (min p (line-beginning-position)))))))
+        (cons row (string-bytes (buffer-substring-no-properties row-beg p)))))))
 
 (defun omnidiff-dual--row-byte-col-to-point (buf line-starts row byte-col &optional tick)
   "Convert 0-based (ROW, BYTE-COL) to a clamped buffer position in BUF.
@@ -391,104 +409,27 @@ Falls back to `goto-char' + `forward-line' when LINE-STARTS is stale."
       (widen)
       (let* ((pmin (point-min))
              (pmax (point-max))
-             (n (if line-starts (length line-starts) 0))
-             (eff-tick (omnidiff-dual--resolve-line-starts-tick buf line-starts tick))
-             (use-table (and (> n 0)
-                             (integerp eff-tick)
-                             (= eff-tick (buffer-chars-modified-tick buf))
-                             (<= (aref line-starts (1- n)) pmax))))
-        (if use-table
-            (let* ((r (max 0 (min (or row 0) (1- n))))
-                   (row-beg (max pmin (min pmax (aref line-starts r))))
-                   (row-end (max row-beg
-                                 (min pmax
-                                      (if (< (1+ r) n)
-                                          (1- (aref line-starts (1+ r)))
-                                        pmax))))
-                   (line (buffer-substring-no-properties row-beg row-end))
-                   (char-off (omnidiff-engine-line-byte-to-char line (or byte-col 0))))
-              (max pmin (min pmax (min row-end (+ row-beg char-off)))))
-          (save-excursion
-            (goto-char pmin)
-            (when (and (integerp row) (> row 0))
-              (forward-line row))
-            (let* ((row-beg (max pmin (min pmax (line-beginning-position))))
-                   (row-end (max row-beg (min pmax (line-end-position))))
-                   (line (buffer-substring-no-properties row-beg row-end))
-                   (char-off (omnidiff-engine-line-byte-to-char line (or byte-col 0))))
-              (max pmin (min pmax (min row-end (+ row-beg char-off)))))))))))
-
-(defun omnidiff-dual--range-last-row (range num-rows)
-  "Return inclusive 0-based last row of RANGE within NUM-ROWS, or nil."
-  (when (and range (> num-rows 0))
-    (let ((sr (omnidiff-json-range-start-row range))
-          (sc (omnidiff-json-range-start-col range))
-          (er (omnidiff-json-range-end-row range))
-          (ec (omnidiff-json-range-end-col range)))
-      (when (and (< sr num-rows)
-                 (<= sr er)
-                 (or (> er sr) (> ec sc)))
-        (let ((last (if (and (> er sr) (= ec 0))
-                        (1- (min er num-rows))
-                      (min er (1- num-rows)))))
-          (when (>= last sr)
-            last))))))
-
-(defun omnidiff-dual--range-nonempty-p (range)
-  "Return non-nil when `omnidiff-json-range' RANGE covers at least one byte."
-  (when range
-    (let ((sr (omnidiff-json-range-start-row range))
-          (sc (omnidiff-json-range-start-col range))
-          (er (omnidiff-json-range-end-row range))
-          (ec (omnidiff-json-range-end-col range)))
-      (or (> er sr) (and (= er sr) (> ec sc))))))
-
-(defun omnidiff-dual--range-contains-p (range row byte-col)
-  "Return non-nil if right-open RANGE contains (ROW, BYTE-COL)."
-  (when range
-    (let ((sr (omnidiff-json-range-start-row range))
-          (sc (omnidiff-json-range-start-col range))
-          (er (omnidiff-json-range-end-row range))
-          (ec (omnidiff-json-range-end-col range)))
-      (and (or (< sr row) (and (= sr row) (<= sc byte-col)))
-           (or (< row er) (and (= row er) (< byte-col ec)))))))
-
-(defun omnidiff-dual--range-covers-row-p (range row)
-  "Return non-nil if non-empty RANGE covers 0-based ROW."
-  (when (omnidiff-dual--range-nonempty-p range)
-    (let* ((sr (omnidiff-json-range-start-row range))
-           (er (omnidiff-json-range-end-row range))
-           (ec (omnidiff-json-range-end-col range))
-           (lr (if (and (> er sr) (= ec 0)) (1- er) er)))
-      (and (<= sr row) (<= row lr)))))
-
-(defun omnidiff-dual--hunk-at (hunks row byte-col)
-  "Return the most specific hunk in HUNKS covering (ROW, BYTE-COL), or on ROW.
-Exact span containment is preferred; if point lies outside all spans on ROW,
-falls back to the nearest hunk on ROW."
-  (let ((exact nil)
-        (exact-span most-positive-fixnum)
-        (on-row nil)
-        (on-row-dist most-positive-fixnum))
-    (dolist (h hunks)
-      (let ((r (omnidiff-json-hunk-range h)))
-        (cond
-         ((omnidiff-dual--range-contains-p r row byte-col)
-          (let ((span (+ (* 100000 (- (omnidiff-json-range-end-row r)
-                                      (omnidiff-json-range-start-row r)))
-                         (abs (- (omnidiff-json-range-end-col r)
-                                 (omnidiff-json-range-start-col r))))))
-            (when (< span exact-span)
-              (setq exact h
-                    exact-span span))))
-         ((and (null exact) (omnidiff-dual--range-covers-row-p r row))
-          (let ((dist (if (= (omnidiff-json-range-start-row r) row)
-                          (abs (- (omnidiff-json-range-start-col r) byte-col))
-                        0)))
-            (when (< dist on-row-dist)
-              (setq on-row h
-                    on-row-dist dist)))))))
-    (or exact on-row)))
+             (use-table (omnidiff-dual--table-usable-p buf line-starts tick pmax))
+             (bounds
+              (if use-table
+                  (let* ((n (length line-starts))
+                         (r (max 0 (min (or row 0) (1- n))))
+                         (beg (max pmin (min pmax (aref line-starts r))))
+                         (end (if (< (1+ r) n)
+                                  (1- (aref line-starts (1+ r)))
+                                pmax)))
+                    (cons beg (max beg (min pmax end))))
+                (save-excursion
+                  (goto-char pmin)
+                  (when (and (integerp row) (> row 0))
+                    (forward-line row))
+                  (let ((beg (max pmin (min pmax (line-beginning-position)))))
+                    (cons beg (max beg (min pmax (line-end-position))))))))
+             (row-beg (car bounds))
+             (row-end (cdr bounds))
+             (line (buffer-substring-no-properties row-beg row-end))
+             (char-off (omnidiff-engine-line-byte-to-char line (or byte-col 0))))
+        (max pmin (min pmax (min row-end (+ row-beg char-off))))))))
 
 (defun omnidiff-dual--invoke-callback (session key &optional missing-msg)
   "Invoke callback KEY from SESSION's `:nav-callbacks' plist."
@@ -504,15 +445,6 @@ falls back to the nearest hunk on ROW."
 
 ;;; Fringe, faces & overlays
 
-(defun omnidiff-dual--token-face (op)
-  "Return semantic token face for hunk operation OP."
-  (pcase op
-    ('insert 'omnidiff-token-insert)
-    ('delete 'omnidiff-token-delete)
-    ('update 'omnidiff-token-update)
-    ('move 'omnidiff-token-move)
-    (_ 'omnidiff-token-update)))
-
 (defun omnidiff-dual--gutter-face (op)
   "Return dual gutter face for hunk operation OP."
   (pcase op
@@ -521,15 +453,6 @@ falls back to the nearest hunk on ROW."
     ('update 'omnidiff-dual-gutter-update)
     ('move 'omnidiff-dual-gutter-move)
     (_ 'omnidiff-dual-gutter-update)))
-
-(defun omnidiff-dual--op-priority (op)
-  "Return visual prominence rank for operation OP (higher wins per row)."
-  (pcase op
-    ('update 3)
-    ('insert 2)
-    ('delete 2)
-    ('move 1)
-    (_ 0)))
 
 (defun omnidiff-dual--ensure-fringe-bitmap ()
   "Register distinct accessible left-fringe bitmaps per diff operation."
@@ -560,60 +483,80 @@ falls back to the nearest hunk on ROW."
     ('move 'omnidiff-dual-bar-move)
     (_ 'omnidiff-dual-bar)))
 
+(defconst omnidiff-dual--fringe-strings
+  (list
+   (cons 'insert (propertize " " 'display '(left-fringe omnidiff-dual-bar-insert omnidiff-dual-gutter-insert)))
+   (cons 'delete (propertize " " 'display '(left-fringe omnidiff-dual-bar-delete omnidiff-dual-gutter-delete)))
+   (cons 'update (propertize " " 'display '(left-fringe omnidiff-dual-bar-update omnidiff-dual-gutter-update)))
+   (cons 'move   (propertize " " 'display '(left-fringe omnidiff-dual-bar-move   omnidiff-dual-gutter-move))))
+  "Pre-constructed left-fringe `before-string' values per diff operation.")
+
+(defconst omnidiff-dual--fringe-default-string
+  (propertize " " 'display '(left-fringe omnidiff-dual-bar omnidiff-dual-gutter-update))
+  "Fallback left-fringe `before-string' for unknown diff operations.")
+
 (defun omnidiff-dual--clear-overlays (buf &optional kind)
   "Remove dual viewer overlays from BUF.
-When KIND is non-nil, only overlays whose `omnidiff-dual-kind' matches KIND
-are removed; otherwise all `omnidiff-dual-ov' overlays are deleted."
+KIND may be nil (remove all `omnidiff-dual-ov' overlays), a single kind
+symbol, or a list of kind symbols matching `omnidiff-dual-kind'."
   (when (buffer-live-p buf)
     (with-current-buffer buf
       (save-restriction
         (widen)
         (dolist (ov (overlays-in (point-min) (point-max)))
           (when (and (overlay-get ov 'omnidiff-dual-ov)
-                     (or (null kind)
-                         (eq (overlay-get ov 'omnidiff-dual-kind) kind)))
+                     (cond
+                      ((null kind) t)
+                      ((listp kind) (memq (overlay-get ov 'omnidiff-dual-kind) kind))
+                      (t (eq (overlay-get ov 'omnidiff-dual-kind) kind))))
             (delete-overlay ov)))))))
+
+(defun omnidiff-dual--delete-overlay-list (ovs)
+  "Delete every live overlay in OVS."
+  (dolist (ov ovs)
+    (when (overlayp ov) (delete-overlay ov))))
 
 (defun omnidiff-dual--clear-focus-overlays (session)
   "Delete active-stop and counterpart cross-highlight overlays for SESSION."
-  (dolist (ov (omnidiff-dual--session-active-ovs session))
-    (when (overlayp ov) (delete-overlay ov)))
-  (dolist (ov (omnidiff-dual--session-cross-ovs session))
-    (when (overlayp ov) (delete-overlay ov)))
+  (omnidiff-dual--delete-overlay-list (omnidiff-dual--session-active-ovs session))
+  (omnidiff-dual--delete-overlay-list (omnidiff-dual--session-cross-ovs session))
   (setf (omnidiff-dual--session-active-ovs session) nil
-        (omnidiff-dual--session-cross-ovs session) nil))
+        (omnidiff-dual--session-cross-ovs session) nil
+        (omnidiff-dual--session-sync-cache session) nil))
 
 (defun omnidiff-dual--make-range-overlays (buf line-starts range face priority kind &optional tick)
   "Create per-line overlays for RANGE in BUF with FACE, PRIORITY, and KIND.
 Returns the list of created overlays, or nil if LINE-STARTS is stale."
   (when (and (buffer-live-p buf)
              line-starts
-             (omnidiff-dual--range-nonempty-p range))
-    (let ((eff-tick (omnidiff-dual--resolve-line-starts-tick buf line-starts tick)))
-      (when (if (integerp eff-tick)
-                (omnidiff-dual--line-starts-fresh-p buf line-starts eff-tick)
-              (and (> (length line-starts) 0)
-                   (<= (aref line-starts (1- (length line-starts)))
-                       (with-current-buffer buf
-                         (save-restriction (widen) (point-max))))))
-        (let ((created nil))
-          (dolist (reg (omnidiff-engine-range-to-buffer-regions range line-starts buf))
-            (let ((beg (car reg))
-                  (end (cdr reg)))
-              (when (< beg end)
-                (let ((ov (make-overlay beg end buf)))
-                  (overlay-put ov 'face face)
-                  (overlay-put ov 'priority priority)
-                  (overlay-put ov 'omnidiff-dual-ov t)
-                  (overlay-put ov 'omnidiff-dual-kind kind)
-                  (overlay-put ov 'evaporate t)
-                  (push ov created)))))
-          (nreverse created))))))
+             (omnidiff-dual--range-nonempty-p range)
+             (if (integerp tick)
+                 (omnidiff-dual--line-starts-fresh-p buf line-starts tick)
+               (and (> (length line-starts) 0)
+                    (<= (aref line-starts (1- (length line-starts)))
+                        (with-current-buffer buf
+                          (save-restriction (widen) (point-max)))))))
+    (let ((created nil))
+      (dolist (reg (omnidiff-engine-range-to-buffer-regions range line-starts buf))
+        (let ((beg (car reg))
+              (end (cdr reg)))
+          (when (< beg end)
+            (let ((ov (make-overlay beg end buf)))
+              (overlay-put ov 'face face)
+              (overlay-put ov 'priority priority)
+              (overlay-put ov 'omnidiff-dual-ov t)
+              (overlay-put ov 'omnidiff-dual-kind kind)
+              (overlay-put ov 'evaporate t)
+              (push ov created)))))
+      (nreverse created))))
 
-(defun omnidiff-dual--apply-side-overlays (session side)
-  "Apply semantic token and left-fringe overlays on SIDE for SESSION."
-  (let* ((buf (omnidiff-dual--side-buf session side))
-         (line-starts (omnidiff-dual--side-line-starts session side))
+(defun omnidiff-dual--apply-side-overlays (session side &optional skip-clear)
+  "Apply semantic token and left-fringe overlays on SIDE for SESSION.
+When SKIP-CLEAR is non-nil, assume existing token/fringe overlays were
+already removed by the caller."
+  (let* ((pane (omnidiff-dual--pane session side))
+         (buf (omnidiff-dual--pane-buf pane))
+         (line-starts (omnidiff-dual--pane-line-starts pane))
          (json-side (omnidiff-dual--side-json session side))
          (hunks (and json-side (omnidiff-json-side-hunks json-side)))
          (num-rows (if line-starts (length line-starts) 0))
@@ -623,12 +566,12 @@ Returns the list of created overlays, or nil if LINE-STARTS is stale."
          (row-ops (when (and use-fringe (> num-rows 0))
                     (make-vector num-rows nil))))
     (when (buffer-live-p buf)
-      (omnidiff-dual--clear-overlays buf 'token)
-      (omnidiff-dual--clear-overlays buf 'fringe)
+      (unless skip-clear
+        (omnidiff-dual--clear-overlays buf '(token fringe)))
       (dolist (hunk hunks)
         (let* ((op (omnidiff-json-hunk-operation hunk))
                (rng (omnidiff-json-hunk-range hunk))
-               (face (omnidiff-dual--token-face op)))
+               (face (omnidiff-theme-token-face op)))
           (dolist (reg (omnidiff-engine-range-to-buffer-regions rng line-starts buf))
             (let ((beg (car reg))
                   (end (cdr reg)))
@@ -641,25 +584,22 @@ Returns the list of created overlays, or nil if LINE-STARTS is stale."
                   (overlay-put ov 'omnidiff-dual-hunk hunk)
                   (overlay-put ov 'evaporate t)))))
           (when row-ops
-            (when-let* ((last-row (omnidiff-dual--range-last-row rng num-rows)))
+            (when-let* ((last-row (omnidiff-engine-range-last-row rng num-rows)))
               (let ((r (omnidiff-json-range-start-row rng))
-                    (prio (omnidiff-dual--op-priority op)))
+                    (prio (omnidiff-theme-op-priority op)))
                 (while (<= r last-row)
                   (let ((cur (aref row-ops r)))
-                    (when (or (null cur) (> prio (omnidiff-dual--op-priority cur)))
+                    (when (or (null cur) (> prio (omnidiff-theme-op-priority cur)))
                       (aset row-ops r op)))
                   (setq r (1+ r))))))))
       (when row-ops
         (dotimes (r num-rows)
           (when-let* ((op (aref row-ops r)))
             (let* ((pos (aref line-starts r))
-                   (ov (make-overlay pos pos buf))
-                   (gface (omnidiff-dual--gutter-face op)))
+                   (ov (make-overlay pos pos buf)))
               (overlay-put ov 'before-string
-                           (propertize " " 'display
-                                       (list 'left-fringe
-                                             (omnidiff-dual--fringe-bitmap op)
-                                             gface)))
+                           (or (cdr (assq op omnidiff-dual--fringe-strings))
+                               omnidiff-dual--fringe-default-string))
               (overlay-put ov 'priority 5)
               (overlay-put ov 'omnidiff-dual-ov t)
               (overlay-put ov 'omnidiff-dual-kind 'fringe))))))))
@@ -718,85 +658,100 @@ immediately following a fold overlay."
     map)
   "Keymap allowing mouse clicks to expand dual-viewer fold banners.")
 
-(defun omnidiff-dual--fold-decl-for-run (hunks lines run-end)
-  "Return trimmed enclosing declaration for a fold ending at RUN-END, or nil."
-  (let ((num-lines (length lines))
-        (max-sr (+ run-end omnidiff-dual-context-lines 1))
-        (found nil))
-    (dolist (h hunks)
-      (unless found
-        (let ((sr (omnidiff-json-range-start-row (omnidiff-json-hunk-range h)))
-              (ref (omnidiff-json-hunk-reference-line h)))
-          (when (and (> sr run-end)
-                     (<= sr max-sr)
-                     (integerp ref)
-                     (>= ref 0)
-                     (<= ref run-end)
-                     (< ref num-lines))
-            (let ((text (string-trim (aref lines ref))))
-              (unless (string-empty-p text)
-                (setq found (if (> (length text) 64)
-                                (concat (substring text 0 61) "...")
-                              text))))))))
-    found))
+(defun omnidiff-dual--fold-compute-visibility (session side num-lines hunks)
+  "Return a boolean vector of visible rows on SIDE, or nil when nothing marked."
+  (let* ((other-side (omnidiff-dual--other-side side))
+         (other-json (omnidiff-dual--side-json session other-side))
+         (other-hunks (and other-json (omnidiff-json-side-hunks other-json)))
+         (alignment (omnidiff-dual--session-alignment session))
+         (ctx omnidiff-dual-context-lines))
+    (when (and (> num-lines 2) (or hunks other-hunks))
+      (let ((visible (make-vector num-lines nil))
+            (any-marked nil))
+        (cl-flet ((mark-range (r0 r1)
+                    (let ((lo (max 0 (- r0 ctx)))
+                          (hi (min (1- num-lines) (+ r1 ctx))))
+                      (setq any-marked t)
+                      (while (<= lo hi)
+                        (aset visible lo t)
+                        (setq lo (1+ lo))))))
+          (dolist (h hunks)
+            (let ((rng (omnidiff-json-hunk-range h)))
+              (when-let* ((lr (omnidiff-engine-range-last-row rng num-lines)))
+                (mark-range (omnidiff-json-range-start-row rng) lr))))
+          (when (and alignment other-hunks)
+            (let* ((other-pane (omnidiff-dual--pane session other-side))
+                   (other-n (max 1 (omnidiff-dual--logical-line-count
+                                    (omnidiff-dual--pane-buf other-pane)
+                                    (omnidiff-dual--pane-line-starts other-pane)))))
+              (dolist (h other-hunks)
+                (let ((rng (omnidiff-json-hunk-range h)))
+                  (when-let* ((lr (omnidiff-engine-range-last-row rng other-n)))
+                    (let* ((sr (omnidiff-json-range-start-row rng))
+                           (m0 (omnidiff-engine-map-row alignment other-side sr))
+                           (m1 (omnidiff-engine-map-row alignment other-side lr)))
+                      (mark-range (min m0 m1) (max m0 m1)))))))))
+        (when any-marked visible)))))
 
-(defun omnidiff-dual--apply-folds-side (session side)
-  "Apply or clear unchanged-region fold overlays on SIDE for SESSION."
-  (let* ((buf (omnidiff-dual--side-buf session side))
-         (line-starts (omnidiff-dual--side-line-starts session side))
-         (lines (omnidiff-dual--side-lines session side))
+(defun omnidiff-dual--create-fold-overlay (buf beg end count decl)
+  "Create a fold banner overlay covering BEG..END for COUNT (>= 2) lines in BUF.
+Must be called with BUF current and widened."
+  (let* ((fold-end (if (and (> end beg) (eq (char-before end) ?\n))
+                       (1- end)
+                     end))
+         (banner-text (format "  ··· %d unchanged lines ···%s"
+                              count
+                              (if decl (format "  @ %s" decl) "")))
+         (ov (make-overlay beg fold-end buf)))
+    (overlay-put ov 'invisible 'omnidiff-dual-fold)
+    (overlay-put ov 'before-string
+                 (propertize banner-text
+                             'face 'omnidiff-dual-fold-banner
+                             'mouse-face 'highlight
+                             'help-echo "Click or press RET to expand unchanged lines"
+                             'keymap omnidiff-dual--fold-banner-map))
+    (overlay-put ov 'isearch-open-invisible #'omnidiff-dual--isearch-open-fold)
+    (overlay-put ov 'priority 40)
+    (overlay-put ov 'omnidiff-dual-ov t)
+    (overlay-put ov 'omnidiff-dual-kind 'fold)
+    (when (< fold-end end)
+      (let ((nl-ov (make-overlay fold-end end buf)))
+        (overlay-put nl-ov 'face 'omnidiff-dual-fold-banner)
+        (overlay-put nl-ov 'priority 40)
+        (overlay-put nl-ov 'omnidiff-dual-ov t)
+        (overlay-put nl-ov 'omnidiff-dual-kind 'fold-nl)
+        (overlay-put ov 'omnidiff-dual-fold-nl-ov nl-ov)))))
+
+(defun omnidiff-dual--apply-folds-side (session side &optional skip-clear)
+  "Apply or clear unchanged-region fold overlays on SIDE for SESSION.
+When SKIP-CLEAR is non-nil, assume existing fold overlays were already removed."
+  (let* ((pane (omnidiff-dual--pane session side))
+         (buf (omnidiff-dual--pane-buf pane))
+         (line-starts (omnidiff-dual--pane-line-starts pane))
+         (tick (omnidiff-dual--pane-lines-tick pane))
          (fold-p (omnidiff-dual--session-fold-unchanged session)))
     (when (buffer-live-p buf)
-      (omnidiff-dual--clear-overlays buf 'fold)
-      (omnidiff-dual--clear-overlays buf 'fold-nl)
+      (unless skip-clear
+        (omnidiff-dual--clear-overlays buf '(fold fold-nl)))
       (with-current-buffer buf
         (if (not fold-p)
             (when (listp buffer-invisibility-spec)
               (remove-from-invisibility-spec 'omnidiff-dual-fold))
-          (when (omnidiff-dual--line-starts-fresh-p
-                 buf line-starts (omnidiff-dual--side-lines-tick session side))
-            (let* ((num-lines (omnidiff-dual--logical-line-count buf line-starts))
-                 (json-side (omnidiff-dual--side-json session side))
-                 (other-side (omnidiff-dual--other-side side))
-                 (other-json (omnidiff-dual--side-json session other-side))
-                 (hunks (and json-side (omnidiff-json-side-hunks json-side)))
-                 (other-hunks (and other-json (omnidiff-json-side-hunks other-json)))
-                 (alignment (omnidiff-dual--session-alignment session))
-                 (ctx omnidiff-dual-context-lines))
-            (when (and (> num-lines 2) (or hunks other-hunks))
-              (let ((visible (make-vector num-lines nil))
-                    (any-marked nil))
-                (cl-flet ((mark-range (r0 r1)
-                            (let ((lo (max 0 (- r0 ctx)))
-                                  (hi (min (1- num-lines) (+ r1 ctx))))
-                              (setq any-marked t)
-                              (while (<= lo hi)
-                                (aset visible lo t)
-                                (setq lo (1+ lo))))))
-                  (dolist (h hunks)
-                    (when-let* ((lr (omnidiff-dual--range-last-row
-                                     (omnidiff-json-hunk-range h) num-lines)))
-                      (mark-range (omnidiff-json-range-start-row
-                                   (omnidiff-json-hunk-range h))
-                                  lr)))
-                  (when alignment
-                    (let ((other-n (omnidiff-dual--logical-line-count
-                                    (omnidiff-dual--side-buf session other-side)
-                                    (omnidiff-dual--side-line-starts session other-side))))
-                      (dolist (h other-hunks)
-                        (when-let* ((lr (omnidiff-dual--range-last-row
-                                         (omnidiff-json-hunk-range h) (max 1 other-n))))
-                          (let* ((sr (omnidiff-json-range-start-row
-                                      (omnidiff-json-hunk-range h)))
-                                 (m0 (omnidiff-engine-map-row alignment other-side sr))
-                                 (m1 (omnidiff-engine-map-row alignment other-side lr)))
-                            (mark-range (min m0 m1) (max m0 m1))))))))
-                (when any-marked
-                  (when (listp buffer-invisibility-spec)
-                    (add-to-invisibility-spec 'omnidiff-dual-fold))
+          (when-let* ((_ (omnidiff-dual--line-starts-fresh-p buf line-starts tick))
+                      (num-lines (omnidiff-dual--logical-line-count buf line-starts))
+                      (json-side (omnidiff-dual--side-json session side)))
+            (let ((hunks (omnidiff-json-side-hunks json-side)))
+              (when-let* ((visible (omnidiff-dual--fold-compute-visibility
+                                    session side num-lines hunks)))
+                (when (listp buffer-invisibility-spec)
+                  (add-to-invisibility-spec 'omnidiff-dual-fold))
+                (save-restriction
+                  (widen)
                   (let ((row 0)
                         (starts-len (length line-starts))
-                        (pmax (save-restriction (widen) (point-max))))
+                        (pmax (point-max))
+                        (ctx omnidiff-dual-context-lines)
+                        (hunk-cursor hunks))
                     (while (< row num-lines)
                       (if (aref visible row)
                           (setq row (1+ row))
@@ -806,47 +761,43 @@ immediately following a fold overlay."
                           (let* ((run-end (1- row))
                                  (count (1+ (- run-end run-start))))
                             (when (>= count 2)
-                              (let* ((beg (aref line-starts run-start))
-                                     (has-nl (< (1+ run-end) starts-len))
-                                     (end (if has-nl
-                                              (aref line-starts (1+ run-end))
-                                            pmax))
-                                     (fold-end (if (and (> end beg)
-                                                        (eq (char-before end) ?\n))
-                                                   (1- end)
-                                                 end))
-                                     (decl (omnidiff-dual--fold-decl-for-run
-                                            hunks lines run-end))
-                                     (banner-text
-                                      (format "  ··· %d unchanged %s ···%s"
-                                              count
-                                              (if (= count 1) "line" "lines")
-                                              (if decl (format "  @ %s" decl) "")))
-                                     (ov (make-overlay beg fold-end buf)))
-                                (overlay-put ov 'invisible 'omnidiff-dual-fold)
-                                (overlay-put ov 'before-string
-                                             (propertize banner-text
-                                                         'face 'omnidiff-dual-fold-banner
-                                                         'mouse-face 'highlight
-                                                         'help-echo "Click or press RET to expand unchanged lines"
-                                                         'keymap omnidiff-dual--fold-banner-map))
-                                (overlay-put ov 'isearch-open-invisible
-                                             #'omnidiff-dual--isearch-open-fold)
-                                (overlay-put ov 'priority 40)
-                                (overlay-put ov 'omnidiff-dual-ov t)
-                                (overlay-put ov 'omnidiff-dual-kind 'fold)
-                                (when (< fold-end end)
-                                  (let ((nl-ov (make-overlay fold-end end buf)))
-                                    (overlay-put nl-ov 'face 'omnidiff-dual-fold-banner)
-                                    (overlay-put nl-ov 'priority 40)
-                                    (overlay-put nl-ov 'omnidiff-dual-ov t)
-                                    (overlay-put nl-ov 'omnidiff-dual-kind 'fold-nl)
-                                    (overlay-put ov 'omnidiff-dual-fold-nl-ov nl-ov))))))))))))))))))))
+                              ;; Advance sorted hunk pointer past runs ending at or before run-end.
+                              (while (and hunk-cursor
+                                          (<= (omnidiff-json-range-start-row
+                                               (omnidiff-json-hunk-range (car hunk-cursor)))
+                                              run-end))
+                                (setq hunk-cursor (cdr hunk-cursor)))
+                              (let ((max-sr (+ run-end ctx 1))
+                                    (scan hunk-cursor)
+                                    (decl nil))
+                                (while (and scan (not decl)
+                                            (<= (omnidiff-json-range-start-row
+                                                 (omnidiff-json-hunk-range (car scan)))
+                                                max-sr))
+                                  (let ((ref (omnidiff-json-hunk-reference-line (car scan))))
+                                    (when (and (integerp ref) (>= ref 0) (<= ref run-end) (< ref num-lines))
+                                      (let* ((beg (aref line-starts ref))
+                                             (end (if (< (1+ ref) starts-len)
+                                                      (1- (aref line-starts (1+ ref)))
+                                                    pmax))
+                                             (text (string-trim (buffer-substring-no-properties beg end))))
+                                        (unless (string-empty-p text)
+                                          (setq decl (if (> (length text) 64)
+                                                         (concat (substring text 0 61) "...")
+                                                       text))))))
+                                  (setq scan (cdr scan)))
+                                (omnidiff-dual--create-fold-overlay
+                                 buf
+                                 (aref line-starts run-start)
+                                 (if (< (1+ run-end) starts-len)
+                                     (aref line-starts (1+ run-end))
+                                   pmax)
+                                 count decl)))))))))))))))))
 
-(defun omnidiff-dual--apply-folds (session)
+(defun omnidiff-dual--apply-folds (session &optional skip-clear)
   "Apply or clear fold overlays on both panes of SESSION."
-  (omnidiff-dual--apply-folds-side session 'before)
-  (omnidiff-dual--apply-folds-side session 'after))
+  (omnidiff-dual--apply-folds-side session 'before skip-clear)
+  (omnidiff-dual--apply-folds-side session 'after skip-clear))
 
 ;;; Header-line minimap & status chrome
 
@@ -855,10 +806,10 @@ immediately following a fold overlay."
   (let ((nb (length buckets)))
     (dolist (h hunks)
       (let* ((op (omnidiff-json-hunk-operation h))
-             (prio (omnidiff-dual--op-priority op))
+             (prio (omnidiff-theme-op-priority op))
              (rng (omnidiff-json-hunk-range h))
              (sr (omnidiff-json-range-start-row rng))
-             (lr (or (omnidiff-dual--range-last-row rng total) sr))
+             (lr (or (omnidiff-engine-range-last-row rng total) sr))
              (b0 (min (1- nb) (max 0 (/ (* sr nb) total))))
              (b1 (min (1- nb) (max b0 (/ (* lr nb) total))))
              (bi b0))
@@ -869,7 +820,7 @@ immediately following a fold overlay."
               (let ((cur-op (car cur))
                     (cnt (cdr cur)))
                 (aset buckets bi
-                      (cons (if (> prio (omnidiff-dual--op-priority cur-op)) op cur-op)
+                      (cons (if (> prio (omnidiff-theme-op-priority cur-op)) op cur-op)
                             (1+ cnt))))))
           (setq bi (1+ bi)))))))
 
@@ -898,16 +849,19 @@ immediately following a fold overlay."
   (let* ((diff (omnidiff-dual--session-json-diff session))
          (b-hunks (and diff (omnidiff-json-side-hunks (omnidiff-json-diff-before diff))))
          (a-hunks (and diff (omnidiff-json-side-hunks (omnidiff-json-diff-after diff))))
+         (b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
          (b-count (omnidiff-dual--logical-line-count
-                   (omnidiff-dual--session-before-buf session)
-                   (omnidiff-dual--session-before-line-starts session)))
+                   (omnidiff-dual--pane-buf b-pane)
+                   (omnidiff-dual--pane-line-starts b-pane)))
          (a-count (omnidiff-dual--logical-line-count
-                   (omnidiff-dual--session-after-buf session)
-                   (omnidiff-dual--session-after-line-starts session)))
+                   (omnidiff-dual--pane-buf a-pane)
+                   (omnidiff-dual--pane-line-starts a-pane)))
          (total (max 1 b-count a-count))
+         (rev (omnidiff-theme-revision))
          (cache (omnidiff-dual--session-minimap-cache session)))
     (if (and cache
-             (eql (plist-get cache :rev) omnidiff-theme--revision)
+             (eql (plist-get cache :rev) rev)
              (eql (plist-get cache :total) total)
              (eq (plist-get cache :b-hunks) b-hunks)
              (eq (plist-get cache :a-hunks) a-hunks))
@@ -920,7 +874,7 @@ immediately following a fold overlay."
         (omnidiff-dual--minimap-fill-buckets tty-buckets total b-hunks)
         (omnidiff-dual--minimap-fill-buckets tty-buckets total a-hunks)
         (let ((new-cache
-               (list :rev omnidiff-theme--revision
+               (list :rev rev
                      :total total
                      :b-hunks b-hunks
                      :a-hunks a-hunks
@@ -944,8 +898,9 @@ immediately following a fold overlay."
       (with-current-buffer buf
         (when-let* ((session (omnidiff-dual-active-session))
                     (side omnidiff-dual--side))
-          (let* ((starts (omnidiff-dual--side-line-starts session side))
-                 (tick (omnidiff-dual--side-lines-tick session side))
+          (let* ((pane (omnidiff-dual--pane session side))
+                 (starts (omnidiff-dual--pane-line-starts pane))
+                 (tick (omnidiff-dual--pane-lines-tick pane))
                  (total (max 1 (omnidiff-dual--logical-line-count buf starts)))
                  (obj-xy (posn-object-x-y start))
                  (obj-wh (posn-object-width-height start))
@@ -983,20 +938,31 @@ immediately following a fold overlay."
   (when (omnidiff-dual--session-show-minimap session)
     (let* ((cache (omnidiff-dual--ensure-minimap-cache session))
            (total (plist-get cache :total))
-           (gui-p (and (display-graphic-p)
-                       (fboundp 'image-type-available-p)
-                       (image-type-available-p 'svg)
-                       (fboundp 'create-image)))
+           (gui-p (and (display-graphic-p) (image-type-available-p 'svg)))
            (nb (if gui-p 50 16))
            (cur-side (omnidiff-dual--session-active-side session))
-           (cur-buf (omnidiff-dual--side-buf session cur-side))
-           (cur-row (if (buffer-live-p cur-buf)
-                        (car (omnidiff-dual--point-to-row-byte-col
-                              cur-buf
-                              (omnidiff-dual--side-line-starts session cur-side)
-                              (with-current-buffer cur-buf (point))
-                              (omnidiff-dual--side-lines-tick session cur-side)))
-                      0))
+           (pane (omnidiff-dual--pane session cur-side))
+           (cur-buf (omnidiff-dual--pane-buf pane))
+           (cur-row
+            (if (not (buffer-live-p cur-buf))
+                0
+              (let* ((cur-pt (with-current-buffer cur-buf (point)))
+                     (last-cs (omnidiff-dual--session-last-cursor-state session))
+                     (sc (omnidiff-dual--session-sync-cache session))
+                     (cached-row (and sc (plist-get sc :row))))
+                (if (and (integerp cached-row)
+                         (eq (car-safe last-cs) cur-side)
+                         (eql (cdr-safe last-cs) cur-pt))
+                    cached-row
+                  (with-current-buffer cur-buf
+                    (save-restriction
+                      (widen)
+                      (let ((p (max (point-min) (min cur-pt (point-max))))
+                            (starts (omnidiff-dual--pane-line-starts pane)))
+                        (if (omnidiff-dual--table-usable-p
+                             cur-buf starts (omnidiff-dual--pane-lines-tick pane) (point-max))
+                            (omnidiff-dual--find-row-for-pos starts p)
+                          (1- (line-number-at-pos p t))))))))))
            (cursor-bucket (min (1- nb) (max 0 (/ (* cur-row nb) total)))))
       (if (and (plist-get cache :rendered)
                (eq (plist-get cache :last-gui-p) gui-p)
@@ -1061,173 +1027,150 @@ immediately following a fold overlay."
     (propertize (concat " " (string-join (nreverse parts) " ") " ")
                 'face 'omnidiff-dual-header-badge)))
 
-(defun omnidiff-dual--truncate-label (label max-cols)
-  "Truncate LABEL to at most MAX-COLS display columns, preserving tail path."
-  (let ((w (string-width label)))
-    (cond
-     ((or (<= max-cols 0) (<= w max-cols)) label)
-     ((<= max-cols 4) (truncate-string-to-width label max-cols nil nil "…"))
-     ((string-search "/" label)
-      (let* ((parts (split-string label "/"))
-             (tail (car (last parts)))
-             (rest (nreverse (butlast parts)))
-             (acc tail))
-        (while (and rest
-                    (<= (+ 2 (string-width (car rest)) 1 (string-width acc)) max-cols))
-          (setq acc (concat (pop rest) "/" acc)))
-        (let ((cand (concat "…/" acc)))
-          (if (<= (string-width cand) max-cols)
-              cand
-            (truncate-string-to-width cand max-cols nil nil "…")))))
-     (t
-      (truncate-string-to-width label max-cols nil nil "…")))))
+(defun omnidiff-dual--format-header-line (session side active-p single-p win-w
+                                                  diff total-stops stop-idx
+                                                  raw-label minimap
+                                                  reviewed-p prog)
+  "Format header-line string for SIDE of SESSION given pre-resolved metadata."
+  (let* ((before-p (eq side 'before))
+         (sp (propertize "  " 'face 'omnidiff-dual-header-meta))
+         (sep (propertize " · " 'face 'omnidiff-dual-header-meta))
+         (file-face (if active-p 'omnidiff-dual-header-file 'omnidiff-dual-header-meta))
+         (pill-face (if before-p
+                        (if active-p 'omnidiff-dual-header-before 'omnidiff-dual-header-before-inactive)
+                      (if active-p 'omnidiff-dual-header-after 'omnidiff-dual-header-after-inactive)))
+         (summary (and diff (omnidiff-engine-summary-label (omnidiff-json-diff-summary diff))))
+         (show-summary (and summary (or before-p single-p)))
+         (show-minimap (and minimap (or before-p single-p)))
+         (minimap-cols (if show-minimap (if (display-graphic-p) 15 16) 0))
+         (counter (if (> total-stops 0)
+                      (format "change %d/%d" (max 1 (min total-stops stop-idx)) total-stops)
+                    "no changes"))
+         (tail-parts nil)
+         (tail-cols 10))
+    (cl-flet ((add-meta (prefix text)
+                (push prefix tail-parts)
+                (push (propertize text 'face 'omnidiff-dual-header-meta) tail-parts)
+                (setq tail-cols (+ tail-cols (string-width prefix) (string-width text))))
+              (add-badge (prefix text)
+                (let ((badge (concat " " text " ")))
+                  (push prefix tail-parts)
+                  (push (propertize badge 'face 'omnidiff-dual-header-badge) tail-parts)
+                  (setq tail-cols (+ tail-cols (string-width prefix) (string-width badge))))))
+      (if before-p
+          (let ((lang (and diff (or (omnidiff-json-side-language (omnidiff-json-diff-before diff))
+                                    (omnidiff-json-side-language (omnidiff-json-diff-after diff))))))
+            (when (and lang (>= win-w 62)) (add-meta sep lang))
+            (when show-summary (add-badge sp summary))
+            (when show-minimap
+              (push sp tail-parts)
+              (push minimap tail-parts)
+              (setq tail-cols (+ tail-cols 2 minimap-cols)))
+            (add-meta sp counter)
+            (when single-p (add-meta sep "single (o:flip)")))
+        (let* ((editing-p (omnidiff-dual--session-editing-p session))
+               (nav (omnidiff-dual--session-nav-callbacks session))
+               (f-idx (plist-get nav :file-index))
+               (f-tot (plist-get nav :file-total))
+               (rev-cnt (or (car-safe prog) 0))
+               (rev-tot (or (cdr-safe prog) 0))
+               (has-file (and (integerp f-idx) (integerp f-tot) (> f-tot 0)))
+               (has-rev (and (> rev-cnt 0) (> rev-tot 0)))
+               (file-str (cond
+                          ((and has-file has-rev)
+                           (format "file %d/%d · reviewed %d/%d" f-idx f-tot rev-cnt rev-tot))
+                          (has-file (format "file %d/%d" f-idx f-tot))
+                          (has-rev (format "reviewed %d/%d" rev-cnt rev-tot))))
+               (preset-pill (omnidiff-dual--preset-pill session))
+               (hints (if editing-p
+                          "M-n/p C-c r C-c C-c:review C-c ?"
+                        (if (omnidiff-dual--session-editable-after-p session)
+                            "n/p RET r/u z v e ? q"
+                          "n/p RET z v ? q"))))
+          (when reviewed-p (add-badge (propertize " " 'face 'omnidiff-dual-header-meta) "✓"))
+          (when editing-p (add-badge (propertize " " 'face 'omnidiff-dual-header-meta) "EDIT"))
+          (when show-summary (add-badge sp summary))
+          (push sp tail-parts)
+          (push preset-pill tail-parts)
+          (setq tail-cols (+ tail-cols 2 (string-width preset-pill)))
+          (when file-str (add-meta sp file-str))
+          (when show-minimap
+            (push sp tail-parts)
+            (push minimap tail-parts)
+            (setq tail-cols (+ tail-cols 2 minimap-cols)))
+          (when single-p (add-meta sep (concat counter " · o:flip")))
+          (when (>= win-w 72) (add-meta sp hints)))))
+    (let ((label (omnidiff-engine-truncate-path raw-label (max 14 (- win-w tail-cols 2)))))
+      (apply #'concat
+             (propertize (if before-p " BEFORE " " AFTER  ") 'face pill-face)
+             (propertize (concat " " label) 'face file-face)
+             (nreverse tail-parts)))))
 
 (defun omnidiff-dual--header-line ()
-  "Build dynamic `header-line-format' string for the current dual pane."
-  (ignore-errors
-    (let ((session (omnidiff-dual-active-session))
-          (side omnidiff-dual--side))
-      (when (and session side)
-        (let* ((diff (omnidiff-dual--session-json-diff session))
-               (stops (omnidiff-dual--session-stops session))
-               (total-stops (length stops))
-               (stop-idx (omnidiff-dual--session-stop-index session))
-               (single-p (eq (omnidiff-dual--effective-layout session) 'single))
-               (active-p (or single-p
-                             (eq side (omnidiff-dual--session-active-side session))))
-               (win (get-buffer-window (current-buffer)))
-               (win-w (if (window-live-p win) (window-body-width win) 80))
-               (sp (propertize "  " 'face 'omnidiff-dual-header-meta))
-               (sep (propertize " · " 'face 'omnidiff-dual-header-meta))
-               (file-face (if active-p
-                              'omnidiff-dual-header-file
-                            'omnidiff-dual-header-file-inactive))
-               (lang (or (and diff (omnidiff-json-side-language
-                                    (omnidiff-json-diff-before diff)))
-                         (and diff (omnidiff-json-side-language
-                                    (omnidiff-json-diff-after diff)))))
-               (summary (and diff (omnidiff-engine-summary-label
-                                   (omnidiff-json-diff-summary diff))))
-               (minimap (when (or (eq side 'before) single-p)
-                          (omnidiff-dual--render-minimap session)))
-               (minimap-cols (if minimap (if (display-graphic-p) 15 16) 0))
-               (counter (if (> total-stops 0)
-                            (format "change %d/%d"
-                                    (max 1 (min total-stops stop-idx))
-                                    total-stops)
-                          "no changes"))
-               (parts nil))
-          (if (eq side 'before)
-              (let* ((raw-label (or (omnidiff-dual--session-before-label session)
-                                    (omnidiff-dual--session-display-path session)
-                                    "before"))
-                     (pill-face (if active-p
-                                    'omnidiff-dual-header-before
-                                  'omnidiff-dual-header-before-inactive))
-                     (tail-cols (+ 10 ; pill + leading space
-                                   (if lang (+ 3 (string-width lang)) 0)
-                                   (if summary (+ 4 (string-width summary)) 0)
-                                   (if minimap (+ 2 minimap-cols) 0)
-                                   (+ 2 (string-width counter))
-                                   (if single-p 18 0)))
-                     (label (omnidiff-dual--truncate-label
-                             raw-label (max 14 (- win-w tail-cols 2)))))
-                (push (propertize " BEFORE " 'face pill-face) parts)
-                (push (propertize (concat " " label) 'face file-face) parts)
-                (when (and lang (>= win-w 62))
-                  (push sep parts)
-                  (push (propertize lang 'face 'omnidiff-dual-header-meta) parts))
-                (when summary
-                  (push sp parts)
-                  (push (propertize (concat " " summary " ")
-                                    'face 'omnidiff-dual-header-badge)
-                        parts))
-                (when minimap
-                  (push sp parts)
-                  (push minimap parts))
-                (push sp parts)
-                (push (propertize counter 'face 'omnidiff-dual-header-meta) parts)
-                (when single-p
-                  (push sep parts)
-                  (push (propertize "single (o:flip)" 'face 'omnidiff-dual-header-meta)
-                        parts)))
-            (let* ((raw-label (or (omnidiff-dual--session-after-label session)
-                                  (omnidiff-dual--session-display-path session)
-                                  "after"))
-                   (pill-face (if active-p
-                                  'omnidiff-dual-header-after
-                                'omnidiff-dual-header-after-inactive))
-                   (editing-p (omnidiff-dual--session-editing-p session))
-                   (nav (omnidiff-dual--session-nav-callbacks session))
-                   (f-idx (plist-get nav :file-index))
-                   (f-tot (plist-get nav :file-total))
-                   (rev-fn (plist-get nav :reviewed-p))
-                   (reviewed-p (and (functionp rev-fn) (funcall rev-fn)))
-                   (prog-fn (plist-get nav :review-progress))
-                   (prog (when (functionp prog-fn) (funcall prog-fn)))
-                   (rev-cnt (or (car-safe prog) 0))
-                   (rev-tot (or (cdr-safe prog) 0))
-                   (file-str (cond
-                              ((and (integerp f-idx) (integerp f-tot) (> f-tot 0)
-                                    (> rev-cnt 0) (> rev-tot 0))
-                               (format "file %d/%d · reviewed %d/%d" f-idx f-tot rev-cnt rev-tot))
-                              ((and (integerp f-idx) (integerp f-tot) (> f-tot 0))
-                               (format "file %d/%d" f-idx f-tot))
-                              ((and (> rev-cnt 0) (> rev-tot 0))
-                               (format "reviewed %d/%d" rev-cnt rev-tot))))
-                   (preset-pill (omnidiff-dual--preset-pill session))
-                   (hints (if editing-p
-                              "M-n/p C-c r C-c C-c:review C-c ?"
-                            (if (omnidiff-dual--session-editable-after-p session)
-                                "n/p RET r/u z v e ? q"
-                              "n/p RET z v ? q")))
-                   (show-hints (>= win-w 72))
-                   (tail-cols (+ 10
-                                 (if editing-p 9 0)
-                                 (if reviewed-p 5 0)
-                                 (+ 2 (string-width preset-pill))
-                                 (if file-str (+ 2 (string-width file-str)) 0)
-                                 (if (and single-p summary) (+ 4 (string-width summary)) 0)
-                                 (if (and single-p minimap) (+ 2 minimap-cols) 0)
-                                 (if single-p (+ 12 (string-width counter)) 0)
-                                 (if show-hints (+ 2 (string-width hints)) 0)))
-                   (label (omnidiff-dual--truncate-label
-                           raw-label (max 14 (- win-w tail-cols 2)))))
-              (push (propertize " AFTER  " 'face pill-face) parts)
-              (push (propertize (concat " " label) 'face file-face) parts)
-              (when reviewed-p
-                (push (propertize " " 'face 'omnidiff-dual-header-meta) parts)
-                (push (propertize " ✓ " 'face 'omnidiff-dual-header-badge) parts))
-              (when editing-p
-                (push (propertize " " 'face 'omnidiff-dual-header-meta) parts)
-                (push (propertize " EDIT " 'face 'omnidiff-dual-header-badge) parts))
-              (when (and single-p summary)
-                (push sp parts)
-                (push (propertize (concat " " summary " ")
-                                  'face 'omnidiff-dual-header-badge)
-                      parts))
-              (push sp parts)
-              (push preset-pill parts)
-              (when file-str
-                (push sp parts)
-                (push (propertize file-str 'face 'omnidiff-dual-header-meta) parts))
-              (when (and single-p minimap)
-                (push sp parts)
-                (push minimap parts))
-              (when single-p
-                (push sep parts)
-                (push (propertize (concat counter " · o:flip")
-                                  'face 'omnidiff-dual-header-meta)
-                      parts))
-              (when show-hints
-                (push sp parts)
-                (push (propertize hints 'face 'omnidiff-dual-header-meta) parts))))
-          (apply #'concat (nreverse parts)))))))
+  "Build cached dynamic `header-line-format' string for the current dual pane."
+  (when-let* ((session (omnidiff-dual-active-session))
+              (side omnidiff-dual--side))
+    (let* ((pane (omnidiff-dual--pane session side))
+           (win (get-buffer-window (current-buffer)))
+           (win-w (if (window-live-p win) (window-body-width win) 80))
+           (theme-rev (omnidiff-theme-revision))
+           (gui-p (display-graphic-p))
+           (single-p (eq (omnidiff-dual--effective-layout session) 'single))
+           (active-p (or single-p
+                         (eq side (omnidiff-dual--session-active-side session))))
+           (diff (omnidiff-dual--session-json-diff session))
+           (total-stops (length (omnidiff-dual--session-stops session)))
+           (stop-idx (omnidiff-dual--session-stop-index session))
+           (raw-label (or (omnidiff-dual--pane-label pane)
+                          (omnidiff-dual--session-display-path session)
+                          (if (eq side 'before) "before" "after")))
+           (minimap (when (or (eq side 'before) single-p)
+                      (omnidiff-dual--render-minimap session)))
+           (minimap-bucket (and minimap
+                                (plist-get (omnidiff-dual--session-minimap-cache session)
+                                           :last-cursor-bucket)))
+           (nav (unless (eq side 'before)
+                  (omnidiff-dual--session-nav-callbacks session)))
+           (rev-fn (plist-get nav :reviewed-p))
+           (reviewed-p (and (functionp rev-fn)
+                            (ignore-errors (funcall rev-fn))
+                            t))
+           (prog-fn (plist-get nav :review-progress))
+           (prog (when (functionp prog-fn)
+                   (ignore-errors (funcall prog-fn))))
+           (key (if (eq side 'before)
+                    (list win-w theme-rev gui-p single-p active-p
+                          diff total-stops stop-idx raw-label minimap-bucket)
+                  (list win-w theme-rev gui-p single-p active-p
+                        diff total-stops stop-idx raw-label minimap-bucket
+                        (omnidiff-dual--session-editing-p session)
+                        (omnidiff-dual--session-editable-after-p session)
+                        (omnidiff-dual--session-preset session)
+                        (omnidiff-dual--session-whole-updates session)
+                        (omnidiff-dual--session-paint-reindent-moves session)
+                        (plist-get nav :file-index)
+                        (plist-get nav :file-total)
+                        reviewed-p prog)))
+           (cached (omnidiff-dual--pane-header-cache pane)))
+      (if (and cached
+               (eq (cadr cached) minimap)
+               (equal (car cached) key))
+          (nth 2 cached)
+        (let ((formatted
+               (omnidiff-dual--format-header-line
+                session side active-p single-p win-w
+                diff total-stops stop-idx raw-label minimap
+                reviewed-p prog)))
+          (setf (omnidiff-dual--pane-header-cache pane)
+                (list key minimap formatted))
+          formatted)))))
 
 (defun omnidiff-dual--refresh-headers (session)
-  "Force header-line redisplay on both panes of SESSION."
+  "Invalidate cached headers and force header-line redisplay on both panes."
   (dolist (side '(before after))
-    (when-let* ((buf (omnidiff-dual--side-buf session side)))
+    (let* ((pane (omnidiff-dual--pane session side))
+           (buf (omnidiff-dual--pane-buf pane)))
+      (setf (omnidiff-dual--pane-header-cache pane) nil)
       (when (buffer-live-p buf)
         (with-current-buffer buf
           (force-mode-line-update))))))
@@ -1251,10 +1194,12 @@ immediately following a fold overlay."
 
 (defun omnidiff-dual--dual-visible-p (session)
   "Return non-nil when SESSION's BEFORE and AFTER panes are both visible."
-  (let ((bw (omnidiff-dual--session-before-win session))
-        (aw (omnidiff-dual--session-after-win session))
-        (bb (omnidiff-dual--session-before-buf session))
-        (ab (omnidiff-dual--session-after-buf session)))
+  (let* ((bp (omnidiff-dual--session-before-pane session))
+         (ap (omnidiff-dual--session-after-pane session))
+         (bw (omnidiff-dual--pane-win bp))
+         (aw (omnidiff-dual--pane-win ap))
+         (bb (omnidiff-dual--pane-buf bp))
+         (ab (omnidiff-dual--pane-buf ap)))
     (and (window-live-p bw)
          (window-live-p aw)
          (not (eq bw aw))
@@ -1266,10 +1211,12 @@ immediately following a fold overlay."
 (defun omnidiff-dual--apply-layout (session)
   "Arrange windows for SESSION according to its effective layout."
   (let* ((eff (omnidiff-dual--effective-layout session))
-         (bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session))
-         (bw (omnidiff-dual--session-before-win session))
-         (aw (omnidiff-dual--session-after-win session))
+         (bp (omnidiff-dual--session-before-pane session))
+         (ap (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf bp))
+         (ab (omnidiff-dual--pane-buf ap))
+         (bw (omnidiff-dual--pane-win bp))
+         (aw (omnidiff-dual--pane-win ap))
          (active (omnidiff-dual--session-active-side session))
          (anchor (cond
                   ((and (eq active 'before) (window-live-p bw)) bw)
@@ -1277,6 +1224,7 @@ immediately following a fold overlay."
                   ((window-live-p bw) bw)
                   ((window-live-p aw) aw)
                   (t (selected-window)))))
+    (setf (omnidiff-dual--session-sync-cache session) nil)
     (if (eq eff 'dual)
         (if (and (window-live-p bw) (window-live-p aw) (not (eq bw aw)))
             (progn
@@ -1289,26 +1237,20 @@ immediately following a fold overlay."
             (if (window-live-p right)
                 (progn
                   (set-window-buffer right ab)
-                  (setf (omnidiff-dual--session-before-win session) anchor
-                        (omnidiff-dual--session-after-win session) right))
+                  (setf (omnidiff-dual--pane-win bp) anchor
+                        (omnidiff-dual--pane-win ap) right))
               ;; Frame too narrow to split: fall back gracefully to single pane.
               (set-window-buffer anchor (omnidiff-dual--side-buf session active))
-              (setf (omnidiff-dual--session-before-win session)
-                    (when (eq active 'before) anchor)
-                    (omnidiff-dual--session-after-win session)
-                    (when (eq active 'after) anchor)))))
+              (setf (omnidiff-dual--pane-win bp) (when (eq active 'before) anchor)
+                    (omnidiff-dual--pane-win ap) (when (eq active 'after) anchor)))))
       ;; Single-pane layout.
       (when (and (window-live-p bw) (window-live-p aw) (not (eq bw aw)))
-        (let ((keep anchor)
-              (drop (if (eq anchor bw) aw bw)))
+        (let ((drop (if (eq anchor bw) aw bw)))
           (when (window-live-p drop)
-            (ignore-errors (delete-window drop)))
-          (setq anchor keep)))
+            (ignore-errors (delete-window drop)))))
       (set-window-buffer anchor (omnidiff-dual--side-buf session active))
-      (setf (omnidiff-dual--session-before-win session)
-            (when (eq active 'before) anchor)
-            (omnidiff-dual--session-after-win session)
-            (when (eq active 'after) anchor)))
+      (setf (omnidiff-dual--pane-win bp) (when (eq active 'before) anchor)
+            (omnidiff-dual--pane-win ap) (when (eq active 'after) anchor)))
     (let ((target-win (or (omnidiff-dual--side-win session active) anchor)))
       (when (window-live-p target-win)
         (select-window target-win)))))
@@ -1316,15 +1258,17 @@ immediately following a fold overlay."
 (defun omnidiff-dual--focus-side (session side)
   "Focus SIDE (`before' or `after') for SESSION, switching pane or buffer."
   (setf (omnidiff-dual--session-active-side session) side)
-  (let ((buf (omnidiff-dual--side-buf session side)))
+  (let* ((bp (omnidiff-dual--session-before-pane session))
+         (ap (omnidiff-dual--session-after-pane session))
+         (buf (omnidiff-dual--side-buf session side)))
     (when (buffer-live-p buf)
       (if (eq (omnidiff-dual--effective-layout session) 'dual)
           (let ((win (omnidiff-dual--side-win session side)))
             (if (and (window-live-p win) (eq (window-buffer win) buf))
                 (select-window win)
               (omnidiff-dual--apply-layout session)))
-        (let ((bw (omnidiff-dual--session-before-win session))
-              (aw (omnidiff-dual--session-after-win session)))
+        (let ((bw (omnidiff-dual--pane-win bp))
+              (aw (omnidiff-dual--pane-win ap)))
           (if (and (window-live-p bw) (window-live-p aw) (not (eq bw aw)))
               (omnidiff-dual--apply-layout session)
             (let ((win (or (omnidiff-dual--side-win session side)
@@ -1332,39 +1276,43 @@ immediately following a fold overlay."
                            (selected-window))))
               (when (window-live-p win)
                 (set-window-buffer win buf)
-                (setf (omnidiff-dual--session-before-win session)
-                      (when (eq side 'before) win)
-                      (omnidiff-dual--session-after-win session)
-                      (when (eq side 'after) win))
+                (setf (omnidiff-dual--pane-win bp) (when (eq side 'before) win)
+                      (omnidiff-dual--pane-win ap) (when (eq side 'after) win))
                 (select-window win)))))))))
 
 (defun omnidiff-dual--setup-windows (session)
   "Initialize windows for a newly created SESSION."
   (setf (omnidiff-dual--session-saved-winconf session)
         (current-window-configuration))
+  (when (and (not (eq omnidiff-dual-window-setup 'new-tab))
+             (bound-and-true-p tab-bar-mode))
+    (when-let* ((cur (assq 'current-tab (tab-bar-tabs (selected-frame)))))
+      (let ((wc-id (omnidiff-dual--session-id session)))
+        (setcdr cur (cons (cons 'omnidiff-dual-winconf-id wc-id) (cdr cur)))
+        (setf (omnidiff-dual--session-saved-winconf-tab session) wc-id))))
   (cond
    ((eq omnidiff-dual-window-setup 'new-tab)
-    (when (fboundp 'tab-bar-new-tab)
-      (tab-bar-new-tab)
-      (let* ((frame (selected-frame))
-             (tab-id (omnidiff-dual--session-id session))
-             (cur (when (fboundp 'tab-bar-tabs)
-                    (assq 'current-tab (tab-bar-tabs frame)))))
-        (when cur
-          (setcdr cur (cons (cons 'omnidiff-dual-tab-id tab-id) (cdr cur))))
-        (setf (omnidiff-dual--session-created-tab-p session) t
-              (omnidiff-dual--session-created-tab-frame session) frame
-              (omnidiff-dual--session-created-tab-id session) tab-id)))
+    (tab-bar-new-tab)
+    (let* ((frame (selected-frame))
+           (tab-id (omnidiff-dual--session-id session))
+           (cur (assq 'current-tab (tab-bar-tabs frame))))
+      (when cur
+        (setcdr cur (cons (cons 'omnidiff-dual-tab-id tab-id) (cdr cur))))
+      (setf (omnidiff-dual--session-created-tab-p session) t
+            (omnidiff-dual--session-created-tab-frame session) frame
+            (omnidiff-dual--session-created-tab-id session) tab-id))
     (omnidiff-dual--apply-layout session))
    ((functionp omnidiff-dual-window-setup)
-    (let* ((bb (omnidiff-dual--session-before-buf session))
-           (ab (omnidiff-dual--session-after-buf session))
+    (let* ((bp (omnidiff-dual--session-before-pane session))
+           (ap (omnidiff-dual--session-after-pane session))
+           (bb (omnidiff-dual--pane-buf bp))
+           (ab (omnidiff-dual--pane-buf ap))
            (res (funcall omnidiff-dual-window-setup bb ab session)))
       (if (and (consp res) (window-live-p (car res)) (window-live-p (cdr res)))
-          (setf (omnidiff-dual--session-before-win session) (car res)
-                (omnidiff-dual--session-after-win session) (cdr res))
-        (setf (omnidiff-dual--session-before-win session) (get-buffer-window bb)
-              (omnidiff-dual--session-after-win session) (get-buffer-window ab)))
+          (setf (omnidiff-dual--pane-win bp) (car res)
+                (omnidiff-dual--pane-win ap) (cdr res))
+        (setf (omnidiff-dual--pane-win bp) (get-buffer-window bb)
+              (omnidiff-dual--pane-win ap) (get-buffer-window ab)))
       (when-let* ((w (omnidiff-dual--side-win
                       session (omnidiff-dual--session-active-side session))))
         (when (window-live-p w)
@@ -1375,18 +1323,54 @@ immediately following a fold overlay."
 ;;; Active focus, counterpart cross-highlight & synchronized scrolling
 
 (defun omnidiff-dual--find-stop-at (session side row byte-col)
-  "Return the `omnidiff-change-stop' matching (SIDE, ROW, BYTE-COL), or nil."
-  (cl-loop for stop in (omnidiff-dual--session-stops session)
-           when (or (and (eq (omnidiff-change-stop-side stop) side)
-                         (omnidiff-dual--range-contains-p
-                          (omnidiff-change-stop-range stop) row byte-col))
-                    (and (eq (omnidiff-change-stop-counterpart-side stop) side)
-                         (omnidiff-dual--range-contains-p
-                          (omnidiff-change-stop-counterpart-range stop) row byte-col)))
-           return stop))
+  "Return the `omnidiff-change-stop' matching (SIDE, ROW, BYTE-COL), or nil.
+When multiple stops overlap at (SIDE, ROW, BYTE-COL), keeps the session's
+active `stop-index' if it still covers the position; otherwise picks the
+most specific match (preferring primary-side matches and narrower spans)."
+  (cl-flet ((match-kind (stop)
+              (cond
+               ((and (eq (omnidiff-change-stop-side stop) side)
+                     (omnidiff-engine-range-contains-p
+                      (omnidiff-change-stop-range stop) row byte-col))
+                'range)
+               ((and (eq (omnidiff-change-stop-counterpart-side stop) side)
+                     (omnidiff-engine-range-contains-p
+                      (omnidiff-change-stop-counterpart-range stop) row byte-col))
+                'counterpart))))
+    (let* ((stops (omnidiff-dual--session-stops session))
+           (cur-idx (omnidiff-dual--session-stop-index session))
+           (cur (and (integerp cur-idx) (> cur-idx 0) (nth (1- cur-idx) stops))))
+      (if (and cur (match-kind cur))
+          cur
+        (let ((best nil)
+              (best-primary nil)
+              (best-dr most-positive-fixnum)
+              (best-dc most-positive-fixnum))
+          (dolist (stop stops)
+            (when-let* ((kind (match-kind stop)))
+              (let* ((primary-p (eq kind 'range))
+                     (rng (if primary-p
+                              (omnidiff-change-stop-range stop)
+                            (omnidiff-change-stop-counterpart-range stop)))
+                     (dr (- (omnidiff-json-range-end-row rng)
+                            (omnidiff-json-range-start-row rng)))
+                     (dc (- (omnidiff-json-range-end-col rng)
+                            (omnidiff-json-range-start-col rng))))
+                (when (or (and primary-p (not best-primary))
+                          (and (eq primary-p best-primary)
+                               (or (< dr best-dr)
+                                   (and (= dr best-dr) (< dc best-dc)))))
+                  (setq best stop
+                        best-primary primary-p
+                        best-dr dr
+                        best-dc dc)))))
+          best)))))
 
-(defun omnidiff-dual--sync-other-window (session other-side target-pos &optional center-p)
-  "Scroll and position OTHER-SIDE window at TARGET-POS when dual panes show."
+(defun omnidiff-dual--sync-other-window (session other-side target-pos
+                                                 &optional center-p
+                                                 prev-target-pos prev-screen-line)
+  "Scroll and position OTHER-SIDE window at TARGET-POS when dual panes show.
+Returns the computed active screen line (or nil if centered/skipped)."
   (when (and omnidiff-dual-sync-scroll
              (not (minibuffer-window-active-p (selected-window)))
              (omnidiff-dual--dual-visible-p session))
@@ -1405,18 +1389,75 @@ immediately following a fold overlay."
                      (max 0 (1- (count-screen-lines
                                  (window-start active-win)
                                  (window-point active-win)
-                                 nil
+                                 t
                                  active-win))))))))
-          (with-current-buffer other-buf
-            (omnidiff-dual--expand-fold-at target-pos))
-          (save-selected-window
-            (select-window other-win 'norecord)
-            (goto-char target-pos)
-            (ignore-errors
-              (if center-p
-                  (recenter)
-                (let ((max-line (max 0 (1- (window-body-height other-win)))))
-                  (recenter (min max-line (or screen-line (/ max-line 2)))))))))))))
+          (unless (and (not center-p)
+                       (eql target-pos prev-target-pos)
+                       (eql screen-line prev-screen-line)
+                       (eql (window-point other-win) target-pos))
+            (with-current-buffer other-buf
+              (omnidiff-dual--expand-fold-at target-pos))
+            (save-selected-window
+              (select-window other-win 'norecord)
+              (goto-char target-pos)
+              (ignore-errors
+                (if center-p
+                    (recenter)
+                  (let ((max-line (max 0 (1- (window-body-height other-win)))))
+                    (recenter (min max-line (or screen-line (/ max-line 2)))))))))
+          screen-line)))))
+
+(defun omnidiff-dual--resolve-focus-targets (session side diff alignment row bcol explicit-stop)
+  "Resolve `(ACTIVE-RANGE CROSS-RANGE SCROLL-ROW SCROLL-COL)' for SESSION."
+  (let ((other-side (omnidiff-dual--other-side side))
+        (active-range nil)
+        (cross-range nil)
+        (scroll-row nil)
+        (scroll-col 0))
+    (if explicit-stop
+        (progn
+          (setq active-range (omnidiff-change-stop-range explicit-stop))
+          (if (and (eq (omnidiff-change-stop-counterpart-side explicit-stop) other-side)
+                   (omnidiff-dual--range-nonempty-p
+                    (omnidiff-change-stop-counterpart-range explicit-stop)))
+              (setq cross-range (omnidiff-change-stop-counterpart-range explicit-stop))
+            (let ((cp (omnidiff-engine-counterpart-at
+                       diff alignment side
+                       (omnidiff-json-range-start-row active-range)
+                       (omnidiff-json-range-start-col active-range))))
+              (when (and cp (eq (car cp) other-side))
+                (if (omnidiff-dual--range-nonempty-p (cdr cp))
+                    (setq cross-range (cdr cp))
+                  (setq scroll-row (omnidiff-json-range-start-row (cdr cp))))))))
+      (let* ((json-side (omnidiff-dual--side-json session side))
+             (hunk (omnidiff-engine-hunk-at json-side row bcol t))
+             (matched-stop (omnidiff-dual--find-stop-at session side row bcol)))
+        (when matched-stop
+          (setf (omnidiff-dual--session-stop-index session)
+                (omnidiff-change-stop-index matched-stop)))
+        (if hunk
+            (let* ((hrng (omnidiff-json-hunk-range hunk))
+                   (inside-p (omnidiff-engine-range-contains-p hrng row bcol))
+                   (q-row (if inside-p row (omnidiff-json-range-start-row hrng)))
+                   (q-col (if inside-p bcol (omnidiff-json-range-start-col hrng)))
+                   (cp (omnidiff-engine-counterpart-at diff alignment side q-row q-col)))
+              (setq active-range hrng)
+              (when (and cp (eq (car cp) other-side))
+                (if (omnidiff-dual--range-nonempty-p (cdr cp))
+                    (setq cross-range (cdr cp))
+                  (setq scroll-row (omnidiff-json-range-start-row (cdr cp))))))
+          (setq scroll-row (omnidiff-engine-map-row alignment side row)))))
+    (cond
+     (cross-range
+      (setq scroll-row (omnidiff-json-range-start-row cross-range)
+            scroll-col (omnidiff-json-range-start-col cross-range)))
+     ((null scroll-row)
+      (setq scroll-row (omnidiff-engine-map-row alignment side row))))
+    (list active-range cross-range scroll-row scroll-col)))
+
+(defun omnidiff-dual--overlays-live-p (ovs)
+  "Return non-nil when OVS is non-empty and its first overlay is live."
+  (and (consp ovs) (overlayp (car ovs)) (overlay-buffer (car ovs))))
 
 (defun omnidiff-dual--sync-focus-and-counterpart (session &optional explicit-stop center-p skip-other-scroll)
   "Update active overlay, counterpart cross-highlight, and sync-scroll.
@@ -1427,81 +1468,110 @@ When SKIP-OTHER-SCROLL is non-nil, do not reposition the opposite window."
          (alignment (omnidiff-dual--session-alignment session))
          (side (omnidiff-dual--session-active-side session))
          (other-side (omnidiff-dual--other-side side))
-         (buf (omnidiff-dual--side-buf session side))
-         (other-buf (omnidiff-dual--side-buf session other-side)))
+         (pane (omnidiff-dual--pane session side))
+         (other-pane (omnidiff-dual--pane session other-side))
+         (buf (omnidiff-dual--pane-buf pane))
+         (other-buf (omnidiff-dual--pane-buf other-pane)))
     (when (and diff alignment (buffer-live-p buf) (buffer-live-p other-buf))
-      (omnidiff-dual--clear-focus-overlays session)
-      (let* ((starts (omnidiff-dual--side-line-starts session side))
-             (other-starts (omnidiff-dual--side-line-starts session other-side))
-             (tick (omnidiff-dual--side-lines-tick session side))
-             (other-tick (omnidiff-dual--side-lines-tick session other-side))
+      (let* ((starts (omnidiff-dual--pane-line-starts pane))
+             (other-starts (omnidiff-dual--pane-line-starts other-pane))
+             (tick (omnidiff-dual--pane-lines-tick pane))
+             (other-tick (omnidiff-dual--pane-lines-tick other-pane))
+             (editing-p (omnidiff-dual--session-editing-p session))
+             (prev (omnidiff-dual--session-sync-cache session))
+             (prev-side (plist-get prev :side))
+             (prev-row (plist-get prev :row))
+             (prev-bol (plist-get prev :bol))
              (pos (with-current-buffer buf (point)))
-             (rc (omnidiff-dual--point-to-row-byte-col buf starts pos tick))
-             (row (car rc))
-             (bcol (cdr rc))
-             (active-range nil)
-             (cross-range nil)
-             (scroll-row nil)
-             (scroll-col 0))
-        (if explicit-stop
-            (progn
-              (setq active-range (omnidiff-change-stop-range explicit-stop))
-              (if (and (eq (omnidiff-change-stop-counterpart-side explicit-stop) other-side)
-                       (omnidiff-dual--range-nonempty-p
-                        (omnidiff-change-stop-counterpart-range explicit-stop)))
-                  (setq cross-range (omnidiff-change-stop-counterpart-range explicit-stop))
-                (let ((cp (omnidiff-engine-counterpart-at
-                           diff alignment side
-                           (omnidiff-json-range-start-row active-range)
-                           (omnidiff-json-range-start-col active-range))))
-                  (when (and cp (eq (car cp) other-side))
-                    (if (omnidiff-dual--range-nonempty-p (cdr cp))
-                        (setq cross-range (cdr cp))
-                      (setq scroll-row (omnidiff-json-range-start-row (cdr cp))))))))
-          (let* ((json-side (omnidiff-dual--side-json session side))
-                 (hunks (and json-side (omnidiff-json-side-hunks json-side)))
-                 (hunk (omnidiff-dual--hunk-at hunks row bcol))
-                 (matched-stop (omnidiff-dual--find-stop-at session side row bcol)))
-            (when matched-stop
-              (setf (omnidiff-dual--session-stop-index session)
-                    (omnidiff-change-stop-index matched-stop)))
-            (if hunk
-                (let* ((hrng (omnidiff-json-hunk-range hunk))
-                       (q-row (if (omnidiff-dual--range-contains-p hrng row bcol)
-                                  row
-                                (omnidiff-json-range-start-row hrng)))
-                       (q-col (if (omnidiff-dual--range-contains-p hrng row bcol)
-                                  bcol
-                                (omnidiff-json-range-start-col hrng)))
-                       (cp (omnidiff-engine-counterpart-at
-                            diff alignment side q-row q-col)))
-                  (setq active-range hrng)
-                  (when (and cp (eq (car cp) other-side))
-                    (if (omnidiff-dual--range-nonempty-p (cdr cp))
-                        (setq cross-range (cdr cp))
-                      (setq scroll-row (omnidiff-json-range-start-row (cdr cp))))))
-              (setq scroll-row (omnidiff-engine-map-row alignment side row)))))
-        (when active-range
-          (setf (omnidiff-dual--session-active-ovs session)
-                (omnidiff-dual--make-range-overlays
-                 buf starts active-range 'omnidiff-token-active 25 'active tick)))
-        (when (and cross-range (omnidiff-dual--session-show-cross-highlight session))
-          (setf (omnidiff-dual--session-cross-ovs session)
-                (omnidiff-dual--make-range-overlays
-                 other-buf other-starts cross-range
-                 'omnidiff-token-cross-highlight 30 'cross other-tick)))
-        (cond
-         (cross-range
-          (setq scroll-row (omnidiff-json-range-start-row cross-range)
-                scroll-col (omnidiff-json-range-start-col cross-range)))
-         ((null scroll-row)
-          (setq scroll-row (omnidiff-engine-map-row alignment side row))))
-        (unless skip-other-scroll
-          (let ((target-pos (omnidiff-dual--row-byte-col-to-point
-                             other-buf other-starts scroll-row scroll-col other-tick)))
-            (omnidiff-dual--sync-other-window session other-side target-pos center-p)))
-        (setf (omnidiff-dual--session-last-cursor-state session) (cons side pos))
-        (omnidiff-dual--refresh-headers session)))))
+             (cur-bol (with-current-buffer buf (line-beginning-position)))
+             (fresh-p (omnidiff-dual--line-starts-fresh-p buf starts tick)))
+        ;; Fast path: continuous typing on the same line in edit mode with
+        ;; stale `line-starts' skips O(N) `line-number-at-pos', overlays, and scroll.
+        (if (and editing-p
+                 (not fresh-p)
+                 (not explicit-stop)
+                 (not center-p)
+                 prev
+                 (eq side prev-side)
+                 (integerp prev-bol)
+                 (= cur-bol prev-bol))
+            (setf (omnidiff-dual--session-last-cursor-state session) (cons side pos))
+          (let* ((rc (omnidiff-dual--point-to-row-byte-col buf starts pos tick))
+                 (row (car rc))
+                 (bcol (cdr rc))
+                 (prev-stop-idx (omnidiff-dual--session-stop-index session))
+                 (targets (omnidiff-dual--resolve-focus-targets
+                           session side diff alignment row bcol explicit-stop))
+                 (active-range (nth 0 targets))
+                 (cross-range (nth 1 targets))
+                 (scroll-row (nth 2 targets))
+                 (scroll-col (nth 3 targets))
+                 (eff-cross (when (and cross-range
+                                       (omnidiff-dual--session-show-cross-highlight session))
+                              cross-range))
+                 (active-same-p (and prev
+                                     (eq side prev-side)
+                                     (equal active-range (plist-get prev :active-range))
+                                     (or (null active-range)
+                                         (omnidiff-dual--overlays-live-p
+                                          (omnidiff-dual--session-active-ovs session)))))
+                 (cross-same-p (and prev
+                                    (eq other-side (plist-get prev :other-side))
+                                    (equal eff-cross (plist-get prev :cross-range))
+                                    (or (null eff-cross)
+                                        (omnidiff-dual--overlays-live-p
+                                         (omnidiff-dual--session-cross-ovs session)))))
+                 (target-pos (plist-get prev :target-pos))
+                 (screen-line (plist-get prev :screen-line)))
+            (unless active-same-p
+              (omnidiff-dual--delete-overlay-list (omnidiff-dual--session-active-ovs session))
+              (setf (omnidiff-dual--session-active-ovs session)
+                    (when active-range
+                      (omnidiff-dual--make-range-overlays
+                       buf starts active-range 'omnidiff-token-active 25 'active tick))))
+            (unless cross-same-p
+              (omnidiff-dual--delete-overlay-list (omnidiff-dual--session-cross-ovs session))
+              (setf (omnidiff-dual--session-cross-ovs session)
+                    (when eff-cross
+                      (omnidiff-dual--make-range-overlays
+                       other-buf other-starts eff-cross
+                       'omnidiff-token-cross-highlight 30 'cross other-tick))))
+            (unless (or skip-other-scroll
+                        (and editing-p
+                             (not center-p)
+                             (not explicit-stop)
+                             prev
+                             (eq side prev-side)
+                             (eql row prev-row)))
+              (setq target-pos (omnidiff-dual--row-byte-col-to-point
+                                other-buf other-starts scroll-row scroll-col other-tick)
+                    screen-line (omnidiff-dual--sync-other-window
+                                 session other-side target-pos center-p
+                                 (when (eq side prev-side) (plist-get prev :target-pos))
+                                 (when (eq side prev-side) (plist-get prev :screen-line)))))
+            (let* ((new-stop-idx (omnidiff-dual--session-stop-index session))
+                   (mm-cache (omnidiff-dual--session-minimap-cache session))
+                   (cur-bucket
+                    (when mm-cache
+                      (let ((nb (if (and (display-graphic-p) (image-type-available-p 'svg)) 50 16)))
+                        (min (1- nb) (max 0 (/ (* row nb) (plist-get mm-cache :total)))))))
+                   (prev-bucket (plist-get prev :bucket)))
+              (setf (omnidiff-dual--session-last-cursor-state session) (cons side pos)
+                    (omnidiff-dual--session-sync-cache session)
+                    (list :side side
+                          :other-side other-side
+                          :row row
+                          :bol cur-bol
+                          :bucket cur-bucket
+                          :active-range active-range
+                          :cross-range eff-cross
+                          :target-pos target-pos
+                          :screen-line screen-line))
+              (when (or (null prev)
+                        (not (eq side prev-side))
+                        (not (eql new-stop-idx prev-stop-idx))
+                        (not (eql cur-bucket prev-bucket)))
+                (omnidiff-dual--refresh-headers session)))))))))
 
 (defun omnidiff-dual--post-command ()
   "Sync focus, cross-highlight, and counterpart scroll from `post-command-hook'."
@@ -1518,205 +1588,25 @@ When SKIP-OTHER-SCROLL is non-nil, do not reposition the opposite window."
                   (omnidiff-dual--sync-focus-and-counterpart session nil nil)))))
         (error nil)))))
 
-;;; Buffer creation, syntax highlighting, and attachment
+;;; BOM helpers, buffer creation, syntax highlighting, and attachment
 
-(defun omnidiff-dual--apply-safe-major-mode (buf path-hint show-syntax)
-  "Enable native syntax highlighting in ephemeral BUF without running mode hooks.
-Uses PATH-HINT against `auto-mode-alist' while guarding size against
-`omnidiff-dual-syntax-max-bytes'."
-  (with-current-buffer buf
-    (when (and (stringp path-hint)
-               (not (string-empty-p path-hint))
-               (not (string= path-hint "/dev/null"))
-               (<= (buffer-size) omnidiff-dual-syntax-max-bytes))
-      (let ((buffer-file-name (expand-file-name path-hint))
-            (enable-local-variables nil)
-            (enable-dir-local-variables nil))
-        (ignore-errors
-          (delay-mode-hooks
-            (set-auto-mode t)))
-        (setq delayed-mode-hooks nil))
-      ;; Never let viewer major modes (e.g., `image-mode' on `.svg') hide source text.
-      (when (derived-mode-p 'image-mode 'archive-mode 'tar-mode 'doc-view-mode)
-        (let ((enable-local-variables nil)
-              (enable-dir-local-variables nil))
-          (ignore-errors
-            (delay-mode-hooks
-              (if (string-match-p "\\.svgz?\\'" path-hint)
-                  (xml-mode)
-                (fundamental-mode))))
-          (setq delayed-mode-hooks nil)))
-      (when (and show-syntax (not (eq major-mode 'fundamental-mode)))
-        (ignore-errors
-          (font-lock-mode 1)
-          (font-lock-ensure))))))
+(defsubst omnidiff-dual--string-has-bom-p (str)
+  "Return non-nil when string STR starts with a U+FEFF byte order mark."
+  (and (stringp str) (> (length str) 0) (= (aref str 0) #xfeff)))
 
-(defun omnidiff-dual--make-ephemeral-buffer (side display-name content path-hint show-syntax)
-  "Create and populate an owned ephemeral buffer for SIDE."
-  (let* ((tag (if (eq side 'before) "BEFORE" "AFTER"))
-         (buf (generate-new-buffer (format "*omnidiff %s: %s*" tag display-name))))
-    (with-current-buffer buf
-      (let ((inhibit-read-only t))
-        (insert (or content "")))
-      (goto-char (point-min))
-      (set-buffer-modified-p nil)
-      (setq buffer-undo-list t)
-      (omnidiff-dual--apply-safe-major-mode buf path-hint show-syntax))
-    buf))
+(defsubst omnidiff-dual--strip-leading-bom (str)
+  "Return STR with a single leading U+FEFF removed, if present."
+  (if (omnidiff-dual--string-has-bom-p str)
+      (substring str 1)
+    str))
 
-(defun omnidiff-dual--writable-file-p (path)
-  "Return non-nil when PATH is a regular readable and writable file on disk."
-  (and (stringp path)
-       (not (string-empty-p path))
-       (not (string= path "/dev/null"))
-       (file-regular-p path)
-       (file-readable-p path)
-       (file-writable-p path)))
-
-(defun omnidiff-dual--attach-buffer (session side buf owns-p)
-  "Attach BUF on SIDE to SESSION, recording original state for restoration."
-  (with-current-buffer buf
-    ;; If BUF is still attached to another session, tear down that session first
-    ;; so BUF's true original state is restored before we record `orig-*'.
-    (when (and (omnidiff-dual--session-p omnidiff-dual--session)
-               (not (eq omnidiff-dual--session session)))
-      (save-current-buffer
-        (omnidiff-dual--teardown omnidiff-dual--session nil nil)))
-    (let ((orig-ro buffer-read-only)
-          (orig-ln (bound-and-true-p display-line-numbers-mode))
-          (orig-hl-local (local-variable-p 'header-line-format))
-          (orig-hl header-line-format)
-          (orig-fl (bound-and-true-p font-lock-mode)))
-      (if (eq side 'before)
-          (setf (omnidiff-dual--session-before-buf session) buf
-                (omnidiff-dual--session-before-owns-buf-p session) owns-p
-                (omnidiff-dual--session-before-orig-read-only session) orig-ro
-                (omnidiff-dual--session-before-orig-line-numbers session) orig-ln
-                (omnidiff-dual--session-before-orig-header-line-local-p session) orig-hl-local
-                (omnidiff-dual--session-before-orig-header-line session) orig-hl
-                (omnidiff-dual--session-before-orig-font-lock session) orig-fl)
-        (setf (omnidiff-dual--session-after-buf session) buf
-              (omnidiff-dual--session-after-owns-buf-p session) owns-p
-              (omnidiff-dual--session-after-orig-read-only session) orig-ro
-              (omnidiff-dual--session-after-orig-line-numbers session) orig-ln
-              (omnidiff-dual--session-after-orig-header-line-local-p session) orig-hl-local
-              (omnidiff-dual--session-after-orig-header-line session) orig-hl
-              (omnidiff-dual--session-after-orig-font-lock session) orig-fl)))
-    (setq-local omnidiff-dual--session session)
-    (setq-local omnidiff-dual--side side)
-    (when (and (fboundp 'display-line-numbers-mode)
-               (not (bound-and-true-p display-line-numbers-mode)))
-      (display-line-numbers-mode 1))
-    (setq-local header-line-format '(:eval (omnidiff-dual--header-line)))
-    (let ((cookie (face-remap-add-relative 'header-line 'omnidiff-dual-header-meta)))
-      (if (eq side 'before)
-          (setf (omnidiff-dual--session-before-hl-remap-cookie session) cookie)
-        (setf (omnidiff-dual--session-after-hl-remap-cookie session) cookie)))
-    (setq buffer-read-only t)
-    (omnidiff-dual-edit-mode -1)
-    (omnidiff-dual-mode 1)
-    (add-hook 'post-command-hook #'omnidiff-dual--post-command nil t)
-    (add-hook 'kill-buffer-hook #'omnidiff-dual--on-kill-buffer nil t)
-    (add-hook 'change-major-mode-hook #'omnidiff-dual--on-change-major-mode nil t)))
-
-(defun omnidiff-dual--detach-buffer (session side &optional dying-buf)
-  "Detach SIDE buffer from SESSION, killing owned buffers or restoring user ones.
-If the buffer is `eq' to DYING-BUF, do not call `kill-buffer' on it."
-  (let* ((before-p (eq side 'before))
-         (buf (if before-p
-                  (omnidiff-dual--session-before-buf session)
-                (omnidiff-dual--session-after-buf session)))
-         (owns-p (if before-p
-                     (omnidiff-dual--session-before-owns-buf-p session)
-                   (omnidiff-dual--session-after-owns-buf-p session)))
-         (orig-ro (if before-p
-                      (omnidiff-dual--session-before-orig-read-only session)
-                    (omnidiff-dual--session-after-orig-read-only session)))
-         (orig-ln (if before-p
-                      (omnidiff-dual--session-before-orig-line-numbers session)
-                    (omnidiff-dual--session-after-orig-line-numbers session)))
-         (orig-hl-local (if before-p
-                            (omnidiff-dual--session-before-orig-header-line-local-p session)
-                          (omnidiff-dual--session-after-orig-header-line-local-p session)))
-         (orig-hl (if before-p
-                      (omnidiff-dual--session-before-orig-header-line session)
-                    (omnidiff-dual--session-after-orig-header-line session)))
-         (orig-fl (if before-p
-                      (omnidiff-dual--session-before-orig-font-lock session)
-                    (omnidiff-dual--session-after-orig-font-lock session)))
-         (hl-cookie (if before-p
-                        (omnidiff-dual--session-before-hl-remap-cookie session)
-                      (omnidiff-dual--session-after-hl-remap-cookie session))))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (remove-hook 'kill-buffer-hook #'omnidiff-dual--on-kill-buffer t)
-        (remove-hook 'change-major-mode-hook #'omnidiff-dual--on-change-major-mode t)
-        (remove-hook 'post-command-hook #'omnidiff-dual--post-command t)
-        (remove-hook 'after-save-hook #'omnidiff-dual--on-after-save t)
-        (remove-hook 'after-change-functions #'omnidiff-dual--on-after-change t)
-        (omnidiff-dual--clear-overlays buf)
-        (when (listp buffer-invisibility-spec)
-          (remove-from-invisibility-spec 'omnidiff-dual-fold))
-        (if (and owns-p (not (eq buf dying-buf)))
-            (kill-buffer buf)
-          (when (bound-and-true-p omnidiff-dual-mode)
-            (omnidiff-dual-mode -1))
-          (when (bound-and-true-p omnidiff-dual-edit-mode)
-            (omnidiff-dual-edit-mode -1))
-          (setq buffer-read-only orig-ro)
-          (when (and (fboundp 'display-line-numbers-mode)
-                     (not orig-ln)
-                     (bound-and-true-p display-line-numbers-mode))
-            (display-line-numbers-mode -1))
-          (if orig-hl-local
-              (setq-local header-line-format orig-hl)
-            (kill-local-variable 'header-line-format))
-          (when hl-cookie
-            (ignore-errors (face-remap-remove-relative hl-cookie)))
-          (when (and (boundp 'font-lock-mode)
-                     (not (eq (and orig-fl t) (and font-lock-mode t))))
-            (ignore-errors (font-lock-mode (if orig-fl 1 -1))))
-          (setq-local omnidiff-dual--session nil)
-          (setq-local omnidiff-dual--side nil))))))
-
-(defun omnidiff-dual--ensure-tmpdir (session)
-  "Return SESSION's temporary directory, creating it lazily if needed."
-  (let ((dir (omnidiff-dual--session-tmpdir session)))
-    (unless (and dir (file-directory-p dir))
-      (setq dir (make-temp-file "omnidiff-dual-" t))
-      (setf (omnidiff-dual--session-tmpdir session) dir))
-    dir))
-
-(defun omnidiff-dual--delete-temp-files (paths)
-  "Silently remove temporary snapshot files in PATHS and empty parent subdirs."
-  (dolist (p paths)
-    (when (and (stringp p) (file-exists-p p))
-      (ignore-errors (delete-file p))
-      (let ((parent (file-name-directory p)))
-        (when (and parent (file-directory-p parent))
-          (ignore-errors (delete-directory parent nil)))))))
-
-(defun omnidiff-dual--write-string-temp (content tmpdir name-hint)
-  "Write string CONTENT into a unique temp file under TMPDIR preserving NAME-HINT."
-  (with-temp-buffer
-    (insert (or content ""))
-    (omnidiff-engine-write-temp-for-buffer (current-buffer) tmpdir name-hint)))
-
-;;; Diff application & asynchronous recompute
-
-(defun omnidiff-dual--initial-fold-p (session)
-  "Compute initial folding boolean for SESSION from `omnidiff-dual-fold-unchanged'."
-  (pcase omnidiff-dual-fold-unchanged
-    ('nil nil)
-    ('auto
-     (let ((nb (omnidiff-dual--logical-line-count
-                (omnidiff-dual--session-before-buf session)
-                (omnidiff-dual--session-before-line-starts session)))
-           (na (omnidiff-dual--logical-line-count
-                (omnidiff-dual--session-after-buf session)
-                (omnidiff-dual--session-after-line-starts session))))
-       (> (max nb na) omnidiff-dual-auto-fold-lines)))
-    (_ t)))
+(defun omnidiff-dual--buffer-starts-with-bom-p (buf)
+  "Return non-nil when live buffer BUF starts with a literal U+FEFF char."
+  (and (buffer-live-p buf)
+       (with-current-buffer buf
+         (save-restriction
+           (widen)
+           (eql (char-after (point-min)) #xfeff)))))
 
 (defun omnidiff-dual--file-has-bom-p (path)
   "Return non-nil when regular file PATH starts with a UTF-8/UTF-16/UTF-32 BOM."
@@ -1752,6 +1642,191 @@ If the buffer is `eq' to DYING-BUF, do not call `kill-buffer' on it."
                  (string-match-p "with-signature" (symbol-name cs)))
              (not (eql (save-restriction (widen) (char-after (point-min)))
                        #xfeff)))))))
+
+(defun omnidiff-dual--apply-safe-major-mode (buf path-hint show-syntax)
+  "Enable native syntax highlighting in ephemeral BUF without running mode hooks.
+Uses PATH-HINT against `auto-mode-alist' while guarding size against
+`omnidiff-dual-syntax-max-bytes'."
+  (with-current-buffer buf
+    (when (and (stringp path-hint)
+               (not (string-empty-p path-hint))
+               (not (string= path-hint "/dev/null"))
+               (<= (buffer-size) omnidiff-dual-syntax-max-bytes))
+      (let ((buffer-file-name (expand-file-name path-hint))
+            (enable-local-variables nil)
+            (enable-dir-local-variables nil))
+        (ignore-errors
+          (delay-mode-hooks
+            (set-auto-mode t)))
+        (setq delayed-mode-hooks nil))
+      ;; Never let viewer major modes (e.g., `image-mode' on `.svg') hide source text.
+      (when (derived-mode-p 'image-mode 'archive-mode 'tar-mode 'doc-view-mode)
+        (let ((enable-local-variables nil)
+              (enable-dir-local-variables nil))
+          (ignore-errors
+            (delay-mode-hooks
+              (if (string-match-p "\\.svgz?\\'" path-hint)
+                  (xml-mode)
+                (fundamental-mode))))
+          (setq delayed-mode-hooks nil)))
+      (when (and show-syntax (not (eq major-mode 'fundamental-mode)))
+        (ignore-errors
+          (font-lock-mode 1)
+          (when noninteractive
+            (font-lock-ensure)))))))
+
+(defun omnidiff-dual--make-ephemeral-buffer (side display-name content path-hint show-syntax)
+  "Create and populate an owned ephemeral buffer for SIDE.
+Strips any leading U+FEFF byte order mark so line 0 aligns consistently
+with BOM-stripped visited buffers."
+  (let* ((tag (if (eq side 'before) "BEFORE" "AFTER"))
+         (buf (generate-new-buffer (format "*omnidiff %s: %s*" tag display-name)))
+         (clean (omnidiff-dual--strip-leading-bom (or content ""))))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (insert clean))
+      (goto-char (point-min))
+      (set-buffer-modified-p nil)
+      (setq buffer-undo-list t)
+      (omnidiff-dual--apply-safe-major-mode buf path-hint show-syntax))
+    buf))
+
+(defun omnidiff-dual--writable-file-p (path)
+  "Return non-nil when PATH is a regular readable and writable file on disk."
+  (and (stringp path)
+       (not (string-empty-p path))
+       (not (string= path "/dev/null"))
+       (file-regular-p path)
+       (file-readable-p path)
+       (file-writable-p path)))
+
+(defun omnidiff-dual--attach-pane (session side pane)
+  "Attach PANE's buffer on SIDE to SESSION, recording original state on PANE."
+  (let ((buf (omnidiff-dual--pane-buf pane)))
+    (with-current-buffer buf
+      ;; If BUF is still attached to another session, tear down that session first
+      ;; so BUF's true original state is restored before we record `:orig-state'.
+      (when (and (omnidiff-dual--session-p omnidiff-dual--session)
+                 (not (eq omnidiff-dual--session session)))
+        (save-current-buffer
+          (omnidiff-dual--teardown omnidiff-dual--session nil nil)))
+      (let ((orig-ro buffer-read-only)
+            (orig-ln (bound-and-true-p display-line-numbers-mode))
+            (orig-hl-local (local-variable-p 'header-line-format))
+            (orig-hl header-line-format)
+            (orig-fl (bound-and-true-p font-lock-mode))
+            (hl-cookie nil))
+        (setq-local omnidiff-dual--session session)
+        (setq-local omnidiff-dual--side side)
+        (unless (bound-and-true-p display-line-numbers-mode)
+          (display-line-numbers-mode 1))
+        (setq-local header-line-format '(:eval (omnidiff-dual--header-line)))
+        (setq hl-cookie (face-remap-add-relative 'header-line 'omnidiff-dual-header-meta))
+        (setf (omnidiff-dual--pane-orig-state pane)
+              (list :read-only orig-ro
+                    :line-numbers orig-ln
+                    :header-line-local-p orig-hl-local
+                    :header-line orig-hl
+                    :font-lock orig-fl
+                    :hl-remap-cookie hl-cookie))
+        (unless (omnidiff-dual--session-show-syntax session)
+          (ignore-errors
+            (when (bound-and-true-p font-lock-mode)
+              (font-lock-mode -1))
+            (font-lock-unfontify-buffer)))
+        (setq buffer-read-only t)
+        (omnidiff-dual-edit-mode -1)
+        (omnidiff-dual-mode 1)
+        (add-hook 'post-command-hook #'omnidiff-dual--post-command nil t)
+        (add-hook 'kill-buffer-hook #'omnidiff-dual--on-kill-buffer nil t)
+        (add-hook 'change-major-mode-hook #'omnidiff-dual--on-change-major-mode nil t)
+        (when (and (eq side 'after)
+                   (omnidiff-dual--session-editable-after-p session))
+          (add-hook 'after-save-hook #'omnidiff-dual--on-after-save nil t))))))
+
+(defun omnidiff-dual--detach-pane (pane &optional dying-buf keep-buffer)
+  "Detach PANE's buffer, killing owned buffers or restoring user ones.
+Idempotent: clears PANE's `buf' and `orig-state' after detaching.
+If the buffer is `eq' to DYING-BUF or KEEP-BUFFER is non-nil, restores buffer
+state without calling `kill-buffer'."
+  (when pane
+    (let ((buf (omnidiff-dual--pane-buf pane))
+          (owns-p (omnidiff-dual--pane-owns-buf-p pane))
+          (orig (omnidiff-dual--pane-orig-state pane)))
+      (setf (omnidiff-dual--pane-buf pane) nil
+            (omnidiff-dual--pane-orig-state pane) nil
+            (omnidiff-dual--pane-header-cache pane) nil)
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (remove-hook 'kill-buffer-hook #'omnidiff-dual--on-kill-buffer t)
+          (remove-hook 'change-major-mode-hook #'omnidiff-dual--on-change-major-mode t)
+          (remove-hook 'post-command-hook #'omnidiff-dual--post-command t)
+          (remove-hook 'after-save-hook #'omnidiff-dual--on-after-save t)
+          (remove-hook 'after-change-functions #'omnidiff-dual--on-after-change t)
+          (omnidiff-dual--clear-overlays buf)
+          (when (listp buffer-invisibility-spec)
+            (remove-from-invisibility-spec 'omnidiff-dual-fold))
+          (if (and owns-p (not keep-buffer) (not (eq buf dying-buf)))
+              (kill-buffer buf)
+            (when (bound-and-true-p omnidiff-dual-mode)
+              (omnidiff-dual-mode -1))
+            (when (bound-and-true-p omnidiff-dual-edit-mode)
+              (omnidiff-dual-edit-mode -1))
+            (setq buffer-read-only (plist-get orig :read-only))
+            (when (and (not (plist-get orig :line-numbers))
+                       (bound-and-true-p display-line-numbers-mode))
+              (display-line-numbers-mode -1))
+            (if (plist-get orig :header-line-local-p)
+                (setq-local header-line-format (plist-get orig :header-line))
+              (kill-local-variable 'header-line-format))
+            (when-let* ((hl-cookie (plist-get orig :hl-remap-cookie)))
+              (ignore-errors (face-remap-remove-relative hl-cookie)))
+            (let ((orig-fl (and (plist-get orig :font-lock) t)))
+              (unless (eq orig-fl (and (bound-and-true-p font-lock-mode) t))
+                (ignore-errors (font-lock-mode (if orig-fl 1 -1)))))
+            (setq-local omnidiff-dual--session nil)
+            (setq-local omnidiff-dual--side nil)))))))
+
+(defun omnidiff-dual--ensure-tmpdir (session)
+  "Return SESSION's temporary directory, creating it lazily if needed."
+  (let ((dir (omnidiff-dual--session-tmpdir session)))
+    (unless (and dir (file-directory-p dir))
+      (setq dir (make-temp-file "omnidiff-dual-" t))
+      (setf (omnidiff-dual--session-tmpdir session) dir))
+    dir))
+
+(defun omnidiff-dual--delete-temp-files (paths)
+  "Silently remove temporary snapshot files in PATHS and empty parent subdirs."
+  (dolist (p paths)
+    (when (and (stringp p) (file-exists-p p))
+      (ignore-errors (delete-file p))
+      (let ((parent (file-name-directory p)))
+        (when (and parent (file-directory-p parent))
+          (ignore-errors (delete-directory parent nil)))))))
+
+(defun omnidiff-dual--write-string-temp (content tmpdir name-hint)
+  "Write string CONTENT into a unique temp file under TMPDIR preserving NAME-HINT."
+  (with-temp-buffer
+    (insert (or content ""))
+    (omnidiff-engine-write-temp-for-buffer (current-buffer) tmpdir name-hint)))
+
+;;; Diff application & asynchronous recompute
+
+(defun omnidiff-dual--initial-fold-p (session)
+  "Compute initial folding boolean for SESSION from `omnidiff-dual-fold-unchanged'."
+  (pcase omnidiff-dual-fold-unchanged
+    ('nil nil)
+    ('auto
+     (let* ((bp (omnidiff-dual--session-before-pane session))
+            (ap (omnidiff-dual--session-after-pane session))
+            (nb (omnidiff-dual--logical-line-count
+                 (omnidiff-dual--pane-buf bp)
+                 (omnidiff-dual--pane-line-starts bp)))
+            (na (omnidiff-dual--logical-line-count
+                 (omnidiff-dual--pane-buf ap)
+                 (omnidiff-dual--pane-line-starts ap))))
+       (> (max nb na) omnidiff-dual-auto-fold-lines)))
+    (_ t)))
 
 (defun omnidiff-dual--shift-row0-range (range delta)
   "Return RANGE with row-0 byte columns shifted by DELTA (clamped >= 0)."
@@ -1801,7 +1876,7 @@ If the buffer is `eq' to DYING-BUF, do not call `kill-buffer' on it."
          :hunks (nreverse new-hunks))))))
 
 (defun omnidiff-dual--side-json-has-bom-p (side-json fallback-path)
-  "Return non-nil when SIDE-JSON was computed from a BOM-prefixed disk file."
+  "Fallback one-shot check whether precomputed SIDE-JSON came from a BOM file."
   (when side-json
     (let ((jpath (omnidiff-json-side-path side-json)))
       (or (omnidiff-dual--file-has-bom-p jpath)
@@ -1813,22 +1888,21 @@ If the buffer is `eq' to DYING-BUF, do not call `kill-buffer' on it."
                       (file-name-nondirectory fallback-path))
                (omnidiff-dual--file-has-bom-p fallback-path))))))
 
-(defun omnidiff-dual--normalize-bom-diff (session json-diff before-buf after-buf)
-  "Adjust row-0 byte columns in JSON-DIFF for BOM-stripped visited buffers.
-Non-destructively shifts row-0 columns by -3 on any side whose Emacs buffer
-stripped a leading U+FEFF while `omnidiff' read the BOM-prefixed file from disk."
+(defun omnidiff-dual--normalize-bom-diff (json-diff b-diff-bom a-diff-bom before-buf after-buf)
+  "Adjust row-0 byte columns in JSON-DIFF when inputs had BOMs stripped in buffers.
+B-DIFF-BOM and A-DIFF-BOM indicate whether the files diffed by `omnidiff'
+started with a BOM; columns are shifted by -3 on any side whose buffer has
+no leading U+FEFF."
   (if (null json-diff)
       nil
     (let* ((b-side (omnidiff-json-diff-before json-diff))
            (a-side (omnidiff-json-diff-after json-diff))
-           (b-shift (if (and (omnidiff-dual--buffer-bom-stripped-p before-buf)
-                             (omnidiff-dual--side-json-has-bom-p
-                              b-side (omnidiff-dual--session-before-path session)))
+           (b-shift (if (and b-diff-bom
+                             (not (omnidiff-dual--buffer-starts-with-bom-p before-buf)))
                         -3
                       0))
-           (a-shift (if (and (omnidiff-dual--buffer-bom-stripped-p after-buf)
-                             (omnidiff-dual--side-json-has-bom-p
-                              a-side (omnidiff-dual--session-after-path session)))
+           (a-shift (if (and a-diff-bom
+                             (not (omnidiff-dual--buffer-starts-with-bom-p after-buf)))
                         -3
                       0)))
       (if (and (= b-shift 0) (= a-shift 0))
@@ -1846,9 +1920,10 @@ stripped a leading U+FEFF while `omnidiff' read the BOM-prefixed file from disk.
   "Focus and move point to `omnidiff-change-stop' STOP in SESSION."
   (let* ((side (omnidiff-change-stop-side stop))
          (range (omnidiff-change-stop-range stop))
-         (buf (omnidiff-dual--side-buf session side))
-         (starts (omnidiff-dual--side-line-starts session side))
-         (tick (omnidiff-dual--side-lines-tick session side)))
+         (pane (omnidiff-dual--pane session side))
+         (buf (omnidiff-dual--pane-buf pane))
+         (starts (omnidiff-dual--pane-line-starts pane))
+         (tick (omnidiff-dual--pane-lines-tick pane)))
     (when (buffer-live-p buf)
       (setf (omnidiff-dual--session-stop-index session)
             (omnidiff-change-stop-index stop))
@@ -1865,41 +1940,63 @@ stripped a leading U+FEFF while `omnidiff' read the BOM-prefixed file from disk.
             (ignore-errors (recenter)))))
       (omnidiff-dual--sync-focus-and-counterpart session stop center-p))))
 
-(defun omnidiff-dual--apply-diff (session json-diff &optional preserve-cursor)
+(defun omnidiff-dual--apply-diff (session json-diff &optional preserve-cursor
+                                          initial-side initial-line
+                                          b-diff-bom a-diff-bom)
   "Install JSON-DIFF on SESSION, computing alignment, stops, and overlays.
 When PRESERVE-CURSOR is non-nil, keep cursor positions in place instead of
-jumping to the first change stop."
-  (let* ((bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session))
-         (json-diff (omnidiff-dual--normalize-bom-diff session json-diff bb ab))
+jumping.  Otherwise, if INITIAL-LINE is a positive 1-based line number, jump
+directly to INITIAL-SIDE (default `after') at INITIAL-LINE with a single
+counterpart sync; else jump to the first change stop.
+B-DIFF-BOM and A-DIFF-BOM indicate whether the diff inputs started with a BOM."
+  (let* ((b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf b-pane))
+         (ab (omnidiff-dual--pane-buf a-pane))
+         (json-diff (omnidiff-dual--normalize-bom-diff
+                     json-diff b-diff-bom a-diff-bom bb ab))
          (b-tick (buffer-chars-modified-tick bb))
          (a-tick (buffer-chars-modified-tick ab))
-         (b-starts (omnidiff-engine-buffer-line-offsets bb))
-         (a-starts (omnidiff-engine-buffer-line-offsets ab))
+         (b-starts (if (omnidiff-dual--line-starts-fresh-p
+                        bb
+                        (omnidiff-dual--pane-line-starts b-pane)
+                        (omnidiff-dual--pane-lines-tick b-pane))
+                       (omnidiff-dual--pane-line-starts b-pane)
+                     (omnidiff-engine-buffer-line-offsets bb)))
+         (a-starts (if (omnidiff-dual--line-starts-fresh-p
+                        ab
+                        (omnidiff-dual--pane-line-starts a-pane)
+                        (omnidiff-dual--pane-lines-tick a-pane))
+                       (omnidiff-dual--pane-line-starts a-pane)
+                     (omnidiff-engine-buffer-line-offsets ab)))
          (b-lines (omnidiff-dual--buffer-lines bb b-starts))
          (a-lines (omnidiff-dual--buffer-lines ab a-starts))
          (alignment (omnidiff-engine-compute-alignment b-lines a-lines json-diff))
-         (stops (omnidiff-engine-build-change-stops json-diff alignment)))
+         (stops (omnidiff-engine-build-change-stops json-diff alignment))
+         (apply-folds-p (not (and preserve-cursor (omnidiff-dual--session-editing-p session))))
+         (clear-kinds (if apply-folds-p '(token fringe fold fold-nl) '(token fringe))))
     (setf (omnidiff-dual--session-json-diff session) json-diff
-          (omnidiff-dual--session-before-line-starts session) b-starts
-          (omnidiff-dual--session-after-line-starts session) a-starts
-          (omnidiff-dual--session-before-lines-tick session) b-tick
-          (omnidiff-dual--session-after-lines-tick session) a-tick
-          (omnidiff-dual--session-before-lines session) b-lines
-          (omnidiff-dual--session-after-lines session) a-lines
+          (omnidiff-dual--pane-line-starts b-pane) b-starts
+          (omnidiff-dual--pane-line-starts a-pane) a-starts
+          (omnidiff-dual--pane-lines-tick b-pane) b-tick
+          (omnidiff-dual--pane-lines-tick a-pane) a-tick
           (omnidiff-dual--session-alignment session) alignment
           (omnidiff-dual--session-stops session) stops
           (omnidiff-dual--session-minimap-cache session) nil
-          (omnidiff-dual--session-last-cursor-state session) nil)
+          (omnidiff-dual--session-last-cursor-state session) nil
+          (omnidiff-dual--session-sync-cache session) nil)
     (unless preserve-cursor
       (setf (omnidiff-dual--session-fold-unchanged session)
             (omnidiff-dual--initial-fold-p session)
             (omnidiff-dual--session-stop-index session) (if stops 1 0)
             (omnidiff-dual--session-last-jump session) nil))
-    (omnidiff-dual--apply-side-overlays session 'before)
-    (omnidiff-dual--apply-side-overlays session 'after)
-    (unless (and preserve-cursor (omnidiff-dual--session-editing-p session))
-      (omnidiff-dual--apply-folds session)
+    ;; Clear overlays once per side instead of separate token/fringe/fold passes.
+    (omnidiff-dual--clear-overlays bb clear-kinds)
+    (omnidiff-dual--clear-overlays ab clear-kinds)
+    (omnidiff-dual--apply-side-overlays session 'before t)
+    (omnidiff-dual--apply-side-overlays session 'after t)
+    (when apply-folds-p
+      (omnidiff-dual--apply-folds session t)
       (when preserve-cursor
         (let ((active-buf (omnidiff-dual--side-buf
                            session (omnidiff-dual--session-active-side session))))
@@ -1909,80 +2006,151 @@ jumping to the first change stop."
     (cond
      (preserve-cursor
       (omnidiff-dual--sync-focus-and-counterpart session nil nil))
+     ((and (integerp initial-line) (> initial-line 0))
+      (let* ((target-side (if (eq initial-side 'before) 'before 'after))
+             (target-pane (omnidiff-dual--pane session target-side))
+             (target-buf (omnidiff-dual--pane-buf target-pane))
+             (target-starts (omnidiff-dual--pane-line-starts target-pane))
+             (target-tick (omnidiff-dual--pane-lines-tick target-pane)))
+        (omnidiff-dual--focus-side session target-side)
+        (when (and (buffer-live-p target-buf) target-starts (> (length target-starts) 0))
+          (let ((pos (omnidiff-dual--row-byte-col-to-point
+                      target-buf target-starts (1- initial-line) 0 target-tick)))
+            (with-current-buffer target-buf
+              (omnidiff-dual--expand-fold-at pos)
+              (goto-char pos)
+              (ignore-errors (recenter)))))
+        (omnidiff-dual--sync-focus-and-counterpart session nil t)))
      (stops
       (omnidiff-dual--goto-stop session (car stops) t))
      (t
       (omnidiff-dual--clear-focus-overlays session)
-      (omnidiff-dual--focus-side session 'after)
+      (omnidiff-dual--focus-side session (if (eq initial-side 'before) 'before 'after))
       (with-current-buffer ab (goto-char (point-min)))
       (with-current-buffer bb (goto-char (point-min)))
       (omnidiff-dual--refresh-headers session)))
     (run-hooks 'omnidiff-dual-after-diff-hook)))
 
-(defun omnidiff-dual--snapshot-paths (session)
-  "Return `(BEFORE-FILE AFTER-FILE TEMP-FILES)' for invoking `omnidiff'."
-  (let* ((bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session))
-         (bp (omnidiff-dual--session-before-path session))
-         (ap (omnidiff-dual--session-after-path session))
-         (hint (or (omnidiff-dual--session-display-path session)
-                   ap bp "file"))
+(defun omnidiff-dual--snapshot-paths-internal (session &optional tmpdir)
+  "Return `(BEFORE-FILE AFTER-FILE TEMP-FILES B-BOM A-BOM)' for SESSION.
+Uses TMPDIR (or SESSION's lazily created tmpdir) when materializing temp
+buffer snapshots.  Maintains BOM parity when both panes came from BOM files."
+  (let* ((b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf b-pane))
+         (ab (omnidiff-dual--pane-buf a-pane))
+         (bp (omnidiff-dual--pane-path b-pane))
+         (ap (omnidiff-dual--pane-path a-pane))
+         (b-bom (omnidiff-dual--pane-has-bom b-pane))
+         (a-bom (omnidiff-dual--pane-has-bom a-pane))
+         (hint (or (omnidiff-dual--session-display-path session) ap bp "file"))
+         (b-disk-ok (and (stringp bp)
+                         (or (string= bp "/dev/null")
+                             (and (file-exists-p bp)
+                                  (or (not (buffer-live-p bb))
+                                      (not (buffer-modified-p bb)))))))
+         (a-disk-ok (and (stringp ap)
+                         (or (string= ap "/dev/null")
+                             (and (file-exists-p ap)
+                                  (or (not (buffer-live-p ab))
+                                      (not (buffer-modified-p ab)))))))
          (temps nil)
-         (b-file (if (and (stringp bp)
-                          (or (string= bp "/dev/null") (file-exists-p bp))
-                          (not (buffer-modified-p bb)))
-                     bp
-                   (let ((f (omnidiff-engine-write-temp-for-buffer
-                             bb (omnidiff-dual--ensure-tmpdir session) hint)))
-                     (push f temps)
-                     f)))
-         (a-file (if (and (stringp ap)
-                          (or (string= ap "/dev/null") (file-exists-p ap))
-                          (not (buffer-modified-p ab)))
-                     ap
-                   (let ((f (omnidiff-engine-write-temp-for-buffer
-                             ab (omnidiff-dual--ensure-tmpdir session) hint)))
-                     (push f temps)
-                     f))))
-    (list b-file a-file temps)))
+         (b-file nil)
+         (a-file nil)
+         (b-snap-bom nil)
+         (a-snap-bom nil))
+    ;; If both sides originated from BOM files and one side must snapshot its
+    ;; BOM-stripped buffer to UTF-8 without BOM, snapshot both sides from their
+    ;; BOM-stripped buffers so `omnidiff' never emits a spurious row-0 BOM diff.
+    (when (and b-bom a-bom)
+      (when (and (not a-disk-ok) b-disk-ok (not (string= bp "/dev/null"))
+                 (buffer-live-p bb) (not (omnidiff-dual--buffer-starts-with-bom-p bb)))
+        (setq b-disk-ok nil))
+      (when (and (not b-disk-ok) a-disk-ok (not (string= ap "/dev/null"))
+                 (buffer-live-p ab) (not (omnidiff-dual--buffer-starts-with-bom-p ab)))
+        (setq a-disk-ok nil)))
+    (cl-flet ((snap-side (buf path bom disk-ok)
+                (cond
+                 (disk-ok
+                  (cons path (and (not (string= path "/dev/null")) bom)))
+                 ((buffer-live-p buf)
+                  (let ((f (omnidiff-engine-write-temp-for-buffer
+                            buf (or tmpdir (omnidiff-dual--ensure-tmpdir session)) hint)))
+                    (push f temps)
+                    (cons f (omnidiff-dual--buffer-starts-with-bom-p buf))))
+                 (t (cons "/dev/null" nil)))))
+      (condition-case err
+          (let ((bs (snap-side bb bp b-bom b-disk-ok))
+                (as (snap-side ab ap a-bom a-disk-ok)))
+            (setq b-file (car bs) b-snap-bom (cdr bs)
+                  a-file (car as) a-snap-bom (cdr as)))
+        (error
+         (omnidiff-dual--delete-temp-files temps)
+         (signal (car err) (cdr err)))))
+    (list b-file a-file temps b-snap-bom a-snap-bom)))
+
+(defun omnidiff-dual-session-snapshot-paths (session &optional tmpdir)
+  "Return `(BEFORE-FILE AFTER-FILE TEMP-FILES)' for invoking `omnidiff' on SESSION.
+When TMPDIR is non-nil, writes any needed buffer snapshot temp files inside
+TMPDIR instead of SESSION's internal temporary directory."
+  (let ((res (omnidiff-dual--snapshot-paths-internal session tmpdir)))
+    (list (nth 0 res) (nth 1 res) (nth 2 res))))
 
 (defun omnidiff-dual--refresh-async (session)
   "Asynchronously re-run `omnidiff --mode json' for SESSION preserving cursor."
-  (when (and (memq session omnidiff-dual--sessions)
-             (buffer-live-p (omnidiff-dual--session-before-buf session))
-             (buffer-live-p (omnidiff-dual--session-after-buf session)))
-    ;; Bump request-seq before killing old-proc so its sentinel drops silently.
-    (let* ((seq (cl-incf (omnidiff-dual--session-request-seq session)))
-           (old-proc (omnidiff-dual--session-active-proc session)))
-      (when (and old-proc (process-live-p old-proc))
-        (delete-process old-proc))
-      (let* ((snap (omnidiff-dual--snapshot-paths session))
-           (b-file (nth 0 snap))
-           (a-file (nth 1 snap))
-           (temps (nth 2 snap))
-           (proc
-            (omnidiff-engine-run-pair-async
-             b-file a-file
-             (lambda (new-diff)
-               (omnidiff-dual--delete-temp-files temps)
-               (when (and (memq session omnidiff-dual--sessions)
-                          (= seq (omnidiff-dual--session-request-seq session))
-                          (buffer-live-p (omnidiff-dual--session-before-buf session))
-                          (buffer-live-p (omnidiff-dual--session-after-buf session)))
-                 (setf (omnidiff-dual--session-active-proc session) nil)
-                 (omnidiff-dual--apply-diff session new-diff t)))
-             :preset (omnidiff-dual--session-preset session)
-             :whole-updates (omnidiff-dual--session-whole-updates session)
-             :paint-reindent-moves (omnidiff-dual--session-paint-reindent-moves session)
-             :error-callback
-             (lambda (err-msg)
-               (omnidiff-dual--delete-temp-files temps)
-               (when (and (memq session omnidiff-dual--sessions)
-                          (= seq (omnidiff-dual--session-request-seq session)))
-                 (setf (omnidiff-dual--session-active-proc session) nil)
-                 (message "OmniDiff refresh failed: %s" err-msg))))))
-      (setf (omnidiff-dual--session-active-proc session) proc)
-      proc))))
+  (let ((bb (omnidiff-dual-session-before-buf session))
+        (ab (omnidiff-dual-session-after-buf session)))
+    (when (and (memq session omnidiff-dual--sessions)
+               (buffer-live-p bb)
+               (buffer-live-p ab))
+      ;; Bump request-seq before killing old-proc so its sentinel drops silently.
+      (let* ((seq (cl-incf (omnidiff-dual--session-request-seq session)))
+             (old-proc (omnidiff-dual--session-active-proc session))
+             (snap-b-tick (buffer-chars-modified-tick bb))
+             (snap-a-tick (buffer-chars-modified-tick ab)))
+        (when (and old-proc (process-live-p old-proc))
+          (delete-process old-proc))
+        (let* ((snap (omnidiff-dual--snapshot-paths-internal session))
+               (b-file (nth 0 snap))
+               (a-file (nth 1 snap))
+               (temps (nth 2 snap))
+               (b-snap-bom (nth 3 snap))
+               (a-snap-bom (nth 4 snap))
+               (proc
+                (condition-case err
+                    (omnidiff-engine-run-pair-async
+                     b-file a-file
+                     (lambda (new-diff)
+                       (omnidiff-dual--delete-temp-files temps)
+                       (when (and (memq session omnidiff-dual--sessions)
+                                  (= seq (omnidiff-dual--session-request-seq session))
+                                  (buffer-live-p bb)
+                                  (buffer-live-p ab)
+                                  (eq bb (omnidiff-dual-session-before-buf session))
+                                  (eq ab (omnidiff-dual-session-after-buf session)))
+                         (setf (omnidiff-dual--session-active-proc session) nil)
+                         (if (and (= snap-b-tick (buffer-chars-modified-tick bb))
+                                  (= snap-a-tick (buffer-chars-modified-tick ab)))
+                             (omnidiff-dual--apply-diff
+                              session new-diff t nil nil b-snap-bom a-snap-bom)
+                           ;; Either buffer changed in flight: discard stale diff
+                           ;; (never stamp it with the new tick) and re-run cleanly.
+                           (omnidiff-dual--refresh-async session))))
+                     :preset (omnidiff-dual--session-preset session)
+                     :whole-updates (omnidiff-dual--session-whole-updates session)
+                     :paint-reindent-moves (omnidiff-dual--session-paint-reindent-moves session)
+                     :error-callback
+                     (lambda (err-msg)
+                       (omnidiff-dual--delete-temp-files temps)
+                       (when (and (memq session omnidiff-dual--sessions)
+                                  (= seq (omnidiff-dual--session-request-seq session)))
+                         (setf (omnidiff-dual--session-active-proc session) nil)
+                         (message "OmniDiff refresh failed: %s" err-msg))))
+                  (error
+                   (omnidiff-dual--delete-temp-files temps)
+                   (signal (car err) (cdr err))))))
+          (setf (omnidiff-dual--session-active-proc session) proc)
+          proc)))))
 
 ;;; Live edit hooks
 
@@ -1992,34 +2160,38 @@ jumping to the first change stop."
     (setf (omnidiff-dual--session-live-timer session) nil)
     (when (and (memq session omnidiff-dual--sessions)
                (omnidiff-dual--session-editing-p session)
-               (buffer-live-p (omnidiff-dual--session-before-buf session))
-               (buffer-live-p (omnidiff-dual--session-after-buf session)))
+               (buffer-live-p (omnidiff-dual-session-before-buf session))
+               (buffer-live-p (omnidiff-dual-session-after-buf session)))
       (omnidiff-dual--refresh-async session))))
 
 (defun omnidiff-dual--on-after-save ()
-  "Recompute semantic overlays after saving a live-edited AFTER buffer."
+  "Track save mutation and recompute semantic overlays for editable AFTER buffer."
   (when-let* ((session (omnidiff-dual-active-session)))
     (when (eq omnidiff-dual--side 'after)
-      (setf (omnidiff-dual--session-mutated-p session) t)
+      (setf (omnidiff-dual--session-mutated-p session) t
+            (omnidiff-dual--pane-has-bom (omnidiff-dual--session-after-pane session))
+            (omnidiff-dual--buffer-bom-stripped-p (current-buffer)))
       (when (memq omnidiff-dual-live-update '(on-save idle))
-        (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-          (cancel-timer timer)
-          (setf (omnidiff-dual--session-live-timer session) nil))
+        (omnidiff-dual--cancel-live-timer session)
         (omnidiff-dual--refresh-async session)))))
 
-(defun omnidiff-dual--on-after-change (_beg _end _len)
-  "Schedule debounced idle diff recompute after editing the AFTER buffer."
+(defun omnidiff-dual--on-after-change (beg _end _len)
+  "Track edit mutation and schedule debounced idle recompute in AFTER buffer."
   (when-let* ((session (omnidiff-dual-active-session)))
     (when (and (eq omnidiff-dual--side 'after)
-               (eq omnidiff-dual-live-update 'idle)
                (omnidiff-dual--session-editing-p session))
-      (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-        (cancel-timer timer))
-      (setf (omnidiff-dual--session-live-timer session)
-            (run-with-idle-timer (max 0.05 omnidiff-dual-live-delay)
-                                 nil
-                                 #'omnidiff-dual--live-timer-fire
-                                 session)))))
+      (setf (omnidiff-dual--session-mutated-p session) t)
+      (let ((sc (omnidiff-dual--session-sync-cache session)))
+        (when (and sc (integerp (plist-get sc :bol)) (< beg (plist-get sc :bol)))
+          (plist-put sc :bol nil)))
+      (when (eq omnidiff-dual-live-update 'idle)
+        (when-let* ((timer (omnidiff-dual--session-live-timer session)))
+          (cancel-timer timer))
+        (setf (omnidiff-dual--session-live-timer session)
+              (run-with-idle-timer (max 0.05 omnidiff-dual-live-delay)
+                                   nil
+                                   #'omnidiff-dual--live-timer-fire
+                                   session))))))
 
 ;;; Session teardown
 
@@ -2030,29 +2202,38 @@ When RESTORE-WINDOWS is non-nil, restore saved window configuration or tab."
   (unless (omnidiff-dual--session-tearing-down-p session)
     (setf (omnidiff-dual--session-tearing-down-p session) t)
     (setq omnidiff-dual--sessions (delq session omnidiff-dual--sessions))
-    (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-      (when (timerp timer) (cancel-timer timer))
-      (setf (omnidiff-dual--session-live-timer session) nil))
+    (omnidiff-dual--cancel-live-timer session)
     (when-let* ((proc (omnidiff-dual--session-active-proc session)))
       (when (process-live-p proc) (delete-process proc))
       (setf (omnidiff-dual--session-active-proc session) nil))
     (omnidiff-dual--clear-focus-overlays session)
-    (let ((saved-winconf (omnidiff-dual--session-saved-winconf session))
-          (created-tab (omnidiff-dual--session-created-tab-p session))
-          (created-tab-frame (omnidiff-dual--session-created-tab-frame session))
-          (created-tab-id (omnidiff-dual--session-created-tab-id session))
-          (tmpdir (omnidiff-dual--session-tmpdir session))
-          (on-quit (plist-get (omnidiff-dual--session-nav-callbacks session) :on-quit)))
-      (omnidiff-dual--detach-buffer session 'before dying-buf)
-      (omnidiff-dual--detach-buffer session 'after dying-buf)
+    (let* ((saved-winconf (omnidiff-dual--session-saved-winconf session))
+           (saved-winconf-tab (omnidiff-dual--session-saved-winconf-tab session))
+           (created-tab (omnidiff-dual--session-created-tab-p session))
+           (created-tab-frame (omnidiff-dual--session-created-tab-frame session))
+           (created-tab-id (omnidiff-dual--session-created-tab-id session))
+           (tmpdir (omnidiff-dual--session-tmpdir session))
+           (wc-frame (and (window-configuration-p saved-winconf)
+                          (window-configuration-frame saved-winconf)))
+           (wc-marker (and saved-winconf-tab
+                           (cons 'omnidiff-dual-winconf-id saved-winconf-tab)))
+           (same-tab-p t))
+      (omnidiff-dual--detach-pane (omnidiff-dual--session-before-pane session) dying-buf)
+      (omnidiff-dual--detach-pane (omnidiff-dual--session-after-pane session) dying-buf)
       (setf (omnidiff-dual--session-tmpdir session) nil)
       (when (and tmpdir (file-directory-p tmpdir))
         (ignore-errors (delete-directory tmpdir t)))
+      ;; Always inspect & clean up any `omnidiff-dual-winconf-id' tab marker.
+      (when (and wc-marker (frame-live-p wc-frame) (bound-and-true-p tab-bar-mode))
+        (ignore-errors
+          (let* ((tabs (tab-bar-tabs wc-frame))
+                 (cur (assq 'current-tab tabs)))
+            (setq same-tab-p (and cur (member wc-marker (cdr cur)) t))
+            (dolist (tab tabs)
+              (setcdr tab (delete wc-marker (cdr tab)))))))
       (when restore-windows
         (cond
-         ((and created-tab
-               (fboundp 'tab-bar-close-tab)
-               (fboundp 'tab-bar-tabs))
+         (created-tab
           (let ((frame (if (frame-live-p created-tab-frame)
                            created-tab-frame
                          (selected-frame))))
@@ -2068,14 +2249,18 @@ When RESTORE-WINDOWS is non-nil, restore saved window configuration or tab."
                   (when (and idx (> (length tabs) 1))
                     (with-selected-frame frame
                       (tab-bar-close-tab (1+ idx)))))))))
-         ((window-configuration-p saved-winconf)
+         ((and (window-configuration-p saved-winconf)
+               (eq (selected-frame) wc-frame)
+               same-tab-p)
           (ignore-errors (set-window-configuration saved-winconf)))))
-      (when (functionp on-quit)
-        (ignore-errors
-          (let ((arity (func-arity on-quit)))
-            (if (and (consp arity) (eql (cdr arity) 0))
-                (funcall on-quit)
-              (funcall on-quit session))))))))
+      (ignore-errors (omnidiff-dual--invoke-callback session :on-quit)))))
+
+(cl-defun omnidiff-dual-close (&optional session (restore-windows t))
+  "Close dual SESSION (defaulting to the active buffer's session) cleanly.
+When RESTORE-WINDOWS is non-nil (default t), restore saved windows or tab."
+  (when-let* ((target (or session (omnidiff-dual-active-session))))
+    (when (omnidiff-dual--session-p target)
+      (omnidiff-dual--teardown target nil restore-windows))))
 
 (defun omnidiff-dual--on-kill-buffer ()
   "Clean up an active dual session if one of its buffers is killed directly."
@@ -2091,23 +2276,6 @@ When RESTORE-WINDOWS is non-nil, restore saved window configuration or tab."
 
 ;;; Navigation & interactive commands
 
-(defun omnidiff-dual--stop-sort-key (alignment stop)
-  "Return reading-order sort key `(AFTER-ROW BEFORE-ROW COL)' for STOP."
-  (let* ((side (omnidiff-change-stop-side stop))
-         (rng (omnidiff-change-stop-range stop))
-         (sr (omnidiff-json-range-start-row rng))
-         (sc (omnidiff-json-range-start-col rng)))
-    (if (eq side 'after)
-        (list sr (omnidiff-engine-map-row alignment 'after sr) sc)
-      (list (omnidiff-engine-map-row alignment 'before sr) sr sc))))
-
-(defun omnidiff-dual--key-less-p (a b)
-  "Return non-nil if 3-element integer tuple A precedes B lexicographically."
-  (cond
-   ((/= (nth 0 a) (nth 0 b)) (< (nth 0 a) (nth 0 b)))
-   ((/= (nth 1 a) (nth 1 b)) (< (nth 1 a) (nth 1 b)))
-   (t (< (nth 2 a) (nth 2 b)))))
-
 (defun omnidiff-dual--step-change (session forward-p)
   "Move SESSION to the next (FORWARD-P) or previous change stop."
   (let ((stops (omnidiff-dual--session-stops session)))
@@ -2117,9 +2285,10 @@ When RESTORE-WINDOWS is non-nil, restore saved window configuration or tab."
           nil)
       (let* ((len (length stops))
              (side (or omnidiff-dual--side (omnidiff-dual--session-active-side session)))
-             (buf (omnidiff-dual--side-buf session side))
-             (starts (omnidiff-dual--side-line-starts session side))
-             (tick (omnidiff-dual--side-lines-tick session side))
+             (pane (omnidiff-dual--pane session side))
+             (buf (omnidiff-dual--pane-buf pane))
+             (starts (omnidiff-dual--pane-line-starts pane))
+             (tick (omnidiff-dual--pane-lines-tick pane))
              (rc (omnidiff-dual--point-to-row-byte-col
                   buf starts (with-current-buffer buf (point)) tick))
              (cur-stop (omnidiff-dual--find-stop-at session side (car rc) (cdr rc)))
@@ -2139,8 +2308,8 @@ When RESTORE-WINDOWS is non-nil, restore saved window configuration or tab."
                        (after-pos
                         (cl-position-if
                          (lambda (st)
-                           (omnidiff-dual--key-less-p
-                            cur-key (omnidiff-dual--stop-sort-key alignment st)))
+                           (omnidiff-engine-stop-key-less-p
+                            cur-key (omnidiff-engine-stop-sort-key st alignment)))
                          stops)))
                   (if forward-p
                       (if after-pos (1+ after-pos) (setq wrapped 'first) 1)
@@ -2186,12 +2355,14 @@ Pressing again immediately returns to the originating position."
           'expanded-fold)
       (let* ((side (or omnidiff-dual--side (omnidiff-dual--session-active-side session)))
              (other-side (omnidiff-dual--other-side side))
-             (buf (omnidiff-dual--side-buf session side))
-             (other-buf (omnidiff-dual--side-buf session other-side))
-             (starts (omnidiff-dual--side-line-starts session side))
-             (other-starts (omnidiff-dual--side-line-starts session other-side))
-             (tick (omnidiff-dual--side-lines-tick session side))
-             (other-tick (omnidiff-dual--side-lines-tick session other-side))
+             (pane (omnidiff-dual--pane session side))
+             (other-pane (omnidiff-dual--pane session other-side))
+             (buf (omnidiff-dual--pane-buf pane))
+             (other-buf (omnidiff-dual--pane-buf other-pane))
+             (starts (omnidiff-dual--pane-line-starts pane))
+             (other-starts (omnidiff-dual--pane-line-starts other-pane))
+             (tick (omnidiff-dual--pane-lines-tick pane))
+             (other-tick (omnidiff-dual--pane-lines-tick other-pane))
              (diff (omnidiff-dual--session-json-diff session))
              (alignment (omnidiff-dual--session-alignment session))
              (orig-pos (point))
@@ -2199,8 +2370,7 @@ Pressing again immediately returns to the originating position."
              (row (car rc))
              (bcol (cdr rc))
              (json-side (omnidiff-dual--side-json session side))
-             (hunks (and json-side (omnidiff-json-side-hunks json-side)))
-             (hunk (omnidiff-dual--hunk-at hunks row bcol))
+             (hunk (omnidiff-engine-hunk-at json-side row bcol t))
              (last-jump (omnidiff-dual--session-last-jump session))
              (dest-side other-side)
              (dest-pos nil)
@@ -2216,12 +2386,9 @@ Pressing again immediately returns to the originating position."
          ;; Hunk at point: use exact move_target or paired counterpart.
          (hunk
           (let* ((hrng (omnidiff-json-hunk-range hunk))
-                 (q-row (if (omnidiff-dual--range-contains-p hrng row bcol)
-                            row
-                          (omnidiff-json-range-start-row hrng)))
-                 (q-col (if (omnidiff-dual--range-contains-p hrng row bcol)
-                            bcol
-                          (omnidiff-json-range-start-col hrng)))
+                 (inside-p (omnidiff-engine-range-contains-p hrng row bcol))
+                 (q-row (if inside-p row (omnidiff-json-range-start-row hrng)))
+                 (q-col (if inside-p bcol (omnidiff-json-range-start-col hrng)))
                  (cp (omnidiff-engine-counterpart-at diff alignment side q-row q-col))
                  (cp-range (cdr cp)))
             (setq dest-side (car cp)
@@ -2337,7 +2504,8 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
   (interactive)
   (let* ((session (omnidiff-dual--require-session))
          (next (not (omnidiff-dual--session-fold-unchanged session))))
-    (setf (omnidiff-dual--session-fold-unchanged session) next)
+    (setf (omnidiff-dual--session-fold-unchanged session) next
+          (omnidiff-dual--session-sync-cache session) nil)
     (omnidiff-dual--apply-folds session)
     (message "OmniDiff unchanged folding: %s" (if next "on" "off"))
     next))
@@ -2382,12 +2550,7 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
   "Cycle `omnidiff-color-scheme' and re-apply the semantic palette."
   (interactive)
   (omnidiff-dual--require-session)
-  (let ((next (pcase omnidiff-color-scheme
-                ('omni-semantic 'calm-modus)
-                ('calm-modus 'neutral-paper)
-                (_ 'omni-semantic))))
-    (setq omnidiff-color-scheme next)
-    (omnidiff-apply-theme)
+  (let ((next (omnidiff-theme-cycle-color-scheme)))
     (message "OmniDiff color scheme: %s" next)
     next))
 
@@ -2398,18 +2561,21 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
          (next (not (omnidiff-dual--session-show-syntax session))))
     (setf (omnidiff-dual--session-show-syntax session) next)
     (dolist (side '(before after))
-      (when-let* ((buf (omnidiff-dual--side-buf session side)))
+      (let* ((pane (omnidiff-dual--pane session side))
+             (buf (omnidiff-dual--pane-buf pane))
+             (owns-p (omnidiff-dual--pane-owns-buf-p pane)))
         (when (buffer-live-p buf)
           (with-current-buffer buf
             (if next
-                (when (<= (buffer-size) omnidiff-dual-syntax-max-bytes)
+                (when (or (not owns-p)
+                          (<= (buffer-size) omnidiff-dual-syntax-max-bytes))
                   (ignore-errors
                     (font-lock-mode 1)
-                    (font-lock-ensure)))
+                    (when noninteractive
+                      (font-lock-ensure))))
               (ignore-errors
                 (font-lock-mode -1)
-                (when (fboundp 'font-lock-unfontify-buffer)
-                  (font-lock-unfontify-buffer))))))))
+                (font-lock-unfontify-buffer)))))))
     (message "OmniDiff syntax highlighting: %s" (if next "on" "off"))
     next))
 
@@ -2418,7 +2584,8 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
   (interactive)
   (let* ((session (omnidiff-dual--require-session))
          (next (not (omnidiff-dual--session-show-cross-highlight session))))
-    (setf (omnidiff-dual--session-show-cross-highlight session) next)
+    (setf (omnidiff-dual--session-show-cross-highlight session) next
+          (omnidiff-dual--session-sync-cache session) nil)
     (omnidiff-dual--sync-focus-and-counterpart session nil nil)
     (message "OmniDiff counterpart highlight: %s" (if next "on" "off"))
     next))
@@ -2437,19 +2604,18 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
   "Toggle live edit mode on the editable AFTER buffer."
   (interactive)
   (let* ((session (omnidiff-dual--require-session))
-         (ab (omnidiff-dual--session-after-buf session)))
+         (ab (omnidiff-dual-session-after-buf session)))
     (unless (and (omnidiff-dual--session-editable-after-p session)
                  (buffer-live-p ab))
       (user-error "AFTER pane is not backed by an editable buffer"))
     (if (omnidiff-dual--session-editing-p session)
-        ;; Return to review mode and refresh overlays.
+        ;; Return to review mode (keeping `after-save-hook' so later saves track
+        ;; `mutated-p' and refresh overlays) and recompute.
         (progn
-          (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-            (when (timerp timer) (cancel-timer timer))
-            (setf (omnidiff-dual--session-live-timer session) nil))
-          (setf (omnidiff-dual--session-editing-p session) nil)
+          (omnidiff-dual--cancel-live-timer session)
+          (setf (omnidiff-dual--session-editing-p session) nil
+                (omnidiff-dual--session-sync-cache session) nil)
           (with-current-buffer ab
-            (remove-hook 'after-save-hook #'omnidiff-dual--on-after-save t)
             (remove-hook 'after-change-functions #'omnidiff-dual--on-after-change t)
             (omnidiff-dual-edit-mode -1)
             (setq buffer-read-only t)
@@ -2459,7 +2625,8 @@ With prefix argument RESET-AUTO-P, restore width-responsive `auto' layout."
           (message "OmniDiff review mode")
           nil)
       ;; Unlock AFTER buffer into live edit mode.
-      (setf (omnidiff-dual--session-editing-p session) t)
+      (setf (omnidiff-dual--session-editing-p session) t
+            (omnidiff-dual--session-sync-cache session) nil)
       (omnidiff-dual--focus-side session 'after)
       (with-current-buffer ab
         (omnidiff-dual-mode -1)
@@ -2491,13 +2658,15 @@ range (or counterpart range) on SIDE covers ROW."
                        (omnidiff-change-stop-range stop))
                       ((eq (omnidiff-change-stop-counterpart-side stop) side)
                        (omnidiff-change-stop-counterpart-range stop)))))
-            (when (and rng (omnidiff-dual--range-covers-row-p rng row))
-              (let ((dist (if (= (omnidiff-json-range-start-row rng) row)
-                              (abs (- (omnidiff-json-range-start-col rng) byte-col))
-                            0)))
-                (when (< dist best-dist)
-                  (setq best stop
-                        best-dist dist))))))
+            (when-let* ((lr (omnidiff-engine-range-last-row rng)))
+              (let ((sr (omnidiff-json-range-start-row rng)))
+                (when (and (<= sr row) (<= row lr))
+                  (let ((dist (if (= sr row)
+                                  (abs (- (omnidiff-json-range-start-col rng) byte-col))
+                                0)))
+                    (when (< dist best-dist)
+                      (setq best stop
+                            best-dist dist))))))))
         best)))
 
 (defun omnidiff-dual--buffer-ends-with-newline-p (buf)
@@ -2523,48 +2692,6 @@ range (or counterpart range) on SIDE covers ROW."
                         pmax)))))))
     (cons beg (max beg end))))
 
-(defun omnidiff-dual--direct-anchor (alignment side row)
-  "Return counterpart row if ROW on SIDE is directly anchored in ALIGNMENT."
-  (let* ((avec (omnidiff-engine--ensure-anchor-vec alignment))
-         (before-p (eq side 'before))
-         (lo 0)
-         (hi (length avec))
-         (found nil))
-    (while (and (< lo hi) (null found))
-      (let* ((mid (/ (+ lo hi) 2))
-             (pair (aref avec mid))
-             (s (if before-p (car pair) (cdr pair))))
-        (cond
-         ((= s row) (setq found (if before-p (cdr pair) (car pair))))
-         ((< s row) (setq lo (1+ mid)))
-         (t (setq hi mid)))))
-    found))
-
-(defun omnidiff-dual--surrounding-anchors (alignment side r0 r1)
-  "Return `(PREV . NEXT)' anchor pairs strictly surrounding [R0, R1] on SIDE."
-  (let* ((avec (omnidiff-engine--ensure-anchor-vec alignment))
-         (alen (length avec))
-         (before-p (eq side 'before))
-         (prev nil)
-         (next nil))
-    ;; Binary search for first anchor with src-row >= r0.
-    (let ((lo 0) (hi alen))
-      (while (< lo hi)
-        (let* ((mid (/ (+ lo hi) 2))
-               (s (if before-p (car (aref avec mid)) (cdr (aref avec mid)))))
-          (if (< s r0) (setq lo (1+ mid)) (setq hi mid))))
-      (when (> lo 0)
-        (setq prev (aref avec (1- lo)))))
-    ;; Binary search for first anchor with src-row > r1.
-    (let ((lo 0) (hi alen))
-      (while (< lo hi)
-        (let* ((mid (/ (+ lo hi) 2))
-               (s (if before-p (car (aref avec mid)) (cdr (aref avec mid)))))
-          (if (<= s r1) (setq lo (1+ mid)) (setq hi mid))))
-      (when (< lo alen)
-        (setq next (aref avec lo))))
-    (cons prev next)))
-
 (defun omnidiff-dual--range-partial-p (buf line-starts range r1)
   "Return non-nil when RANGE starts mid-line or ends before end of row R1 in BUF."
   (or (> (omnidiff-json-range-start-col range) 0)
@@ -2578,16 +2705,48 @@ range (or counterpart range) on SIDE covers ROW."
                         (buffer-substring-no-properties (car bounds) (cdr bounds)))))))
              (< (omnidiff-json-range-end-col range) line-bytes)))))
 
+(defun omnidiff-dual--plan-partial-unaligned-after-revert (session stop rng a0 a1)
+  "Plan precise byte-range deletion for a partial AFTER stop with no BEFORE line.
+Refuses with `user-error' rather than destroying an entire moved/unaligned line."
+  (let* ((a-side (omnidiff-dual--side-json session 'after))
+         (a-hunks (and a-side (omnidiff-json-side-hunks a-side)))
+         (sub-ranges nil)
+         (non-insert nil))
+    (when (= a0 a1)
+      (let ((sc (omnidiff-json-range-start-col rng))
+            (ec (omnidiff-json-range-end-col rng)))
+        (dolist (h a-hunks)
+          (let ((op (omnidiff-json-hunk-operation h))
+                (hr (omnidiff-json-hunk-range h)))
+            (unless (eq op 'move)
+              (when (and (= (omnidiff-json-range-start-row hr) a0)
+                         (= (omnidiff-json-range-end-row hr) a0)
+                         (>= (omnidiff-json-range-start-col hr) sc)
+                         (<= (omnidiff-json-range-end-col hr) ec))
+                (if (eq op 'insert)
+                    (push hr sub-ranges)
+                  (setq non-insert t))))))))
+    (if (and (= a0 a1)
+             (eq (omnidiff-change-stop-operation stop) 'insert)
+             (not non-insert))
+        (list :kind 'delete-ranges
+              :ranges (or (nreverse sub-ranges) (list rng)))
+      (user-error
+       "Cannot revert partial change on an unaligned/moved line automatically (use e to edit)"))))
+
 (defun omnidiff-dual--plan-stop-revert (session stop)
   "Compute a revert edit plan plist for non-move `omnidiff-change-stop' STOP.
 Returns one of:
 - `(:kind replace :a0 A0 :a1 A1 :b0 B0 :b1 B1)'
 - `(:kind delete :a0 A0 :a1 A1)'
+- `(:kind delete-ranges :ranges RANGES)'
 - `(:kind insert :insert-row ROW :b0 B0 :b1 B1)'."
-  (let* ((bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session))
-         (b-starts (omnidiff-dual--session-before-line-starts session))
-         (a-starts (omnidiff-dual--session-after-line-starts session))
+  (let* ((b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf b-pane))
+         (ab (omnidiff-dual--pane-buf a-pane))
+         (b-starts (omnidiff-dual--pane-line-starts b-pane))
+         (a-starts (omnidiff-dual--pane-line-starts a-pane))
          (nb (omnidiff-dual--logical-line-count bb b-starts))
          (na (omnidiff-dual--logical-line-count ab a-starts))
          (alignment (omnidiff-dual--session-alignment session))
@@ -2601,53 +2760,63 @@ Returns one of:
       (let* ((a-rng (if (eq side 'after) rng cp-rng))
              (b-rng (if (eq side 'before) rng cp-rng))
              (a0 (omnidiff-json-range-start-row a-rng))
-             (a1 (or (omnidiff-dual--range-last-row a-rng na) a0))
+             (a1 (or (omnidiff-engine-range-last-row a-rng na) a0))
              (b0 (omnidiff-json-range-start-row b-rng))
-             (b1 (or (omnidiff-dual--range-last-row b-rng nb) b0)))
+             (b1 (or (omnidiff-engine-range-last-row b-rng nb) b0)))
         (list :kind 'replace :a0 a0 :a1 a1 :b0 b0 :b1 b1)))
-     ;; 2. Unpaired AFTER stop (inline addition on existing line, or pure line insert).
+     ;; 2. Unpaired AFTER stop (inline addition on existing/moved line, or pure line insert).
      ((eq side 'after)
       (let* ((a0 (omnidiff-json-range-start-row rng))
-             (a1 (or (omnidiff-dual--range-last-row rng na) a0))
+             (a1 (or (omnidiff-engine-range-last-row rng na) a0))
              (b-direct (when (= a0 a1)
-                         (omnidiff-dual--direct-anchor alignment 'after a0))))
+                         (omnidiff-engine-alignment-direct-anchor alignment 'after a0))))
         (if (and (integerp b-direct) (< b-direct nb))
             (list :kind 'replace :a0 a0 :a1 a0 :b0 b-direct :b1 b-direct)
           (pcase-let* ((`(,prev . ,next)
-                        (omnidiff-dual--surrounding-anchors alignment 'after a0 a1))
+                        (omnidiff-engine-alignment-surrounding-anchors alignment 'after a0 a1))
                        (b-lo (if prev (1+ (car prev)) 0))
                        (b-hi (if next (1- (car next)) (1- nb)))
                        (a-lo (if prev (1+ (cdr prev)) 0))
-                       (a-hi (if next (1- (cdr next)) (1- na))))
-            (if (and (<= b-lo b-hi)
-                     (omnidiff-dual--range-partial-p ab a-starts rng a1))
-                (if (and (= a-lo a0) (= a-hi a1))
-                    (list :kind 'replace :a0 a0 :a1 a1 :b0 b-lo :b1 b-hi)
-                  (let ((b-map (max b-lo (min b-hi (omnidiff-engine-map-row
-                                                    alignment 'after a0)))))
-                    (list :kind 'replace :a0 a0 :a1 a1 :b0 b-map :b1 b-map)))
-              (list :kind 'delete :a0 a0 :a1 a1))))))
+                       (a-hi (if next (1- (cdr next)) (1- na)))
+                       (partial-p (omnidiff-dual--range-partial-p ab a-starts rng a1)))
+            (cond
+             ((and partial-p (<= b-lo b-hi))
+              (if (and (= a-lo a0) (= a-hi a1))
+                  (list :kind 'replace :a0 a0 :a1 a1 :b0 b-lo :b1 b-hi)
+                (let ((b-map (max b-lo (min b-hi (omnidiff-engine-map-row
+                                                  alignment 'after a0)))))
+                  (list :kind 'replace :a0 a0 :a1 a1 :b0 b-map :b1 b-map))))
+             (partial-p
+              (omnidiff-dual--plan-partial-unaligned-after-revert
+               session stop rng a0 a1))
+             (t
+              (list :kind 'delete :a0 a0 :a1 a1)))))))
      ;; 3. Unpaired BEFORE stop (inline deletion on existing line, or pure line delete).
      (t
       (let* ((b0 (omnidiff-json-range-start-row rng))
-             (b1 (or (omnidiff-dual--range-last-row rng nb) b0))
+             (b1 (or (omnidiff-engine-range-last-row rng nb) b0))
              (a-direct (when (and (= b0 b1) (eq cp-side 'after))
-                         (omnidiff-dual--direct-anchor alignment 'before b0))))
+                         (omnidiff-engine-alignment-direct-anchor alignment 'before b0))))
         (if (and (integerp a-direct) (< a-direct na))
             (list :kind 'replace :a0 a-direct :a1 a-direct :b0 b0 :b1 b0)
           (pcase-let* ((`(,prev . ,next)
-                        (omnidiff-dual--surrounding-anchors alignment 'before b0 b1))
+                        (omnidiff-engine-alignment-surrounding-anchors alignment 'before b0 b1))
                        (b-lo (if prev (1+ (car prev)) 0))
                        (b-hi (if next (1- (car next)) (1- nb)))
                        (a-lo (if prev (1+ (cdr prev)) 0))
-                       (a-hi (if next (1- (cdr next)) (1- na))))
-            (if (and (<= a-lo a-hi)
-                     (omnidiff-dual--range-partial-p bb b-starts rng b1))
-                (if (and (= b-lo b0) (= b-hi b1))
-                    (list :kind 'replace :a0 a-lo :a1 a-hi :b0 b0 :b1 b1)
-                  (let ((a-map (max a-lo (min a-hi (omnidiff-engine-map-row
-                                                    alignment 'before b0)))))
-                    (list :kind 'replace :a0 a-map :a1 a-map :b0 b0 :b1 b1)))
+                       (a-hi (if next (1- (cdr next)) (1- na)))
+                       (partial-p (omnidiff-dual--range-partial-p bb b-starts rng b1)))
+            (cond
+             ((and partial-p (<= a-lo a-hi))
+              (if (and (= b-lo b0) (= b-hi b1))
+                  (list :kind 'replace :a0 a-lo :a1 a-hi :b0 b0 :b1 b1)
+                (let ((a-map (max a-lo (min a-hi (omnidiff-engine-map-row
+                                                  alignment 'before b0)))))
+                  (list :kind 'replace :a0 a-map :a1 a-map :b0 b0 :b1 b1))))
+             (partial-p
+              (user-error
+               "Cannot revert partial change on an unaligned/moved line automatically (use e to edit)"))
+             (t
               (let ((insert-row
                      (cond
                       ((<= na 0) 0)
@@ -2658,26 +2827,34 @@ Returns one of:
                               (off (round (* (float (max 0 (- b0 b-lo))) a-span) b-span))
                               (hi-limit (if next (cdr next) na)))
                          (max a-lo (min hi-limit (+ a-lo off))))))))
-                (list :kind 'insert :insert-row insert-row :b0 b0 :b1 b1))))))))))
+                (list :kind 'insert :insert-row insert-row :b0 b0 :b1 b1)))))))))))
 
 (defun omnidiff-dual--apply-revert-plan (session plan)
   "Apply revert PLAN to SESSION's AFTER buffer as one atomic undo step.
 Returns the buffer position in AFTER where the edit started."
-  (let* ((bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session))
-         (b-starts (omnidiff-dual--session-before-line-starts session))
-         (a-starts (omnidiff-dual--session-after-line-starts session))
+  (let* ((b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf b-pane))
+         (ab (omnidiff-dual--pane-buf a-pane))
+         (b-starts (omnidiff-dual--pane-line-starts b-pane))
+         (a-starts (omnidiff-dual--pane-line-starts a-pane))
+         (a-tick (omnidiff-dual--pane-lines-tick a-pane))
          (nb (omnidiff-dual--logical-line-count bb b-starts))
          (na (omnidiff-dual--logical-line-count ab a-starts))
          (b-ends-nl (omnidiff-dual--buffer-ends-with-newline-p bb))
+         (a-bom-stripped (omnidiff-dual--buffer-bom-stripped-p ab))
          (kind (plist-get plan :kind))
          (edit-pos nil))
     (cl-flet ((before-text (b0 b1)
-                (let ((bounds (omnidiff-dual--line-range-bounds bb b-starts b0 b1)))
-                  (with-current-buffer bb
-                    (save-restriction
-                      (widen)
-                      (buffer-substring-no-properties (car bounds) (cdr bounds)))))))
+                (let* ((bounds (omnidiff-dual--line-range-bounds bb b-starts b0 b1))
+                       (raw (with-current-buffer bb
+                              (save-restriction
+                                (widen)
+                                (buffer-substring-no-properties (car bounds) (cdr bounds))))))
+                  ;; Never insert a literal U+FEFF into a BOM-stripped visited buffer.
+                  (if (and (= b0 0) a-bom-stripped)
+                      (omnidiff-dual--strip-leading-bom raw)
+                    raw))))
       (with-current-buffer ab
         (save-restriction
           (widen)
@@ -2716,6 +2893,26 @@ Returns the buffer position in AFTER where the edit started."
                  (omnidiff-dual--expand-fold-at del-beg)
                  (delete-region del-beg del-end)
                  (setq edit-pos (min del-beg (point-max)))))
+              ('delete-ranges
+               (let ((regions nil))
+                 (dolist (r (plist-get plan :ranges))
+                   (let ((beg (omnidiff-dual--row-byte-col-to-point
+                               ab a-starts
+                               (omnidiff-json-range-start-row r)
+                               (omnidiff-json-range-start-col r)
+                               a-tick))
+                         (end (omnidiff-dual--row-byte-col-to-point
+                               ab a-starts
+                               (omnidiff-json-range-end-row r)
+                               (omnidiff-json-range-end-col r)
+                               a-tick)))
+                     (when (< beg end)
+                       (push (cons beg end) regions))))
+                 (setq regions (sort regions (lambda (x y) (> (car x) (car y)))))
+                 (dolist (reg regions)
+                   (omnidiff-dual--expand-fold-at (car reg))
+                   (delete-region (car reg) (cdr reg))
+                   (setq edit-pos (car reg)))))
               ('insert
                (let* ((insert-row (plist-get plan :insert-row))
                       (b0 (plist-get plan :b0))
@@ -2757,8 +2954,10 @@ duplicating moved code.  Leaves the buffer unsaved with an atomic Emacs undo
 boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
   (interactive)
   (let* ((session (omnidiff-dual--require-session))
-         (bb (omnidiff-dual--session-before-buf session))
-         (ab (omnidiff-dual--session-after-buf session)))
+         (b-pane (omnidiff-dual--session-before-pane session))
+         (a-pane (omnidiff-dual--session-after-pane session))
+         (bb (omnidiff-dual--pane-buf b-pane))
+         (ab (omnidiff-dual--pane-buf a-pane)))
     (unless (and (omnidiff-dual--session-editable-after-p session)
                  (buffer-live-p ab)
                  (buffer-live-p bb))
@@ -2767,18 +2966,15 @@ boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
             (and proc (process-live-p proc)))
       (user-error "Diff refresh is in progress; wait a moment before reverting"))
     (unless (and (omnidiff-dual--line-starts-fresh-p
-                  bb
-                  (omnidiff-dual--session-before-line-starts session)
-                  (omnidiff-dual--session-before-lines-tick session))
+                  bb (omnidiff-dual--pane-line-starts b-pane) (omnidiff-dual--pane-lines-tick b-pane))
                  (omnidiff-dual--line-starts-fresh-p
-                  ab
-                  (omnidiff-dual--session-after-line-starts session)
-                  (omnidiff-dual--session-after-lines-tick session)))
+                  ab (omnidiff-dual--pane-line-starts a-pane) (omnidiff-dual--pane-lines-tick a-pane)))
       (user-error "Diff is out of date; press g (or C-c C-r) to refresh before reverting"))
     (let* ((side (or omnidiff-dual--side (omnidiff-dual--session-active-side session)))
-           (buf (omnidiff-dual--side-buf session side))
-           (starts (omnidiff-dual--side-line-starts session side))
-           (tick (omnidiff-dual--side-lines-tick session side))
+           (pane (omnidiff-dual--pane session side))
+           (buf (omnidiff-dual--pane-buf pane))
+           (starts (omnidiff-dual--pane-line-starts pane))
+           (tick (omnidiff-dual--pane-lines-tick pane))
            (rc (omnidiff-dual--point-to-row-byte-col
                 buf starts (with-current-buffer buf (point)) tick))
            (stop (omnidiff-dual--find-stop-at-or-on-row session side (car rc) (cdr rc))))
@@ -2791,9 +2987,7 @@ boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
              (total (length (omnidiff-dual--session-stops session)))
              (op (omnidiff-change-stop-operation stop)))
         (omnidiff-dual--apply-revert-plan session plan)
-        (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-          (when (timerp timer) (cancel-timer timer))
-          (setf (omnidiff-dual--session-live-timer session) nil))
+        (omnidiff-dual--cancel-live-timer session)
         (setf (omnidiff-dual--session-mutated-p session) t
               (omnidiff-dual--session-last-jump session) nil)
         (omnidiff-dual--refresh-async session)
@@ -2808,7 +3002,7 @@ boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
   "Undo the last edit or revert in the editable AFTER buffer and refresh."
   (interactive)
   (let* ((session (omnidiff-dual--require-session))
-         (ab (omnidiff-dual--session-after-buf session)))
+         (ab (omnidiff-dual-session-after-buf session)))
     (unless (and (omnidiff-dual--session-editable-after-p session)
                  (buffer-live-p ab))
       (user-error "AFTER pane is not backed by an editable buffer"))
@@ -2821,18 +3015,24 @@ boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
                               'undo
                             last-command)))
         (undo-only 1)))
-    (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-      (when (timerp timer) (cancel-timer timer))
-      (setf (omnidiff-dual--session-live-timer session) nil))
+    (omnidiff-dual--cancel-live-timer session)
     (setf (omnidiff-dual--session-mutated-p session) t
           (omnidiff-dual--session-last-jump session) nil)
     (omnidiff-dual--refresh-async session)
     (message "Undid last change in AFTER buffer")
     t))
 
-(defun omnidiff-dual--menu-flag (label active-p)
-  "Format transient menu toggle LABEL showing live ACTIVE-P state."
-  (format "%s [%s]" label (if active-p "on" "off")))
+;;; Transient menu & help
+
+(defun omnidiff-dual--menu-flag (label getter)
+  "Format transient menu toggle LABEL using GETTER on the active session."
+  (let ((s (omnidiff-dual-active-session)))
+    (format "%s [%s]" label (if (and s (funcall getter s)) "on" "off"))))
+
+(defun omnidiff-dual--menu-val (label getter default)
+  "Format transient menu value LABEL using GETTER on the active session or DEFAULT."
+  (let ((s (omnidiff-dual-active-session)))
+    (format "%s [%s]" label (if s (funcall getter s) default))))
 
 (transient-define-prefix omnidiff-dual-menu ()
   "Interactive command dispatch menu for the OmniDiff Dual Semantic Viewer."
@@ -2852,61 +3052,35 @@ boundary (`u' to undo) and immediately triggers an asynchronous diff refresh."
     ("]" "Next file" omnidiff-dual-next-file)
     ("[" "Previous file" omnidiff-dual-prev-file)]
    ["View & Display"
-    ("v" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (format "Layout [%s]" (if s (omnidiff-dual--effective-layout s) "auto"))))
+    ("v" (lambda () (omnidiff-dual--menu-val "Layout" #'omnidiff-dual--effective-layout "auto"))
      omnidiff-dual-cycle-layout)
-    ("z" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "Fold unchanged" (and s (omnidiff-dual--session-fold-unchanged s)))))
+    ("z" (lambda () (omnidiff-dual--menu-flag "Fold unchanged" #'omnidiff-dual--session-fold-unchanged))
      omnidiff-dual-toggle-fold)
     ("c" (lambda () (format "Color scheme [%s]" omnidiff-color-scheme))
      omnidiff-dual-cycle-color-scheme)
-    ("S" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "Syntax highlight" (and s (omnidiff-dual--session-show-syntax s)))))
+    ("S" (lambda () (omnidiff-dual--menu-flag "Syntax highlight" #'omnidiff-dual--session-show-syntax))
      omnidiff-dual-toggle-syntax)
-    ("H" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "Cross-highlight" (and s (omnidiff-dual--session-show-cross-highlight s)))))
+    ("H" (lambda () (omnidiff-dual--menu-flag "Cross-highlight" #'omnidiff-dual--session-show-cross-highlight))
      omnidiff-dual-toggle-counterpart-highlight)
-    ("M" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "Minimap" (and s (omnidiff-dual--session-show-minimap s)))))
+    ("M" (lambda () (omnidiff-dual--menu-flag "Minimap" #'omnidiff-dual--session-show-minimap))
      omnidiff-dual-toggle-minimap)]
    ["Diff & Actions"
-    ("m" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (format "Preset [%s]" (if s (omnidiff-dual--session-preset s) "default"))))
+    ("m" (lambda () (omnidiff-dual--menu-val "Preset" #'omnidiff-dual--session-preset "default"))
      omnidiff-dual-cycle-preset)
-    ("W" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "--whole-updates" (and s (omnidiff-dual--session-whole-updates s)))))
+    ("W" (lambda () (omnidiff-dual--menu-flag "--whole-updates" #'omnidiff-dual--session-whole-updates))
      omnidiff-dual-toggle-whole-updates)
-    ("I" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "--paint-reindent-moves"
-              (and s (omnidiff-dual--session-paint-reindent-moves s)))))
+    ("I" (lambda () (omnidiff-dual--menu-flag "--paint-reindent-moves" #'omnidiff-dual--session-paint-reindent-moves))
      omnidiff-dual-toggle-paint-reindent-moves)
-    ("e" (lambda ()
-           (let ((s (omnidiff-dual-active-session)))
-             (omnidiff-dual--menu-flag
-              "Live edit AFTER" (and s (omnidiff-dual--session-editing-p s)))))
+    ("e" (lambda () (omnidiff-dual--menu-flag "Live edit AFTER" #'omnidiff-dual--session-editing-p))
      omnidiff-dual-toggle-edit)
     ("r" "Revert change stop" omnidiff-dual-revert-change)
     ("u" "Undo in AFTER" omnidiff-dual-undo)
     ("R" (lambda ()
-           (let* ((s (omnidiff-dual-active-session))
-                  (fn (and s (plist-get (omnidiff-dual--session-nav-callbacks s)
-                                        :reviewed-p))))
-             (omnidiff-dual--menu-flag
-              "Reviewed" (and (functionp fn) (funcall fn)))))
+           (omnidiff-dual--menu-flag
+            "Reviewed"
+            (lambda (s)
+              (let ((fn (plist-get (omnidiff-dual--session-nav-callbacks s) :reviewed-p)))
+                (and (functionp fn) (funcall fn))))))
      omnidiff-dual-toggle-reviewed)
     ("O" "Return to Overview" omnidiff-dual-open-overview)
     ("T" "Open in native TUI" omnidiff-dual-open-tui)
@@ -2927,7 +3101,7 @@ In noninteractive sessions, displays a concise echo-area keybinding summary."
 (defun omnidiff-dual-quit ()
   "Close the current OmniDiff dual viewer session cleanly."
   (interactive)
-  (omnidiff-dual--teardown (omnidiff-dual--require-session) nil t))
+  (omnidiff-dual-close (omnidiff-dual--require-session) t))
 
 ;;; Minor modes
 
@@ -3001,7 +3175,7 @@ In noninteractive sessions, displays a concise echo-area keybinding summary."
   :keymap omnidiff-dual-edit-mode-map
   :group 'omnidiff)
 
-;;; Public entry point
+;;; Session open stages & public entry point
 
 (defun omnidiff-dual--resolve-display-name (display-path before-path after-path
                                                         before-buffer after-buffer)
@@ -3021,12 +3195,169 @@ In noninteractive sessions, displays a concise echo-area keybinding summary."
     (buffer-name before-buffer))
    (t "diff")))
 
-(defun omnidiff-dual--resolve-syntax-hint (side-path display-path fallback-path)
-  "Pick best path hint for `auto-mode-alist' detection."
-  (cl-find-if
-   (lambda (p)
-     (and (stringp p) (not (string-empty-p p)) (not (string= p "/dev/null"))))
-   (list side-path display-path fallback-path)))
+(defun omnidiff-dual--resolve-input-diff (session before-path after-path
+                                                  before-source after-source
+                                                  before-buffer after-buffer
+                                                  b-hint a-hint disp-name
+                                                  json-diff preset
+                                                  whole-updates paint-reindent-moves)
+  "Return `(JSON-DIFF B-DIFF-BOM A-DIFF-BOM)' for `omnidiff-dual-open'.
+Runs `omnidiff-engine-run-pair' when JSON-DIFF is nil, preserving BOM parity
+when one side is a BOM-stripped modified buffer and cleaning temp files."
+  (if json-diff
+      (cl-flet ((side-bom (src buf path side-json)
+                  (cond
+                   ((stringp src) (omnidiff-dual--string-has-bom-p src))
+                   ((and (buffer-live-p buf) (omnidiff-dual--buffer-bom-stripped-p buf))
+                    (omnidiff-dual--side-json-has-bom-p side-json path))
+                   (t (omnidiff-dual--file-has-bom-p path)))))
+        (list json-diff
+              (side-bom before-source before-buffer before-path (omnidiff-json-diff-before json-diff))
+              (side-bom after-source after-buffer after-path (omnidiff-json-diff-after json-diff))))
+    (let ((temp-files nil))
+      (unwind-protect
+          (cl-flet ((buf-needs-temp (buf path)
+                      (and (buffer-live-p buf)
+                           (or (null path) (not (file-exists-p path)) (buffer-modified-p buf))))
+                    (resolve-side (buf path src hint buf-temp-p other-stripped)
+                      (let ((path-ok (and (stringp path)
+                                          (or (string= path "/dev/null") (file-exists-p path)))))
+                        (cond
+                         (buf-temp-p
+                          (let ((f (omnidiff-engine-write-temp-for-buffer
+                                    buf (omnidiff-dual--ensure-tmpdir session)
+                                    (or hint disp-name))))
+                            (push f temp-files)
+                            (cons f (omnidiff-dual--buffer-starts-with-bom-p buf))))
+                         ((and path-ok (not (string= path "/dev/null"))
+                               other-stripped (omnidiff-dual--file-has-bom-p path))
+                          (let* ((raw (or (and (stringp src) src)
+                                          (omnidiff-engine-read-file-decoded path)))
+                                 (f (omnidiff-dual--write-string-temp
+                                     (omnidiff-dual--strip-leading-bom raw)
+                                     (omnidiff-dual--ensure-tmpdir session)
+                                     (or hint disp-name))))
+                            (push f temp-files)
+                            (cons f nil)))
+                         (path-ok
+                          (cons path (omnidiff-dual--file-has-bom-p path)))
+                         ((stringp src)
+                          (let* ((s (if (and other-stripped (omnidiff-dual--string-has-bom-p src))
+                                        (omnidiff-dual--strip-leading-bom src)
+                                      src))
+                                 (f (omnidiff-dual--write-string-temp
+                                     s (omnidiff-dual--ensure-tmpdir session)
+                                     (or hint disp-name))))
+                            (push f temp-files)
+                            (cons f (omnidiff-dual--string-has-bom-p s))))
+                         (t (cons "/dev/null" nil))))))
+            (let* ((b-temp-p (buf-needs-temp before-buffer before-path))
+                   (a-temp-p (buf-needs-temp after-buffer after-path))
+                   (b-stripped (and b-temp-p (omnidiff-dual--buffer-bom-stripped-p before-buffer)))
+                   (a-stripped (and a-temp-p (omnidiff-dual--buffer-bom-stripped-p after-buffer)))
+                   (b-res (resolve-side before-buffer before-path before-source b-hint b-temp-p a-stripped))
+                   (a-res (resolve-side after-buffer after-path after-source a-hint a-temp-p b-stripped)))
+              (list (omnidiff-engine-run-pair
+                     (car b-res) (car a-res) preset nil whole-updates paint-reindent-moves)
+                    (cdr b-res) (cdr a-res))))
+        (omnidiff-dual--delete-temp-files temp-files)))))
+
+(defun omnidiff-dual--acquire-pane-buffer (side given-buf source path enc
+                                                disp-name hint show-syntax
+                                                editable-p editable-supplied-p)
+  "Acquire buffer for SIDE.  Return `(BUF OWNS-P HAS-BOM CAN-EDIT-P)'."
+  (cond
+   ((buffer-live-p given-buf)
+    (list given-buf nil
+          (omnidiff-dual--buffer-bom-stripped-p given-buf)
+          (if (eq side 'after)
+              (if editable-supplied-p (and editable-p t) t)
+            nil)))
+   ((and (eq side 'after) editable-p (omnidiff-dual--writable-file-p path))
+    (let ((buf (find-file-noselect path)))
+      (list buf nil (omnidiff-dual--buffer-bom-stripped-p buf) t)))
+   (t
+    (let* ((text (cond
+                  ((stringp source) source)
+                  ((stringp path) (omnidiff-engine-read-file-decoded path enc))
+                  (t "")))
+           (has-bom (omnidiff-dual--string-has-bom-p text))
+           (buf (omnidiff-dual--make-ephemeral-buffer
+                 side disp-name text hint show-syntax)))
+      (list buf t has-bom nil)))))
+
+(defun omnidiff-dual--swap-session-panes (session reusing-p
+                                                  new-before-buf new-before-owns b-has-bom
+                                                  new-after-buf new-after-owns a-has-bom
+                                                  before-path after-path
+                                                  b-label a-label)
+  "Detach replaced/swapped panes, attach new panes, and arrange windows.
+Returns a list of discarded owned buffers to kill after diff application."
+  (let* ((old-b (omnidiff-dual--session-before-pane session))
+         (old-a (omnidiff-dual--session-after-pane session))
+         (old-b-buf (omnidiff-dual--pane-buf old-b))
+         (old-a-buf (omnidiff-dual--pane-buf old-a))
+         (same-b (and reusing-p (eq new-before-buf old-b-buf)))
+         (same-a (and reusing-p (eq new-after-buf old-a-buf)))
+         (deferred-kills nil))
+    ;; Detach replaced or swapped old panes BEFORE attaching new panes so
+    ;; swapped buffers (e.g., `new-before-buf' == `old-after-buf') restore
+    ;; their true original state before re-attachment.
+    (condition-case err
+        (progn
+          (when reusing-p
+            (unless same-b
+              (when (and (omnidiff-dual--pane-owns-buf-p old-b)
+                         (buffer-live-p old-b-buf)
+                         (not (eq old-b-buf new-after-buf)))
+                (push old-b-buf deferred-kills))
+              (omnidiff-dual--detach-pane old-b nil t))
+            (unless same-a
+              (when (and (omnidiff-dual--pane-owns-buf-p old-a)
+                         (buffer-live-p old-a-buf)
+                         (not (eq old-a-buf new-before-buf)))
+                (push old-a-buf deferred-kills))
+              (omnidiff-dual--detach-pane old-a nil t)))
+          (cl-flet ((install-pane (side old-pane same-p buf owns-p path label has-bom)
+                      (if same-p
+                          (progn
+                            (setf (omnidiff-dual--pane-path old-pane) path
+                                  (omnidiff-dual--pane-label old-pane) label
+                                  (omnidiff-dual--pane-has-bom old-pane) (and has-bom t)
+                                  (omnidiff-dual--pane-header-cache old-pane) nil)
+                            (omnidiff-dual--clear-overlays buf)
+                            (with-current-buffer buf
+                              (when (eq side 'after)
+                                (remove-hook 'after-change-functions #'omnidiff-dual--on-after-change t)
+                                (if (omnidiff-dual--session-editable-after-p session)
+                                    (add-hook 'after-save-hook #'omnidiff-dual--on-after-save nil t)
+                                  (remove-hook 'after-save-hook #'omnidiff-dual--on-after-save t)))
+                              (setq buffer-read-only t)
+                              (omnidiff-dual-edit-mode -1)
+                              (omnidiff-dual-mode 1)))
+                        (let ((pane (make-omnidiff-dual--pane
+                                     :buf buf
+                                     :win (when reusing-p (omnidiff-dual--pane-win old-pane))
+                                     :owns-buf-p (and owns-p t)
+                                     :path path
+                                     :label label
+                                     :has-bom (and has-bom t))))
+                          (if (eq side 'before)
+                              (setf (omnidiff-dual--session-before-pane session) pane)
+                            (setf (omnidiff-dual--session-after-pane session) pane))
+                          (omnidiff-dual--attach-pane session side pane)))))
+            (install-pane 'before old-b same-b new-before-buf new-before-owns before-path b-label b-has-bom)
+            (install-pane 'after old-a same-a new-after-buf new-after-owns after-path a-label a-has-bom))
+          ;; Arrange or swap windows cleanly before disposing replaced buffers.
+          (if reusing-p
+              (omnidiff-dual--apply-layout session)
+            (omnidiff-dual--setup-windows session))
+          deferred-kills)
+      (error
+       (dolist (ob deferred-kills)
+         (when (buffer-live-p ob)
+           (kill-buffer ob)))
+       (signal (car err) (cdr err))))))
 
 ;;;###autoload
 (cl-defun omnidiff-dual-open (&key before-path after-path
@@ -3038,18 +3369,24 @@ In noninteractive sessions, displays a concise echo-area keybinding summary."
                                    (whole-updates omnidiff-whole-updates)
                                    (paint-reindent-moves omnidiff-paint-reindent-moves)
                                    (editable-after nil editable-after-supplied-p)
+                                   initial-side initial-line
                                    nav-callbacks
                                    reuse-session)
   "Open or update a native Dual Semantic Source Viewer session.
 Returns the active `omnidiff-dual--session'.
 
 If JSON-DIFF is already provided (an `omnidiff-json-diff' struct), renders
-immediately with zero subprocesses.  Otherwise runs `omnidiff-engine-run-pair'
-to compute the semantic diff.
+immediately with zero subprocesses (unless an already-visited editable AFTER
+buffer has unsaved edits).  Otherwise runs `omnidiff-engine-run-pair' to
+compute the semantic diff.
 
 When AFTER-BUFFER is provided, or EDITABLE-AFTER is non-nil with a readable
 and writable AFTER-PATH, attaches directly to the user's real buffer without
 overwriting it or killing it on quit.
+
+When INITIAL-LINE is a positive 1-based line number, jumps directly to
+INITIAL-SIDE (`before' or `after', default `after') at INITIAL-LINE with a
+single counterpart sync instead of jumping to the first change stop.
 
 When REUSE-SESSION is a live `omnidiff-dual--session', swaps its contents
 in place without churning the window configuration."
@@ -3067,241 +3404,124 @@ in place without churning the window configuration."
          (disp-name (omnidiff-dual--resolve-display-name
                      display-path before-path after-path
                      before-buffer after-buffer))
-         (b-hint (omnidiff-dual--resolve-syntax-hint
-                  before-path display-path after-path))
-         (a-hint (omnidiff-dual--resolve-syntax-hint
-                  after-path display-path before-path))
-         (old-before-buf (when reusing-p (omnidiff-dual--session-before-buf session)))
-         (old-after-buf (when reusing-p (omnidiff-dual--session-after-buf session)))
-         (old-before-owns (when reusing-p (omnidiff-dual--session-before-owns-buf-p session)))
-         (old-after-owns (when reusing-p (omnidiff-dual--session-after-owns-buf-p session)))
-         (old-b-ro (when reusing-p (omnidiff-dual--session-before-orig-read-only session)))
-         (old-a-ro (when reusing-p (omnidiff-dual--session-after-orig-read-only session)))
-         (old-b-ln (when reusing-p (omnidiff-dual--session-before-orig-line-numbers session)))
-         (old-a-ln (when reusing-p (omnidiff-dual--session-after-orig-line-numbers session)))
-         (old-b-hl-loc (when reusing-p (omnidiff-dual--session-before-orig-header-line-local-p session)))
-         (old-a-hl-loc (when reusing-p (omnidiff-dual--session-after-orig-header-line-local-p session)))
-         (old-b-hl (when reusing-p (omnidiff-dual--session-before-orig-header-line session)))
-         (old-a-hl (when reusing-p (omnidiff-dual--session-after-orig-header-line session)))
-         (old-b-fl (when reusing-p (omnidiff-dual--session-before-orig-font-lock session)))
-         (old-a-fl (when reusing-p (omnidiff-dual--session-after-orig-font-lock session)))
-         (old-b-hl-remap (when reusing-p (omnidiff-dual--session-before-hl-remap-cookie session)))
-         (old-a-hl-remap (when reusing-p (omnidiff-dual--session-after-hl-remap-cookie session)))
-         (temp-files nil)
-         (resolved-diff json-diff)
+         (b-hint (omnidiff-engine-pick-path-hint before-path display-path after-path))
+         (a-hint (omnidiff-engine-pick-path-hint after-path display-path before-path))
          (new-before-buf nil)
          (new-before-owns nil)
          (new-after-buf nil)
          (new-after-owns nil)
-         (can-edit-after nil)
+         (panes-swapped-p nil)
+         (deferred-kills nil)
          (committed nil))
+    ;; Promote an already-visited modified editable AFTER buffer so we diff its
+    ;; live contents instead of applying a stale disk diff.
+    (when (and (null after-buffer)
+               editable-after
+               (omnidiff-dual--writable-file-p after-path))
+      (when-let* ((existing (find-buffer-visiting after-path)))
+        (when (buffer-modified-p existing)
+          (setq after-buffer existing
+                json-diff nil))))
     (unwind-protect
         (progn
           ;; Cancel any in-flight async work when reusing a session.
           (when reusing-p
             (cl-incf (omnidiff-dual--session-request-seq session))
-            (when-let* ((timer (omnidiff-dual--session-live-timer session)))
-              (when (timerp timer) (cancel-timer timer))
-              (setf (omnidiff-dual--session-live-timer session) nil))
+            (omnidiff-dual--cancel-live-timer session)
             (when-let* ((proc (omnidiff-dual--session-active-proc session)))
               (when (process-live-p proc) (delete-process proc))
               (setf (omnidiff-dual--session-active-proc session) nil))
             (omnidiff-dual--clear-focus-overlays session))
-          ;; Compute JSON diff when caller did not supply one.
-          (unwind-protect
-              (unless resolved-diff
-                (let* ((b-disk (cond
-                                ((and (buffer-live-p before-buffer)
-                                      (or (null before-path)
-                                          (not (file-exists-p before-path))
-                                          (buffer-modified-p before-buffer)))
-                                 (let ((f (omnidiff-engine-write-temp-for-buffer
-                                           before-buffer
-                                           (omnidiff-dual--ensure-tmpdir session)
-                                           (or b-hint disp-name))))
-                                   (push f temp-files)
-                                   f))
-                                ((and (stringp before-path)
-                                      (or (string= before-path "/dev/null")
-                                          (file-exists-p before-path)))
-                                 before-path)
-                                ((stringp before-source)
-                                 (let ((f (omnidiff-dual--write-string-temp
-                                           before-source
-                                           (omnidiff-dual--ensure-tmpdir session)
-                                           (or b-hint disp-name))))
-                                   (push f temp-files)
-                                   f))
-                                (t "/dev/null")))
-                       (a-disk (cond
-                                ((and (buffer-live-p after-buffer)
-                                      (or (null after-path)
-                                          (not (file-exists-p after-path))
-                                          (buffer-modified-p after-buffer)))
-                                 (let ((f (omnidiff-engine-write-temp-for-buffer
-                                           after-buffer
-                                           (omnidiff-dual--ensure-tmpdir session)
-                                           (or a-hint disp-name))))
-                                   (push f temp-files)
-                                   f))
-                                ((and (stringp after-path)
-                                      (or (string= after-path "/dev/null")
-                                          (file-exists-p after-path)))
-                                 after-path)
-                                ((stringp after-source)
-                                 (let ((f (omnidiff-dual--write-string-temp
-                                           after-source
-                                           (omnidiff-dual--ensure-tmpdir session)
-                                           (or a-hint disp-name))))
-                                   (push f temp-files)
-                                   f))
-                                (t "/dev/null"))))
-                  (setq resolved-diff
-                        (omnidiff-engine-run-pair
-                         b-disk a-disk eff-preset nil whole-updates paint-reindent-moves))))
-            (omnidiff-dual--delete-temp-files temp-files))
-          ;; Acquire BEFORE buffer.
-          (let ((b-enc (and resolved-diff
-                            (omnidiff-json-side-encoding
-                             (omnidiff-json-diff-before resolved-diff))))
-                (show-syn (omnidiff-dual--session-show-syntax session)))
-            (if (buffer-live-p before-buffer)
-                (setq new-before-buf before-buffer
-                      new-before-owns nil)
-              (let ((text (cond
-                           ((stringp before-source) before-source)
-                           ((stringp before-path)
-                            (omnidiff-engine-read-file-decoded before-path b-enc))
-                           (t ""))))
+          ;; 1. Compute or validate JSON diff and input BOM flags.
+          (pcase-let* ((`(,resolved-diff ,b-diff-bom ,a-diff-bom)
+                        (omnidiff-dual--resolve-input-diff
+                         session before-path after-path
+                         before-source after-source
+                         before-buffer after-buffer
+                         b-hint a-hint disp-name
+                         json-diff eff-preset whole-updates paint-reindent-moves))
+                       (show-syn (omnidiff-dual--session-show-syntax session))
+                       (b-enc (and resolved-diff
+                                   (omnidiff-json-side-encoding
+                                    (omnidiff-json-diff-before resolved-diff))))
+                       (a-enc (and resolved-diff
+                                   (omnidiff-json-side-encoding
+                                    (omnidiff-json-diff-after resolved-diff))))
+                       ;; 2. Acquire BEFORE and AFTER buffers.
+                       (`(,b-buf ,b-owns ,b-has-bom ,_)
+                        (omnidiff-dual--acquire-pane-buffer
+                         'before before-buffer before-source before-path b-enc
+                         disp-name b-hint show-syn nil nil))
+                       (`(,a-buf ,a-owns ,a-has-bom ,can-edit-after)
+                        (omnidiff-dual--acquire-pane-buffer
+                         'after after-buffer after-source after-path a-enc
+                         disp-name a-hint show-syn
+                         editable-after editable-after-supplied-p)))
+            (setq new-before-buf b-buf
+                  new-before-owns b-owns
+                  new-after-buf a-buf
+                  new-after-owns a-owns)
+            ;; Never double-attach the same live buffer as both BEFORE and AFTER.
+            (when (and (buffer-live-p new-before-buf)
+                       (eq new-before-buf new-after-buf))
+              (let ((copy-text (with-current-buffer new-before-buf
+                                 (save-restriction
+                                   (widen)
+                                   (buffer-substring-no-properties
+                                    (point-min) (point-max))))))
                 (setq new-before-buf
                       (omnidiff-dual--make-ephemeral-buffer
-                       'before disp-name text b-hint show-syn)
-                      new-before-owns t))))
-          ;; Acquire AFTER buffer.
-          (let ((a-enc (and resolved-diff
-                            (omnidiff-json-side-encoding
-                             (omnidiff-json-diff-after resolved-diff))))
-                (show-syn (omnidiff-dual--session-show-syntax session)))
-            (cond
-             ((buffer-live-p after-buffer)
-              (setq new-after-buf after-buffer
-                    new-after-owns nil
-                    can-edit-after (if editable-after-supplied-p
-                                       (and editable-after t)
-                                     t)))
-             ((and editable-after (omnidiff-dual--writable-file-p after-path))
-              (setq new-after-buf (find-file-noselect after-path)
-                    new-after-owns nil
-                    can-edit-after t))
-             (t
-              (let ((text (cond
-                           ((stringp after-source) after-source)
-                           ((stringp after-path)
-                            (omnidiff-engine-read-file-decoded after-path a-enc))
-                           (t ""))))
-                (setq new-after-buf
-                      (omnidiff-dual--make-ephemeral-buffer
-                       'after disp-name text a-hint show-syn)
-                      new-after-owns t
-                      can-edit-after nil)))))
-          ;; Never double-attach the same live buffer as both BEFORE and AFTER.
-          (when (and (buffer-live-p new-before-buf)
-                     (eq new-before-buf new-after-buf))
-            (let ((copy-text (with-current-buffer new-before-buf
-                               (save-restriction
-                                 (widen)
-                                 (buffer-substring-no-properties
-                                  (point-min) (point-max))))))
-              (setq new-before-buf
-                    (omnidiff-dual--make-ephemeral-buffer
-                     'before disp-name copy-text b-hint
-                     (omnidiff-dual--session-show-syntax session))
-                    new-before-owns t)))
-          ;; Register session metadata.
-          (setf (omnidiff-dual--session-before-path session) before-path
-                (omnidiff-dual--session-after-path session) after-path
-                (omnidiff-dual--session-before-label session)
-                (or before-label
-                    (if (and (stringp before-path) (string= before-path "/dev/null"))
-                        "/dev/null"
-                      disp-name))
-                (omnidiff-dual--session-after-label session)
-                (or after-label
-                    (if (and (stringp after-path) (string= after-path "/dev/null"))
-                        "/dev/null"
-                      disp-name))
-                (omnidiff-dual--session-display-path session) disp-name
-                (omnidiff-dual--session-preset session) eff-preset
-                (omnidiff-dual--session-whole-updates session) (and whole-updates t)
-                (omnidiff-dual--session-paint-reindent-moves session) (and paint-reindent-moves t)
-                (omnidiff-dual--session-editable-after-p session) can-edit-after
-                (omnidiff-dual--session-editing-p session) nil
-                (omnidiff-dual--session-nav-callbacks session) nav-callbacks)
-          (unless (memq session omnidiff-dual--sessions)
-            (push session omnidiff-dual--sessions))
-          ;; Attach new buffers (preserving original saved states if reusing same buffer).
-          (if (and reusing-p (eq new-before-buf old-before-buf))
-              (progn
-                (omnidiff-dual--clear-overlays new-before-buf)
-                (with-current-buffer new-before-buf
-                  (setq buffer-read-only t)
-                  (omnidiff-dual-edit-mode -1)
-                  (omnidiff-dual-mode 1)))
-            (omnidiff-dual--attach-buffer session 'before new-before-buf new-before-owns))
-          (if (and reusing-p (eq new-after-buf old-after-buf))
-              (progn
-                (omnidiff-dual--clear-overlays new-after-buf)
-                (with-current-buffer new-after-buf
-                  (remove-hook 'after-save-hook #'omnidiff-dual--on-after-save t)
-                  (remove-hook 'after-change-functions #'omnidiff-dual--on-after-change t)
-                  (setq buffer-read-only t)
-                  (omnidiff-dual-edit-mode -1)
-                  (omnidiff-dual-mode 1)))
-            (omnidiff-dual--attach-buffer session 'after new-after-buf new-after-owns))
-          ;; Arrange or swap windows cleanly before disposing old buffers.
-          (if reusing-p
-              (omnidiff-dual--apply-layout session)
-            (omnidiff-dual--setup-windows session))
-          ;; Dispose replaced buffers from a reused session cleanly.
-          (when reusing-p
-            (when (and (buffer-live-p old-before-buf)
-                       (not (eq old-before-buf new-before-buf))
-                       (not (eq old-before-buf new-after-buf)))
-              (let ((tmp (make-omnidiff-dual--session
-                          :before-buf old-before-buf
-                          :before-owns-buf-p old-before-owns
-                          :before-orig-read-only old-b-ro
-                          :before-orig-line-numbers old-b-ln
-                          :before-orig-header-line-local-p old-b-hl-loc
-                          :before-orig-header-line old-b-hl
-                          :before-orig-font-lock old-b-fl
-                          :before-hl-remap-cookie old-b-hl-remap)))
-                (omnidiff-dual--detach-buffer tmp 'before)))
-            (when (and (buffer-live-p old-after-buf)
-                       (not (eq old-after-buf new-after-buf))
-                       (not (eq old-after-buf new-before-buf)))
-              (let ((tmp (make-omnidiff-dual--session
-                          :after-buf old-after-buf
-                          :after-owns-buf-p old-after-owns
-                          :after-orig-read-only old-a-ro
-                          :after-orig-line-numbers old-a-ln
-                          :after-orig-header-line-local-p old-a-hl-loc
-                          :after-orig-header-line old-a-hl
-                          :after-orig-font-lock old-a-fl
-                          :after-hl-remap-cookie old-a-hl-remap)))
-                (omnidiff-dual--detach-buffer tmp 'after))))
-          ;; Apply diff, alignment, overlays, folds, and jump to first change.
-          (omnidiff-dual--apply-diff session resolved-diff nil)
-          (setq committed t)
-          session)
+                       'before disp-name copy-text b-hint show-syn)
+                      new-before-owns t)))
+            ;; 3. Register session-level metadata.
+            (let ((b-label (or before-label
+                               (if (and (stringp before-path) (string= before-path "/dev/null"))
+                                   "/dev/null"
+                                 disp-name)))
+                  (a-label (or after-label
+                               (if (and (stringp after-path) (string= after-path "/dev/null"))
+                                   "/dev/null"
+                                 disp-name))))
+              (setf (omnidiff-dual--session-display-path session) disp-name
+                    (omnidiff-dual--session-preset session) eff-preset
+                    (omnidiff-dual--session-whole-updates session) (and whole-updates t)
+                    (omnidiff-dual--session-paint-reindent-moves session) (and paint-reindent-moves t)
+                    (omnidiff-dual--session-editable-after-p session) (and can-edit-after t)
+                    (omnidiff-dual--session-editing-p session) nil
+                    (omnidiff-dual--session-nav-callbacks session) nav-callbacks)
+              (unless (memq session omnidiff-dual--sessions)
+                (push session omnidiff-dual--sessions))
+              ;; 4. Detach replaced panes, attach new panes, and arrange windows.
+              (setq panes-swapped-p t
+                    deferred-kills
+                    (omnidiff-dual--swap-session-panes
+                     session reusing-p
+                     new-before-buf new-before-owns (or b-has-bom b-diff-bom)
+                     new-after-buf new-after-owns (or a-has-bom a-diff-bom)
+                     before-path after-path b-label a-label))
+              ;; 5. Apply diff, alignment, overlays, folds, and initial jump.
+              (omnidiff-dual--apply-diff
+               session resolved-diff nil initial-side initial-line
+               b-diff-bom a-diff-bom)
+              (setq committed t)
+              ;; 6. Dispose discarded owned buffers safely off-screen.
+              (dolist (ob deferred-kills)
+                (when (buffer-live-p ob)
+                  (kill-buffer ob)))
+              session)))
       (unless committed
-        (if (not reusing-p)
+        (if (or (not reusing-p) panes-swapped-p)
             (progn
-              (when (or (omnidiff-dual--session-before-buf session)
-                        (omnidiff-dual--session-after-buf session)
-                        (omnidiff-dual--session-created-tab-p session))
+              (when (or panes-swapped-p
+                        (omnidiff-dual-session-before-buf session)
+                        (omnidiff-dual-session-after-buf session)
+                        (omnidiff-dual--session-created-tab-p session)
+                        (omnidiff-dual--session-saved-winconf session))
                 (omnidiff-dual--teardown session nil t))
               (setq omnidiff-dual--sessions (delq session omnidiff-dual--sessions))
+              (dolist (ob deferred-kills)
+                (when (buffer-live-p ob)
+                  (kill-buffer ob)))
               (when (and new-before-owns (buffer-live-p new-before-buf))
                 (kill-buffer new-before-buf))
               (when (and new-after-owns (buffer-live-p new-after-buf))
@@ -3310,13 +3530,15 @@ in place without churning the window configuration."
                 (setf (omnidiff-dual--session-tmpdir session) nil)
                 (when (and dir (file-directory-p dir))
                   (ignore-errors (delete-directory dir t)))))
+          ;; Failed before swapping panes in a reused session: keep existing
+          ;; session intact and clean up only newly created owned buffers.
           (when (and new-before-owns
                      (buffer-live-p new-before-buf)
-                     (not (eq new-before-buf (omnidiff-dual--session-before-buf session))))
+                     (not (eq new-before-buf (omnidiff-dual-session-before-buf session))))
             (kill-buffer new-before-buf))
           (when (and new-after-owns
                      (buffer-live-p new-after-buf)
-                     (not (eq new-after-buf (omnidiff-dual--session-after-buf session))))
+                     (not (eq new-after-buf (omnidiff-dual-session-after-buf session))))
             (kill-buffer new-after-buf)))))))
 
 (provide 'omnidiff-dual)

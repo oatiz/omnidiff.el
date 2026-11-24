@@ -31,8 +31,8 @@
 (require 'cl-lib)
 (require 'diff-mode)
 
-(declare-function modus-themes-get-color-value "modus-themes" (color &optional overrides theme))
-(declare-function modus-themes-get-current-theme "modus-themes" ())
+(declare-function modus-themes-get-color-value "ext:modus-themes" (color &optional overrides theme))
+(declare-function modus-themes-get-current-theme "ext:modus-themes" ())
 
 ;;; Customization
 
@@ -109,6 +109,11 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
            (omnidiff-apply-theme))))
 
 ;;; Faces
+;;
+;; Each `defface' carries the single-source-of-truth `(t ...)' fallback spec
+;; for 8/16-color TTY and monochrome displays.  `omnidiff-apply-theme' prepends
+;; `((class color) (min-colors 88) ...)' clauses while preserving each face's
+;; `(t ...)' fallback clause.
 
 (defface omnidiff-ui
   '((t nil))
@@ -116,22 +121,22 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-header-line
-  '((t :inherit omnidiff-ui))
+  '((t :inherit (omnidiff-ui header-line)))
   "Header line face for `omnidiff-mode'."
   :group 'omnidiff)
 
 (defface omnidiff-header-badge
-  '((t :inherit omnidiff-ui :weight bold))
+  '((t :inherit (omnidiff-ui highlight) :weight bold))
   "Accent badge face in the `omnidiff-mode' header line."
   :group 'omnidiff)
 
 (defface omnidiff-header-file
-  '((t :inherit omnidiff-ui :weight semi-bold))
+  '((t :inherit (omnidiff-ui header-line) :weight semi-bold))
   "Current visible file name in the fixed header line."
   :group 'omnidiff)
 
 (defface omnidiff-file-header
-  '((t :inherit omnidiff-ui :weight bold :extend t))
+  '((t :inherit (omnidiff-ui header-line) :weight bold :extend t))
   "File card header face in `omnidiff-mode'."
   :group 'omnidiff)
 
@@ -141,47 +146,47 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-stat-added
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header success) :weight semi-bold))
   "Added count in file card header."
   :group 'omnidiff)
 
 (defface omnidiff-stat-removed
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header error) :weight semi-bold))
   "Removed count in file card header."
   :group 'omnidiff)
 
 (defface omnidiff-stat-changed
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header warning) :weight semi-bold))
   "Updated count in file card header."
   :group 'omnidiff)
 
 (defface omnidiff-stat-moved
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header shadow) :weight semi-bold))
   "Moved count in file card header."
   :group 'omnidiff)
 
 (defface omnidiff-stat-index
-  '((t :inherit omnidiff-file-header :weight normal))
+  '((t :inherit (omnidiff-file-header shadow) :weight normal))
   "File index counter in file card header."
   :group 'omnidiff)
 
 (defface omnidiff-file-status-added
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header diff-added)))
   "Status badge for newly added files."
   :group 'omnidiff)
 
 (defface omnidiff-file-status-deleted
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header diff-removed)))
   "Status badge for deleted files."
   :group 'omnidiff)
 
 (defface omnidiff-file-status-renamed
-  '((t :inherit omnidiff-file-header))
+  '((t :inherit (omnidiff-file-header warning)))
   "Status badge for renamed files."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-header
-  '((t :inherit omnidiff-ui :weight semi-bold :extend t))
+  '((t :inherit (omnidiff-ui header-line) :weight semi-bold :extend t))
   "Hunk header strip face in `omnidiff-mode'."
   :group 'omnidiff)
 
@@ -191,61 +196,48 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-meta
-  '((t :inherit omnidiff-hunk-header :weight normal))
+  '((t :inherit (omnidiff-hunk-header shadow) :weight normal))
   "Secondary metadata (unchanged count, hunk index) on hunk headers."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-stat-added
-  '((t :inherit omnidiff-hunk-header))
+  '((t :inherit (omnidiff-hunk-header success) :weight semi-bold))
   "Added line count face on hunk headers."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-stat-removed
-  '((t :inherit omnidiff-hunk-header))
+  '((t :inherit (omnidiff-hunk-header error) :weight semi-bold))
   "Removed line count face on hunk headers."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-stat-changed
-  '((t :inherit omnidiff-hunk-header))
+  '((t :inherit (omnidiff-hunk-header warning) :weight semi-bold))
   "Changed line count face on hunk headers."
   :group 'omnidiff)
 
 (defface omnidiff-hunk-stat-moved
-  '((t :inherit omnidiff-hunk-header))
+  '((t :inherit (omnidiff-hunk-header shadow) :weight semi-bold))
   "Moved line count face on hunk headers."
   :group 'omnidiff)
 
 (defface omnidiff-side-bar
-  '((t :inherit omnidiff-ui :extend t))
+  '((t :inherit (omnidiff-ui shadow) :extend t))
   "Full-width subtle strip behind BEFORE/AFTER labels."
   :group 'omnidiff)
 
 (defface omnidiff-side-before
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f5e3e7" :foreground "#8a2b3f" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#3a2129" :foreground "#e09eb0" :weight semi-bold)
-    (t :inherit (omnidiff-ui diff-removed) :weight semi-bold))
+  '((t :inherit (omnidiff-ui diff-removed) :weight semi-bold))
   "BEFORE sub-header pill face."
   :group 'omnidiff)
 
 (defface omnidiff-side-after
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#e1f0e6" :foreground "#23623d" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#1f3529" :foreground "#96ccab" :weight semi-bold)
-    (t :inherit (omnidiff-ui diff-added) :weight semi-bold))
+  '((t :inherit (omnidiff-ui diff-added) :weight semi-bold))
   "AFTER sub-header pill face."
   :group 'omnidiff)
 
 (defface omnidiff-gap
-  '((t :inherit omnidiff-ui :slant italic :extend t))
+  '((t :inherit (omnidiff-ui shadow) :slant italic :extend t))
   "Collapsed unchanged-lines band face."
-  :group 'omnidiff)
-
-(defface omnidiff-scope
-  '((t :slant italic :extend t))
-  "Enclosing scope (`@') anchor line face."
   :group 'omnidiff)
 
 (defface omnidiff-lineno
@@ -254,17 +246,17 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-lineno-added
-  '((t :inherit omnidiff-lineno))
+  '((t :inherit (omnidiff-lineno success)))
   "Line number gutter face for added lines."
   :group 'omnidiff)
 
 (defface omnidiff-lineno-removed
-  '((t :inherit omnidiff-lineno))
+  '((t :inherit (omnidiff-lineno error)))
   "Line number gutter face for removed lines."
   :group 'omnidiff)
 
 (defface omnidiff-lineno-changed
-  '((t :inherit omnidiff-lineno))
+  '((t :inherit (omnidiff-lineno warning)))
   "Line number gutter face for updated lines."
   :group 'omnidiff)
 
@@ -274,11 +266,7 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-moved-indicator
-  '((((class color grayscale) (min-colors 88) (background light))
-     :foreground "medium purple")
-    (((class color grayscale) (min-colors 88) (background dark))
-     :foreground "light steel blue")
-    (t :foreground "grey50"))
+  '((t :foreground "grey50"))
   "Foreground-only face for moved rail markers and `→ N' move references."
   :group 'omnidiff)
 
@@ -317,11 +305,6 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   "Full-line face for moved blocks."
   :group 'omnidiff)
 
-(defface omnidiff-moved-header
-  '((t :inherit omnidiff-ui :slant italic :extend t))
-  "Banner face for `Moved to/from line N' annotations."
-  :group 'omnidiff)
-
 (defface omnidiff-commit-hash
   '((t :weight bold))
   "Commit hash face in `git show' preambles."
@@ -333,29 +316,17 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-image-bar
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f2f3f6" :foreground "#595e6a" :extend t)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#1f222a" :foreground "#9aa0ae" :extend t)
-    (t :inherit (omnidiff-ui header-line) :extend t))
+  '((t :inherit (omnidiff-ui header-line) :extend t))
   "Subtle control strip behind image diff mode pills."
   :group 'omnidiff)
 
 (defface omnidiff-image-mode-active
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#dde4f2" :foreground "#2454a8" :weight bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#2e3647" :foreground "#82b4ff" :weight bold)
-    (t :inherit (omnidiff-ui highlight) :weight bold))
+  '((t :inherit (omnidiff-ui highlight) :weight bold))
   "Selected visual diff mode pill on an image card toolbar."
   :group 'omnidiff)
 
 (defface omnidiff-image-mode-inactive
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f2f3f6" :foreground "#595e6a")
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#1f222a" :foreground "#9aa0ae")
-    (t :inherit (omnidiff-ui shadow)))
+  '((t :inherit (omnidiff-ui shadow)))
   "Unselected visual diff mode pill on an image card toolbar."
   :group 'omnidiff)
 
@@ -375,243 +346,183 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
   :group 'omnidiff)
 
 (defface omnidiff-image-frame
-  '((((class color) (min-colors 88) (background light))
-     :foreground "#c8cbd4")
-    (((class color) (min-colors 88) (background dark))
-     :foreground "#3d4252")
-    (t :inherit shadow))
+  '((t :inherit shadow))
   "Subtle border color framing inline image previews and 1:1 region crops."
   :group 'omnidiff)
 
 (defface omnidiff-image-diff-highlight
-  '((((class color) (min-colors 88) (background light))
-     :foreground "#c82d63")
-    (((class color) (min-colors 88) (background dark))
-     :foreground "#e65c8e")
-    (t :foreground "magenta"))
+  '((t :foreground "magenta"))
   "Accent color for pixel-diff highlights and changed-region boxes."
   :group 'omnidiff)
 
 ;;; Semantic token faces (no `:extend t' -- wrap only changed token spans)
 
 (defface omnidiff-token-insert
-  '((((class color) (min-colors 88) (background light))
-     :background "#c3decb")
-    (((class color) (min-colors 88) (background dark))
-     :background "#336c57")
-    (t :inherit diff-refine-added))
+  '((t :inherit diff-refine-added))
   "Inline semantic token highlight for inserted spans."
   :group 'omnidiff)
 
 (defface omnidiff-token-delete
-  '((((class color) (min-colors 88) (background light))
-     :background "#f3c6c9")
-    (((class color) (min-colors 88) (background dark))
-     :background "#7a3f4d")
-    (t :inherit diff-refine-removed))
+  '((t :inherit diff-refine-removed))
   "Inline semantic token highlight for deleted spans."
   :group 'omnidiff)
 
 (defface omnidiff-token-update
-  '((((class color) (min-colors 88) (background light))
-     :background "#e5d7bd")
-    (((class color) (min-colors 88) (background dark))
-     :background "#72624e")
-    (t :inherit diff-refine-changed))
+  '((t :inherit diff-refine-changed))
   "Inline semantic token highlight for updated spans."
   :group 'omnidiff)
 
 (defface omnidiff-token-move
-  '((((class color) (min-colors 88) (background light))
-     :background "#d9dcde")
-    (((class color) (min-colors 88) (background dark))
-     :background "#525560")
-    (t :underline t))
-  "Inline semantic token highlight for moved spans (neutral grey)."
+  '((t :underline t))
+  "Inline semantic token highlight for moved spans."
   :group 'omnidiff)
 
 (defface omnidiff-token-cross-highlight
-  '((((class color) (min-colors 88) (background light))
-     :background "#70a8ea")
-    (((class color) (min-colors 88) (background dark))
-     :background "#4878a6")
-    (t :inherit highlight))
+  '((t :inherit highlight))
   "Vivid counterpart highlight linking active changes and move targets."
   :group 'omnidiff)
 
 (defface omnidiff-token-active
-  '((((class color) (min-colors 88) (background light))
-     :background "#d6e6fb" :box (:line-width -1 :color "#0969da"))
-    (((class color) (min-colors 88) (background dark))
-     :background "#354a66" :box (:line-width -1 :color "#61afef"))
-    (t :box (:line-width -1)))
+  '((t :box (:line-width -1)))
   "Focused change accent for the current navigation stop."
   :group 'omnidiff)
 
 ;;; Dual viewer chrome & gutter faces
 
 (defface omnidiff-dual-header-before
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f5e3e7" :foreground "#cf222e"
-     :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#3a2129" :foreground "#f06875"
-     :weight semi-bold)
-    (t :inherit omnidiff-side-before))
+  '((t :inherit omnidiff-side-before))
   "Header face for the BEFORE pane in the dual semantic viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-header-after
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#e1f0e6" :foreground "#1a7f37"
-     :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#1f3529" :foreground "#50d890"
-     :weight semi-bold)
-    (t :inherit omnidiff-side-after))
+  '((t :inherit omnidiff-side-after))
   "Header face for the AFTER pane in the dual semantic viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-header-meta
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#595e6a")
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#9aa0ae")
-    (t :inherit (omnidiff-ui shadow)))
+  '((t :inherit (omnidiff-ui shadow)))
   "Secondary metadata face in dual viewer pane headers."
   :group 'omnidiff)
 
 (defface omnidiff-dual-header-before-inactive
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#8a2b3f")
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#c49aa6")
-    (t :inherit omnidiff-dual-header-meta))
+  '((t :inherit (omnidiff-ui shadow)))
   "Inactive BEFORE pill face when the opposite dual pane has focus."
   :group 'omnidiff)
 
 (defface omnidiff-dual-header-after-inactive
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#23623d")
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#91b8a2")
-    (t :inherit omnidiff-dual-header-meta))
+  '((t :inherit (omnidiff-ui shadow)))
   "Inactive AFTER pill face when the opposite dual pane has focus."
   :group 'omnidiff)
 
 (defface omnidiff-dual-header-file
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#1f2328" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#e2e4ec" :weight semi-bold)
-    (t :inherit omnidiff-ui :weight semi-bold))
+  '((t :inherit omnidiff-ui :weight semi-bold))
   "Focused filename label face in dual viewer pane headers."
   :group 'omnidiff)
 
-(defface omnidiff-dual-header-file-inactive
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#595e6a")
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#9aa0ae")
-    (t :inherit (omnidiff-ui shadow)))
-  "Unfocused filename label face in dual viewer pane headers."
-  :group 'omnidiff)
-
 (defface omnidiff-dual-header-badge
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#eef1f6" :foreground "#0969da" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#323241" :foreground "#61afef" :weight semi-bold)
-    (t :inherit omnidiff-summary-badge))
+  '((t :inherit omnidiff-summary-badge))
   "Inline badge face inside dual viewer pane headers with continuous underline."
   :group 'omnidiff)
 
 (defface omnidiff-dual-fold-banner
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#f4f4f4" :foreground "#595e6a"
-     :slant italic :overline "#d2d3d4" :underline "#d2d3d4" :extend t)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#262636" :foreground "#898b97"
-     :slant italic :overline "#3b3c4a" :underline "#3b3c4a" :extend t)
-    (t :inherit omnidiff-gap :extend t))
+  '((t :inherit omnidiff-gap :extend t))
   "Full-width fold banner separating unchanged regions in the dual viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-gutter-insert
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#1a7f37" :weight bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#50d890" :weight bold)
-    (t :inherit (omnidiff-ui success) :weight bold))
+  '((t :inherit (omnidiff-ui success) :weight bold))
   "Gutter marker face for inserted lines in the dual viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-gutter-delete
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#cf222e" :weight bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#f06875" :weight bold)
-    (t :inherit (omnidiff-ui error) :weight bold))
+  '((t :inherit (omnidiff-ui error) :weight bold))
   "Gutter marker face for deleted lines in the dual viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-gutter-update
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#9a6700" :weight bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#e5c07b" :weight bold)
-    (t :inherit (omnidiff-ui warning) :weight bold))
+  '((t :inherit (omnidiff-ui warning) :weight bold))
   "Gutter marker face for updated lines in the dual viewer."
   :group 'omnidiff)
 
 (defface omnidiff-dual-gutter-move
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#6e7781" :weight bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#9aa0a6" :weight bold)
-    (t :inherit (omnidiff-ui shadow) :weight bold))
+  '((t :inherit (omnidiff-ui shadow) :weight bold))
   "Gutter marker face for moved lines in the dual viewer."
   :group 'omnidiff)
 
 ;;; Semantic summary & container faces
 
 (defface omnidiff-summary-badge
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :background "#eef1f6" :foreground "#0969da"
-     :weight semi-bold :box (:line-width -1 :color "#d2d3d4"))
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :background "#323241" :foreground "#61afef"
-     :weight semi-bold :box (:line-width -1 :color "#4d4e5b"))
-    (t :inherit omnidiff-header-badge))
+  '((t :inherit omnidiff-header-badge))
   "Badge face for semantic change summaries."
   :group 'omnidiff)
 
 (defface omnidiff-container-member-changed
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#9a6700" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#e5c07b" :weight semi-bold)
-    (t :inherit omnidiff-stat-changed))
+  '((t :inherit (omnidiff-ui warning) :weight semi-bold))
   "Face for changed members in semantic container summaries."
   :group 'omnidiff)
 
 (defface omnidiff-container-member-added
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#1a7f37" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#50d890" :weight semi-bold)
-    (t :inherit omnidiff-stat-added))
+  '((t :inherit (omnidiff-ui success) :weight semi-bold))
   "Face for added members in semantic container summaries."
   :group 'omnidiff)
 
 (defface omnidiff-container-member-removed
-  '((((class color) (min-colors 88) (background light))
-     :inherit omnidiff-ui :foreground "#cf222e" :weight semi-bold)
-    (((class color) (min-colors 88) (background dark))
-     :inherit omnidiff-ui :foreground "#f06875" :weight semi-bold)
-    (t :inherit omnidiff-stat-removed))
+  '((t :inherit (omnidiff-ui error) :weight semi-bold))
   "Face for removed members in semantic container summaries."
   :group 'omnidiff)
+
+;;; State & public helpers
+
+(defvar omnidiff-theme--revision 0
+  "Monotonic revision counter incremented whenever `omnidiff-apply-theme' runs.")
+
+(defvar omnidiff-theme--last-applied-key nil
+  "Memoization key for the most recent `omnidiff-apply-theme' application.")
+
+(defvar omnidiff-theme--semantic-colors-cache nil
+  "Cached `(KEY . PLIST)' pair for `omnidiff-theme-semantic-colors'.")
+
+(defvar omnidiff-theme-after-apply-hook nil
+  "Normal hook run after `omnidiff-apply-theme' updates palette faces.")
+
+(defconst omnidiff-theme--semantic-color-keys
+  '(:insert-bg :delete-bg :update-bg :move-bg :cross-bg :active-bg
+    :overlay-fg :bg-main :bg-chrome :bg-card :border :fg-main :fg-dim
+    :accent :gutter-insert :gutter-delete :gutter-update :gutter-move)
+  "Keys exported by `omnidiff-theme-semantic-colors'.")
+
+(defun omnidiff-theme-revision ()
+  "Return the current monotonic theme revision counter."
+  omnidiff-theme--revision)
+
+(defun omnidiff-theme-op-priority (op)
+  "Return precedence rank for diff operation OP (higher wins)."
+  (pcase op
+    ('update 3)
+    ('insert 2)
+    ('delete 2)
+    ('move 1)
+    (_ 0)))
+
+(defun omnidiff-theme-token-face (op)
+  "Return semantic token face symbol for diff operation OP."
+  (pcase op
+    ('insert 'omnidiff-token-insert)
+    ('delete 'omnidiff-token-delete)
+    ('update 'omnidiff-token-update)
+    ('move 'omnidiff-token-move)
+    (_ 'omnidiff-token-update)))
+
+(defun omnidiff-theme-cycle-color-scheme ()
+  "Cycle `omnidiff-color-scheme' across presets and re-apply faces.
+Return the newly selected scheme symbol."
+  (let ((next (pcase omnidiff-color-scheme
+                ('omni-semantic 'calm-modus)
+                ('calm-modus 'neutral-paper)
+                (_ 'omni-semantic))))
+    (setq omnidiff-color-scheme next)
+    (omnidiff-apply-theme)
+    next))
 
 ;;; Color utilities
 
@@ -650,13 +561,14 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
                           rgb1 rgb2))
       c1)))
 
-(defun omnidiff-theme--dark-color-p (hex)
-  "Return non-nil when HEX is a dark color (Rec. 709 luma below 128)."
-  (pcase (omnidiff-theme--parse-hex hex)
-    (`(,r ,g ,b) (< (+ (* 0.2126 r) (* 0.7152 g) (* 0.0722 b)) 128.0))
-    (_ (eq (frame-parameter nil 'background-mode) 'dark))))
-
-;;; Palette resolution
+(defun omnidiff-theme-dark-color-p (color)
+  "Return non-nil when COLOR is dark (Rec. 709 relative luma below 128)."
+  (let ((rgb (or (omnidiff-theme--parse-hex color)
+                 (when-let* ((hex (omnidiff-theme-color-hex color)))
+                   (omnidiff-theme--parse-hex hex)))))
+    (pcase rgb
+      (`(,r ,g ,b) (< (+ (* 0.2126 r) (* 0.7152 g) (* 0.0722 b)) 128.0))
+      (_ (eq (frame-parameter nil 'background-mode) 'dark)))))
 
 (defun omnidiff-theme--color-distance (c1 c2)
   "Return Manhattan RGB distance between \"#rrggbb\" C1 and C2, or nil."
@@ -689,31 +601,15 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
         (omnidiff-theme-color-hex val))
       fallback))
 
-(cl-defstruct (omnidiff-theme--base (:copier nil))
-  "Raw theme colors resolved from Modus or generic Emacs faces."
-  bg-main bg-dim bg-inactive bg-active bg-card bg-chrome border
-  accent dark-p fg-main fg-dim
-  bg-added-faint bg-added-refine fg-added
-  bg-removed-faint bg-removed-refine fg-removed
-  bg-changed-faint bg-changed-refine fg-changed
-  blue-cooler green-faint red-faint yellow-faint indigo
-  bg-green-nuanced bg-sage bg-ochre fg-ochre bg-lavender raw-moved
-  accent-green accent-red accent-yellow accent-cyan accent-grey)
+;;; Palette resolution
 
-(cl-defstruct (omnidiff-theme--palette (:copier nil))
-  "Resolved semantic surface and foreground colors for `omnidiff-mode'."
-  bg-main bg-active bg-card bg-chrome bg-hunk border hunk-border
-  accent hunk-accent fg-main fg-dim blue-cooler
-  add-bg add-fg add-ref-bg add-gut-fg
-  rem-bg rem-fg rem-ref-bg rem-gut-fg
-  chg-bg chg-fg chg-ref-bg chg-gut-fg
-  mov-bg mov-fg mov-gut-fg mov-hdr-fg
-  ref-fg ref-weight
-  side-before-bg side-after-bg
-  stat-add-fg stat-rem-fg stat-chg-fg stat-mov-fg
-  token-insert-bg token-delete-bg token-update-bg token-move-bg
-  token-cross-bg token-active-bg token-active-border token-overlay-fg
-  dual-gutter-insert dual-gutter-delete dual-gutter-update dual-gutter-move)
+(cl-defstruct (omnidiff-theme--base (:copier nil))
+  "Core theme colors resolved from Modus or generic Emacs faces.
+NUANCES is an optional plist of theme-specific soft tints (used by Modus)."
+  dark-p bg-main bg-dim bg-inactive bg-active bg-card bg-chrome border
+  fg-main fg-dim accent blue-cooler
+  accent-green accent-red accent-yellow
+  nuances)
 
 (defun omnidiff-theme--modus-base ()
   "Resolve `omnidiff-theme--base' from the active Modus theme."
@@ -722,7 +618,7 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
                   fallback)))
     (let* ((frame-dark-p (eq (frame-parameter nil 'background-mode) 'dark))
            (bg-main (c 'bg-main (if frame-dark-p "#1e1e2e" "#ffffff")))
-           (dark-p (omnidiff-theme--dark-color-p bg-main))
+           (dark-p (omnidiff-theme-dark-color-p bg-main))
            (fg-main (c 'fg-main (if dark-p "#e2e4ec" "#1f2328")))
            (bg-dim (c 'bg-dim (omnidiff-theme--blend-hex bg-main fg-main 0.06)))
            (bg-inactive (c 'bg-inactive (omnidiff-theme--blend-hex bg-main fg-main 0.08)))
@@ -739,8 +635,10 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
            (fg-changed (c 'fg-changed (if dark-p "#e5c07b" "#9a6700")))
            (yellow-faint (c 'yellow-faint fg-changed))
            (blue-cooler (c 'blue-cooler (if dark-p "#61afef" "#0969da")))
-           (bg-blue-nuanced (c 'bg-blue-nuanced "#12154a")))
+           (bg-blue-nuanced (c 'bg-blue-nuanced (if dark-p "#12154a" "#e8ebfa")))
+           (bg-magenta-nuanced (c 'bg-magenta-nuanced)))
       (make-omnidiff-theme--base
+       :dark-p dark-p
        :bg-main bg-main
        :bg-dim bg-dim
        :bg-inactive bg-inactive
@@ -748,35 +646,37 @@ floating-point relative scale (e.g. 0.9) or an integer in 1/10pt units."
        :bg-card (if (equal bg-tab-current bg-main) bg-inactive bg-tab-current)
        :bg-chrome (if (equal bg-tab-current bg-main) bg-dim bg-tab-bar)
        :border (c 'border (omnidiff-theme--blend-hex bg-main fg-main 0.22))
-       :accent (c 'blue-warmer blue-cooler)
-       :dark-p dark-p
        :fg-main fg-main
        :fg-dim (c 'fg-dim (omnidiff-theme--blend-hex fg-main bg-main 0.45))
-       :bg-added-faint bg-added-faint
-       :bg-added-refine bg-added-refine
-       :fg-added fg-added
-       :bg-removed-faint bg-removed-faint
-       :bg-removed-refine bg-removed-refine
-       :fg-removed fg-removed
-       :bg-changed-faint bg-changed-faint
-       :bg-changed-refine bg-changed-refine
-       :fg-changed fg-changed
+       :accent (c 'blue-warmer blue-cooler)
        :blue-cooler blue-cooler
-       :green-faint (c 'green-faint fg-added)
-       :red-faint (c 'red-faint fg-removed)
-       :yellow-faint yellow-faint
-       :indigo (c 'indigo (c 'magenta-cooler (if dark-p "#b4a7f0" "#5c4bb8")))
-       :bg-green-nuanced (c 'bg-green-nuanced bg-added-faint)
-       :bg-sage (c 'bg-sage bg-added-refine)
-       :bg-ochre (c 'bg-ochre bg-changed-refine)
-       :fg-ochre (c 'fg-ochre yellow-faint)
-       :bg-lavender (c 'bg-lavender bg-blue-nuanced)
-       :raw-moved bg-blue-nuanced
        :accent-green (c 'green (c 'green-cooler fg-added))
        :accent-red (c 'red (c 'red-warmer fg-removed))
        :accent-yellow (c 'yellow (c 'yellow-warmer fg-changed))
-       :accent-cyan (c 'cyan blue-cooler)
-       :accent-grey (if dark-p "#9aa0a6" "#6e7781")))))
+       :nuances
+       (list :bg-added-faint bg-added-faint
+             :bg-added-refine bg-added-refine
+             :fg-added fg-added
+             :bg-removed-faint bg-removed-faint
+             :bg-removed-refine bg-removed-refine
+             :fg-removed fg-removed
+             :bg-changed-faint bg-changed-faint
+             :bg-changed-refine bg-changed-refine
+             :fg-changed fg-changed
+             :green-faint (c 'green-faint fg-added)
+             :red-faint (c 'red-faint fg-removed)
+             :yellow-faint yellow-faint
+             :indigo (c 'indigo (c 'magenta-cooler (if dark-p "#b4a7f0" "#5c4bb8")))
+             :bg-green-nuanced (c 'bg-green-nuanced bg-added-faint)
+             :bg-sage (c 'bg-sage bg-added-refine)
+             :bg-plum (if bg-magenta-nuanced
+                          (omnidiff-theme--blend-hex bg-removed-refine bg-magenta-nuanced 0.45)
+                        (omnidiff-theme--blend-hex bg-removed-refine bg-dim 0.42))
+             :bg-ochre (c 'bg-ochre bg-changed-refine)
+             :fg-ochre (c 'fg-ochre yellow-faint)
+             :bg-lavender (c 'bg-lavender bg-blue-nuanced)
+             :raw-moved bg-blue-nuanced
+             :accent-cyan (c 'cyan blue-cooler))))))
 
 (defun omnidiff-theme--generic-base (&optional background-mode)
   "Resolve `omnidiff-theme--base' dynamically from active Emacs faces.
@@ -796,13 +696,13 @@ faces and uses clean canonical dark/light hex fallbacks instead."
                        (or (null background-mode)
                            (and (eq background-mode frame-mode)
                                 (or (null raw-bg)
-                                    (eq (omnidiff-theme--dark-color-p raw-bg)
+                                    (eq (omnidiff-theme-dark-color-p raw-bg)
                                         req-dark-p))))))
          (bg-main (or (and probe-p raw-bg)
                       (if req-dark-p "#1e1e2e" "#ffffff")))
          (dark-p (if background-mode
                      req-dark-p
-                   (omnidiff-theme--dark-color-p bg-main)))
+                   (omnidiff-theme-dark-color-p bg-main)))
          (fg-main (or (and probe-p (omnidiff-theme--face-hex 'default :foreground))
                       (if dark-p "#e2e4ec" "#1f2328")))
          (shadow-fg (when probe-p (omnidiff-theme--face-hex 'shadow :foreground)))
@@ -818,7 +718,7 @@ faces and uses clean canonical dark/light hex fallbacks instead."
                           for hex = (omnidiff-theme--face-hex face :background)
                           for dist = (and hex (omnidiff-theme--color-distance hex bg-main))
                           when (and hex
-                                    (eq (omnidiff-theme--dark-color-p hex) dark-p)
+                                    (eq (omnidiff-theme-dark-color-p hex) dark-p)
                                     (>= dist 12)
                                     (<= dist 110))
                           return hex))
@@ -837,17 +737,7 @@ faces and uses clean canonical dark/light hex fallbacks instead."
                                      avoid))
                           return hex))
                fallback)))
-      (let* ((bg-chrome (pick-surface
-                         '(fringe)
-                         (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.04 0.03))))
-             (bg-dim (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.06 0.05)))
-             (bg-inactive (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.08 0.08)))
-             (bg-card (pick-surface
-                       '(header-line mode-line-inactive mode-line)
-                       (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.10 0.07))))
-             (bg-active (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.15 0.13)))
-             (border (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.24 0.20)))
-             (accent (pick-accent '(link font-lock-keyword-face highlight)
+      (let* ((accent (pick-accent '(link font-lock-keyword-face highlight)
                                   (if dark-p "#61afef" "#0969da")))
              (accent-green (pick-accent '(success diff-added)
                                         (if dark-p "#50d890" "#1a7f37")))
@@ -859,613 +749,438 @@ faces and uses clean canonical dark/light hex fallbacks instead."
                                          (list accent-green accent-red)))
              (accent-cyan (pick-accent '(font-lock-constant-face link)
                                        (if dark-p "#61afef" "#0969da")
-                                       (list accent-green accent-red accent-yellow)))
-             (accent-grey (if dark-p "#9aa0a6" "#6e7781"))
-             (bg-added-faint (omnidiff-theme--blend-hex accent-green bg-main
-                                                        (if dark-p 0.80 0.88)))
-             (bg-added-refine (omnidiff-theme--blend-hex accent-green bg-main
-                                                         (if dark-p 0.62 0.76)))
-             (bg-removed-faint (omnidiff-theme--blend-hex accent-red bg-main
-                                                          (if dark-p 0.80 0.88)))
-             (bg-removed-refine (omnidiff-theme--blend-hex accent-red bg-main
-                                                           (if dark-p 0.62 0.76)))
-             (bg-changed-faint (omnidiff-theme--blend-hex accent-yellow bg-main
-                                                          (if dark-p 0.80 0.88)))
-             (bg-changed-refine (omnidiff-theme--blend-hex accent-yellow bg-main
-                                                           (if dark-p 0.62 0.76)))
-             (green-faint (omnidiff-theme--blend-hex accent-green fg-main
-                                                     (if dark-p 0.25 0.10)))
-             (red-faint (omnidiff-theme--blend-hex accent-red fg-main
-                                                   (if dark-p 0.25 0.10)))
-             (yellow-faint (omnidiff-theme--blend-hex accent-yellow fg-main
-                                                      (if dark-p 0.25 0.10)))
-             (indigo (if dark-p "#b4a7f0" "#5c4bb8"))
-             (raw-moved (omnidiff-theme--blend-hex accent-grey bg-main
-                                                   (if dark-p 0.82 0.90))))
+                                       (list accent-green accent-red accent-yellow))))
         (make-omnidiff-theme--base
-         :bg-main bg-main
-         :bg-dim bg-dim
-         :bg-inactive bg-inactive
-         :bg-active bg-active
-         :bg-card bg-card
-         :bg-chrome bg-chrome
-         :border border
-         :accent accent
          :dark-p dark-p
+         :bg-main bg-main
+         :bg-dim (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.06 0.05))
+         :bg-inactive (omnidiff-theme--blend-hex bg-main fg-main 0.08)
+         :bg-active (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.15 0.13))
+         :bg-card (pick-surface
+                   '(header-line mode-line-inactive mode-line)
+                   (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.10 0.07)))
+         :bg-chrome (pick-surface
+                     '(fringe)
+                     (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.04 0.03)))
+         :border (omnidiff-theme--blend-hex bg-main fg-main (if dark-p 0.24 0.20))
          :fg-main fg-main
          :fg-dim fg-dim
-         :bg-added-faint bg-added-faint
-         :bg-added-refine bg-added-refine
-         :fg-added accent-green
-         :bg-removed-faint bg-removed-faint
-         :bg-removed-refine bg-removed-refine
-         :fg-removed accent-red
-         :bg-changed-faint bg-changed-faint
-         :bg-changed-refine bg-changed-refine
-         :fg-changed accent-yellow
+         :accent accent
          :blue-cooler accent-cyan
-         :green-faint green-faint
-         :red-faint red-faint
-         :yellow-faint yellow-faint
-         :indigo indigo
-         :bg-green-nuanced (omnidiff-theme--blend-hex accent-green bg-main
-                                                      (if dark-p 0.78 0.90))
-         :bg-sage bg-added-refine
-         :bg-ochre bg-changed-refine
-         :fg-ochre yellow-faint
-         :bg-lavender (omnidiff-theme--blend-hex indigo bg-main (if dark-p 0.76 0.90))
-         :raw-moved raw-moved
          :accent-green accent-green
          :accent-red accent-red
-         :accent-yellow accent-yellow
-         :accent-cyan accent-cyan
-         :accent-grey accent-grey)))))
+         :accent-yellow accent-yellow)))))
 
 (defun omnidiff-theme--resolve-palette (base scheme)
-  "Compute an `omnidiff-theme--palette' from BASE colors and color SCHEME."
-  (let* ((bg-main (omnidiff-theme--base-bg-main base))
-         (bg-dim (omnidiff-theme--base-bg-dim base))
-         (bg-inactive (omnidiff-theme--base-bg-inactive base))
-         (bg-active (omnidiff-theme--base-bg-active base))
-         (border (omnidiff-theme--custom-color 'border (omnidiff-theme--base-border base)))
-         (accent (omnidiff-theme--custom-color 'accent (omnidiff-theme--base-accent base)))
-         (dark-p (omnidiff-theme--base-dark-p base))
-         (fg-main (omnidiff-theme--base-fg-main base))
-         (fg-dim (omnidiff-theme--base-fg-dim base))
-         (bg-added-faint (omnidiff-theme--base-bg-added-faint base))
-         (bg-added-refine (omnidiff-theme--base-bg-added-refine base))
-         (fg-added (omnidiff-theme--base-fg-added base))
-         (bg-removed-faint (omnidiff-theme--base-bg-removed-faint base))
-         (bg-removed-refine (omnidiff-theme--base-bg-removed-refine base))
-         (fg-removed (omnidiff-theme--base-fg-removed base))
-         (bg-changed-faint (omnidiff-theme--base-bg-changed-faint base))
-         (bg-changed-refine (omnidiff-theme--base-bg-changed-refine base))
-         (fg-changed (omnidiff-theme--base-fg-changed base))
-         (green-faint (omnidiff-theme--base-green-faint base))
-         (red-faint (omnidiff-theme--base-red-faint base))
-         (yellow-faint (omnidiff-theme--base-yellow-faint base))
-         (indigo (omnidiff-theme--base-indigo base))
-         (bg-green-nuanced (omnidiff-theme--base-bg-green-nuanced base))
-         (bg-sage (omnidiff-theme--base-bg-sage base))
-         (bg-ochre (omnidiff-theme--base-bg-ochre base))
-         (fg-ochre (omnidiff-theme--base-fg-ochre base))
-         (bg-lavender (omnidiff-theme--base-bg-lavender base))
-         (raw-moved (omnidiff-theme--base-raw-moved base))
-         (accent-green (or (omnidiff-theme--base-accent-green base)
-                           fg-added
-                           (if dark-p "#50d890" "#1a7f37")))
-         (accent-red (or (omnidiff-theme--base-accent-red base)
-                         fg-removed
-                         (if dark-p "#f06875" "#cf222e")))
-         (accent-yellow (or (omnidiff-theme--base-accent-yellow base)
-                            fg-changed
-                            (if dark-p "#e5c07b" "#9a6700")))
-         (accent-cyan (or (omnidiff-theme--base-accent-cyan base)
-                          (omnidiff-theme--base-blue-cooler base)
-                          accent))
-         (accent-grey (or (omnidiff-theme--base-accent-grey base)
-                          (if dark-p "#9aa0a6" "#6e7781")))
-         (fg-soft (omnidiff-theme--blend-hex fg-main fg-dim 0.16))
-         (omni-p (eq scheme 'omni-semantic))
-         (neutral-p (cl-ecase scheme
-                      (omni-semantic nil)
-                      (calm-modus nil)
-                      (neutral-paper t)))
-         (paper-p (and dark-p neutral-p))
-         (light-paper-p (and (not dark-p) neutral-p))
-         ;; Perceptual token blending: ~56-60% toward bg in dark, ~74% in light,
-         ;; neutral grey for moves, vivid ~38-44% cyan/blue for cross-highlight.
-         (band-ratio (cond (omni-p (if dark-p 0.56 0.74))
-                           (neutral-p (if dark-p 0.64 0.80))
-                           (t (if dark-p 0.58 0.75))))
-         (move-ratio (cond (omni-p (if dark-p 0.60 0.76))
-                           (neutral-p (if dark-p 0.66 0.82))
-                           (t (if dark-p 0.62 0.78))))
-         ;; Keep cross-highlight legible under `preserve-syntax' while an underline
-         ;; supplies crisp counterpart prominence without swallowing syntax hues.
-         (cross-ratio (cond (omni-p (if dark-p 0.56 0.68))
-                            (neutral-p (if dark-p 0.60 0.74))
-                            (t (if dark-p 0.58 0.70))))
-         (token-insert-bg
-          (omnidiff-theme--custom-color
-           'insert-bg (omnidiff-theme--blend-hex accent-green bg-main band-ratio)))
-         (token-delete-bg
-          (omnidiff-theme--custom-color
-           'delete-bg (omnidiff-theme--blend-hex accent-red bg-main band-ratio)))
-         (token-update-bg
-          (omnidiff-theme--custom-color
-           'update-bg (omnidiff-theme--blend-hex accent-yellow bg-main band-ratio)))
-         (token-move-bg
-          (omnidiff-theme--custom-color
-           'move-bg (omnidiff-theme--blend-hex accent-grey bg-main move-ratio)))
-         (token-cross-bg
-          (omnidiff-theme--custom-color
-           'cross-highlight-bg
-           (omnidiff-theme--blend-hex accent-cyan bg-main cross-ratio)))
-         (token-active-bg
-          (omnidiff-theme--custom-color
-           'active-bg (omnidiff-theme--blend-hex accent bg-main (if dark-p 0.68 0.82))))
-         (token-overlay-fg
-          (omnidiff-theme--custom-color 'overlay-fg fg-main))
-         (dual-gutter-insert
-          (omnidiff-theme--custom-color
-           'gutter-insert (if dark-p
-                              (omnidiff-theme--blend-hex accent-green fg-main 0.15)
-                            accent-green)))
-         (dual-gutter-delete
-          (omnidiff-theme--custom-color
-           'gutter-delete (if dark-p
-                              (omnidiff-theme--blend-hex accent-red fg-main 0.15)
-                            accent-red)))
-         (dual-gutter-update
-          (omnidiff-theme--custom-color
-           'gutter-update (if dark-p
-                              (omnidiff-theme--blend-hex accent-yellow fg-main 0.12)
-                            accent-yellow)))
-         (dual-gutter-move
-          (omnidiff-theme--custom-color 'gutter-move accent-grey)))
-    (make-omnidiff-theme--palette
-     :bg-main bg-main
-     :bg-active bg-active
-     :bg-card (omnidiff-theme--base-bg-card base)
-     :bg-chrome (omnidiff-theme--base-bg-chrome base)
-     :bg-hunk (if dark-p bg-inactive bg-dim)
-     :border border
-     :hunk-border (if dark-p (omnidiff-theme--blend-hex bg-active border 0.50) border)
-     :accent accent
-     :hunk-accent (if dark-p (omnidiff-theme--blend-hex accent fg-dim 0.25) accent)
-     :fg-main fg-main
-     :fg-dim fg-dim
-     :blue-cooler (omnidiff-theme--base-blue-cooler base)
-     :add-bg (cond (omni-p (omnidiff-theme--blend-hex accent-green bg-main
-                                                      (if dark-p 0.88 0.93)))
-                   (paper-p "#14221f")
-                   (dark-p (omnidiff-theme--blend-hex bg-green-nuanced bg-main 0.38))
-                   (light-paper-p (omnidiff-theme--blend-hex bg-added-faint bg-main 0.35))
-                   (t bg-added-faint))
-     :add-fg (cond (omni-p fg-main)
-                   (paper-p "#c9cbd2")
-                   (dark-p (omnidiff-theme--blend-hex fg-soft green-faint 0.45))
-                   (light-paper-p fg-soft)
-                   (t fg-added))
-     :add-ref-bg (cond (omni-p token-insert-bg)
-                       (paper-p "#284a3e")
-                       (dark-p bg-sage)
-                       (t bg-added-refine))
-     :add-gut-fg (omnidiff-theme--custom-color
-                  'gutter-insert
-                  (cond (omni-p dual-gutter-insert)
-                        (paper-p "#91b8a2")
-                        (dark-p (omnidiff-theme--blend-hex green-faint fg-dim 0.30))
-                        (t fg-added)))
-     :rem-bg (cond (omni-p (omnidiff-theme--blend-hex accent-red bg-main
-                                                      (if dark-p 0.88 0.93)))
-                   (paper-p "#291b23")
-                   (dark-p (omnidiff-theme--blend-hex bg-removed-faint bg-main 0.40))
-                   (light-paper-p (omnidiff-theme--blend-hex bg-removed-faint bg-main 0.35))
-                   (t bg-removed-faint))
-     :rem-fg (cond (omni-p fg-main)
-                   (paper-p "#c9cbd2")
-                   (dark-p (omnidiff-theme--blend-hex fg-soft fg-removed 0.45))
-                   (light-paper-p fg-soft)
-                   (t fg-removed))
-     :rem-ref-bg (cond (omni-p token-delete-bg)
-                       (paper-p "#57323e")
-                       (dark-p (omnidiff-theme--blend-hex bg-removed-refine bg-dim 0.42))
-                       (t bg-removed-refine))
-     :rem-gut-fg (omnidiff-theme--custom-color
-                  'gutter-delete
-                  (cond (omni-p dual-gutter-delete)
-                        (paper-p "#c49aa6")
-                        (dark-p (omnidiff-theme--blend-hex red-faint fg-dim 0.30))
-                        (t fg-removed)))
-     :chg-bg (cond (omni-p (omnidiff-theme--blend-hex accent-yellow bg-main
-                                                      (if dark-p 0.88 0.93)))
-                   (paper-p "#28231b")
-                   (dark-p (omnidiff-theme--blend-hex bg-changed-faint bg-main 0.35))
-                   (light-paper-p (omnidiff-theme--blend-hex bg-changed-faint bg-main 0.35))
-                   (t bg-changed-faint))
-     :chg-fg (cond (omni-p fg-main)
-                   (paper-p "#c9cbd2")
-                   (dark-p (omnidiff-theme--blend-hex fg-soft fg-ochre 0.55))
-                   (light-paper-p fg-soft)
-                   (t fg-changed))
-     :chg-ref-bg (cond (omni-p token-update-bg)
-                       (paper-p "#50452f")
-                       (dark-p bg-ochre)
-                       (t bg-changed-refine))
-     :chg-gut-fg (omnidiff-theme--custom-color
-                  'gutter-update
-                  (cond (omni-p dual-gutter-update)
-                        (paper-p "#c2ad84")
-                        (dark-p (omnidiff-theme--blend-hex yellow-faint fg-dim 0.25))
-                        (t fg-changed)))
-     :mov-bg (cond (omni-p (omnidiff-theme--blend-hex accent-grey bg-main
-                                                      (if dark-p 0.86 0.92)))
-                   (paper-p "#101233")
-                   (dark-p (omnidiff-theme--blend-hex bg-lavender bg-main 0.72))
-                   (light-paper-p (omnidiff-theme--blend-hex raw-moved bg-main 0.35))
-                   (t raw-moved))
-     :mov-fg (cond (omni-p fg-soft)
-                   (paper-p "#c9cbd2")
-                   (dark-p (omnidiff-theme--blend-hex fg-main fg-dim 0.22))
-                   (light-paper-p fg-soft)
-                   (t fg-main))
-     :mov-gut-fg (omnidiff-theme--custom-color
-                  'gutter-move
-                  (cond (omni-p dual-gutter-move)
-                        (paper-p "#a69ac5")
-                        (dark-p (omnidiff-theme--blend-hex indigo fg-dim 0.20))
-                        (t indigo)))
-     :mov-hdr-fg (cond (omni-p dual-gutter-move) (paper-p "#a69ac5") (t indigo))
-     :ref-fg (cond (omni-p token-overlay-fg)
-                   (paper-p "#dedee3")
-                   (dark-p fg-soft)
-                   (t fg-main))
-     :ref-weight (if (or neutral-p omni-p) 'normal 'semi-bold)
-     :side-before-bg (if dark-p
-                         (omnidiff-theme--blend-hex bg-removed-faint bg-dim 0.35)
-                       bg-removed-faint)
-     :side-after-bg (if dark-p
-                        (omnidiff-theme--blend-hex bg-green-nuanced bg-dim 0.35)
-                      bg-added-faint)
-     :stat-add-fg (if dark-p green-faint fg-added)
-     :stat-rem-fg (if dark-p red-faint fg-removed)
-     :stat-chg-fg (if dark-p yellow-faint fg-changed)
-     :stat-mov-fg (cond (omni-p dual-gutter-move) (paper-p "#a69ac5") (t indigo))
-     :token-insert-bg token-insert-bg
-     :token-delete-bg token-delete-bg
-     :token-update-bg token-update-bg
-     :token-move-bg token-move-bg
-     :token-cross-bg token-cross-bg
-     :token-active-bg token-active-bg
-     :token-active-border accent
-     :token-overlay-fg token-overlay-fg
-     :dual-gutter-insert dual-gutter-insert
-     :dual-gutter-delete dual-gutter-delete
-     :dual-gutter-update dual-gutter-update
-     :dual-gutter-move dual-gutter-move)))
-
-(defconst omnidiff-theme--fallback-specs
-  '((omnidiff-header-line . (:inherit (omnidiff-ui header-line)))
-    (omnidiff-header-badge . (:inherit (omnidiff-ui highlight) :weight bold))
-    (omnidiff-header-file . (:inherit (omnidiff-ui header-line) :weight semi-bold))
-    (omnidiff-file-header . (:inherit (omnidiff-ui header-line) :weight bold :extend t))
-    (omnidiff-file-accent . (:inherit omnidiff-file-header))
-    (omnidiff-stat-added . (:inherit (omnidiff-file-header success) :weight semi-bold))
-    (omnidiff-stat-removed . (:inherit (omnidiff-file-header error) :weight semi-bold))
-    (omnidiff-stat-changed . (:inherit (omnidiff-file-header warning) :weight semi-bold))
-    (omnidiff-stat-moved . (:inherit (omnidiff-file-header shadow) :weight semi-bold))
-    (omnidiff-stat-index . (:inherit (omnidiff-file-header shadow) :weight normal))
-    (omnidiff-file-status-added . (:inherit (omnidiff-file-header diff-added)))
-    (omnidiff-file-status-deleted . (:inherit (omnidiff-file-header diff-removed)))
-    (omnidiff-file-status-renamed . (:inherit (omnidiff-file-header warning)))
-    (omnidiff-hunk-header . (:inherit (omnidiff-ui header-line) :weight semi-bold :extend t))
-    (omnidiff-hunk-accent . (:inherit omnidiff-hunk-header :weight bold))
-    (omnidiff-hunk-meta . (:inherit (omnidiff-hunk-header shadow) :weight normal))
-    (omnidiff-hunk-stat-added . (:inherit (omnidiff-hunk-header success) :weight semi-bold))
-    (omnidiff-hunk-stat-removed . (:inherit (omnidiff-hunk-header error) :weight semi-bold))
-    (omnidiff-hunk-stat-changed . (:inherit (omnidiff-hunk-header warning) :weight semi-bold))
-    (omnidiff-hunk-stat-moved . (:inherit (omnidiff-hunk-header shadow) :weight semi-bold))
-    (omnidiff-side-bar . (:inherit (omnidiff-ui shadow) :extend t))
-    (omnidiff-side-before . (:inherit (omnidiff-ui diff-removed) :weight semi-bold))
-    (omnidiff-side-after . (:inherit (omnidiff-ui diff-added) :weight semi-bold))
-    (omnidiff-gap . (:inherit (omnidiff-ui shadow) :slant italic :extend t))
-    (omnidiff-scope . (:inherit shadow :slant italic :extend t))
-    (omnidiff-lineno . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-lineno-added . (:inherit (omnidiff-lineno success)))
-    (omnidiff-lineno-removed . (:inherit (omnidiff-lineno error)))
-    (omnidiff-lineno-changed . (:inherit (omnidiff-lineno warning)))
-    (omnidiff-lineno-moved . (:inherit omnidiff-lineno))
-    (omnidiff-moved-indicator . (:foreground "grey50"))
-    (omnidiff-added . (:inherit diff-added :extend t))
-    (omnidiff-added-refine . (:inherit diff-refine-added :weight medium))
-    (omnidiff-removed . (:inherit diff-removed :extend t))
-    (omnidiff-removed-refine . (:inherit diff-refine-removed :weight medium))
-    (omnidiff-changed . (:inherit diff-changed :extend t))
-    (omnidiff-changed-refine . (:inherit diff-refine-changed :weight bold))
-    (omnidiff-moved . (:extend t))
-    (omnidiff-moved-header . (:inherit (omnidiff-ui shadow) :slant italic :extend t))
-    (omnidiff-commit-hash . (:weight bold))
-    (omnidiff-commit-meta . (:inherit shadow))
-    (omnidiff-image-bar . (:inherit (omnidiff-ui header-line) :extend t))
-    (omnidiff-image-mode-active . (:inherit (omnidiff-ui highlight) :weight bold))
-    (omnidiff-image-mode-inactive . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-image-meta . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-image-stat-delta . (:inherit omnidiff-stat-changed))
-    (omnidiff-image-divider . (:inherit omnidiff-file-accent :weight bold))
-    (omnidiff-image-frame . (:inherit shadow))
-    (omnidiff-image-diff-highlight . (:foreground "magenta"))
-    ;; Semantic token faces (no `:extend t')
-    (omnidiff-token-insert . (:inherit diff-refine-added))
-    (omnidiff-token-delete . (:inherit diff-refine-removed))
-    (omnidiff-token-update . (:inherit diff-refine-changed))
-    (omnidiff-token-move . (:underline t))
-    (omnidiff-token-cross-highlight . (:inherit highlight))
-    (omnidiff-token-active . (:box (:line-width -1)))
-    ;; Dual viewer chrome & gutter faces
-    (omnidiff-dual-header-before . (:inherit omnidiff-side-before))
-    (omnidiff-dual-header-after . (:inherit omnidiff-side-after))
-    (omnidiff-dual-header-meta . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-dual-header-before-inactive . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-dual-header-after-inactive . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-dual-header-file . (:inherit omnidiff-ui :weight semi-bold))
-    (omnidiff-dual-header-file-inactive . (:inherit (omnidiff-ui shadow)))
-    (omnidiff-dual-header-badge . (:inherit omnidiff-summary-badge))
-    (omnidiff-dual-fold-banner . (:inherit omnidiff-gap :extend t))
-    (omnidiff-dual-gutter-insert . (:inherit (omnidiff-ui success) :weight bold))
-    (omnidiff-dual-gutter-delete . (:inherit (omnidiff-ui error) :weight bold))
-    (omnidiff-dual-gutter-update . (:inherit (omnidiff-ui warning) :weight bold))
-    (omnidiff-dual-gutter-move . (:inherit (omnidiff-ui shadow) :weight bold))
-    ;; Semantic summary & container faces
-    (omnidiff-summary-badge . (:inherit omnidiff-header-badge))
-    (omnidiff-container-member-changed . (:inherit (omnidiff-ui warning) :weight semi-bold))
-    (omnidiff-container-member-added . (:inherit (omnidiff-ui success) :weight semi-bold))
-    (omnidiff-container-member-removed . (:inherit (omnidiff-ui error) :weight semi-bold)))
-  "8-color/16-color TTY and monochrome fallback face attributes.")
+  "Compute a resolved semantic color palette plist from BASE and SCHEME.
+Unrecognized SCHEME values gracefully fall back to `omni-semantic'."
+  (pcase-let (((cl-struct omnidiff-theme--base
+                          dark-p bg-main bg-dim bg-inactive bg-active
+                          bg-card bg-chrome border fg-main fg-dim
+                          accent blue-cooler accent-green accent-red
+                          accent-yellow nuances)
+               base))
+    (cl-flet ((blend (c1 c2 r) (omnidiff-theme--blend-hex c1 c2 r))
+              (custom (k fb) (omnidiff-theme--custom-color k fb))
+              (nuance (k fb) (or (plist-get nuances k) fb)))
+      (let* ((scheme (if (memq scheme '(omni-semantic calm-modus neutral-paper))
+                         scheme
+                       'omni-semantic))
+             (omni-p (eq scheme 'omni-semantic))
+             (calm-p (eq scheme 'calm-modus))
+             (neutral-p (eq scheme 'neutral-paper))
+             (border (custom 'border border))
+             (accent (custom 'accent accent))
+             (accent-cyan (nuance :accent-cyan blue-cooler))
+             (accent-grey (if dark-p "#9aa0a6" "#6e7781"))
+             (indigo (nuance :indigo (if dark-p "#b4a7f0" "#5c4bb8")))
+             ;; Core diff & soft tint surfaces (Modus nuances when available,
+             ;; otherwise dynamically blended from core theme slots).
+             (bg-added-faint (nuance :bg-added-faint
+                                     (blend accent-green bg-main (if dark-p 0.80 0.88))))
+             (bg-added-refine (nuance :bg-added-refine
+                                      (blend accent-green bg-main (if dark-p 0.62 0.76))))
+             (fg-added (nuance :fg-added accent-green))
+             (bg-removed-faint (nuance :bg-removed-faint
+                                       (blend accent-red bg-main (if dark-p 0.80 0.88))))
+             (bg-removed-refine (nuance :bg-removed-refine
+                                        (blend accent-red bg-main (if dark-p 0.62 0.76))))
+             (fg-removed (nuance :fg-removed accent-red))
+             (bg-changed-faint (nuance :bg-changed-faint
+                                       (blend accent-yellow bg-main (if dark-p 0.80 0.88))))
+             (bg-changed-refine (nuance :bg-changed-refine
+                                        (blend accent-yellow bg-main (if dark-p 0.62 0.76))))
+             (fg-changed (nuance :fg-changed accent-yellow))
+             (green-faint (nuance :green-faint (blend accent-green fg-main (if dark-p 0.25 0.10))))
+             (red-faint (nuance :red-faint (blend accent-red fg-main (if dark-p 0.25 0.10))))
+             (yellow-faint (nuance :yellow-faint (blend accent-yellow fg-main (if dark-p 0.25 0.10))))
+             (bg-green-nuanced (nuance :bg-green-nuanced
+                                       (blend accent-green bg-main (if dark-p 0.78 0.90))))
+             ;; Soft `calm-modus' tints: sage, muted plum, warm ochre, lavender.
+             (bg-sage (nuance :bg-sage
+                              (blend (blend accent-green fg-dim 0.30) bg-main
+                                     (if dark-p 0.68 0.80))))
+             (bg-plum (nuance :bg-plum
+                              (blend (blend accent-red indigo 0.30) bg-main
+                                     (if dark-p 0.64 0.78))))
+             (bg-ochre (nuance :bg-ochre
+                               (blend (blend accent-yellow fg-dim 0.25) bg-main
+                                      (if dark-p 0.68 0.80))))
+             (fg-ochre (nuance :fg-ochre yellow-faint))
+             (bg-lavender (nuance :bg-lavender
+                                  (blend indigo bg-main (if dark-p 0.64 0.82))))
+             (raw-moved (nuance :raw-moved (blend accent-grey bg-main (if dark-p 0.82 0.90))))
+             (fg-soft (blend fg-main fg-dim 0.16))
+             ;; Dynamic `neutral-paper' muted washes derived from bg-main/fg-main
+             ;; so dark paper harmonizes with warm (Gruvbox/Solarized) and cool themes.
+             (paper-green (blend accent-green fg-dim (if dark-p 0.32 0.22)))
+             (paper-red (blend accent-red fg-dim (if dark-p 0.32 0.22)))
+             (paper-yellow (blend accent-yellow fg-dim (if dark-p 0.32 0.22)))
+             (paper-grey (blend fg-dim bg-main (if dark-p 0.20 0.15)))
+             (paper-fg (blend fg-main fg-dim 0.22))
+             ;; Semantic token backgrounds per scheme.
+             (insert-bg
+              (custom 'insert-bg
+                      (cond (calm-p bg-sage)
+                            (neutral-p (blend paper-green bg-main (if dark-p 0.68 0.82)))
+                            (t (blend accent-green bg-main (if dark-p 0.56 0.74))))))
+             (delete-bg
+              (custom 'delete-bg
+                      (cond (calm-p bg-plum)
+                            (neutral-p (blend paper-red bg-main (if dark-p 0.68 0.82)))
+                            (t (blend accent-red bg-main (if dark-p 0.56 0.74))))))
+             (update-bg
+              (custom 'update-bg
+                      (cond (calm-p bg-ochre)
+                            (neutral-p (blend paper-yellow bg-main (if dark-p 0.68 0.82)))
+                            (t (blend accent-yellow bg-main (if dark-p 0.56 0.74))))))
+             (move-bg
+              (custom 'move-bg
+                      (cond (calm-p bg-lavender)
+                            (neutral-p (blend paper-grey bg-main (if dark-p 0.68 0.82)))
+                            (t (blend accent-grey bg-main (if dark-p 0.60 0.76))))))
+             (cross-bg
+              (custom 'cross-highlight-bg
+                      (cond (calm-p (blend (blend accent-cyan indigo 0.35) bg-main
+                                           (if dark-p 0.64 0.76)))
+                            (neutral-p (blend (blend accent-cyan fg-dim 0.25) bg-main
+                                              (if dark-p 0.64 0.76)))
+                            (t (blend accent-cyan bg-main (if dark-p 0.56 0.68))))))
+             (active-bg
+              (custom 'active-bg
+                      (blend accent bg-main
+                             (if omni-p (if dark-p 0.68 0.82) (if dark-p 0.74 0.86)))))
+             (overlay-fg (custom 'overlay-fg fg-main))
+             ;; Gutter foregrounds (custom overrides applied once per key).
+             (gutter-insert
+              (custom 'gutter-insert
+                      (cond (neutral-p paper-green)
+                            (dark-p (blend accent-green fg-main 0.15))
+                            (t accent-green))))
+             (gutter-delete
+              (custom 'gutter-delete
+                      (cond (neutral-p paper-red)
+                            (dark-p (blend accent-red fg-main 0.15))
+                            (t accent-red))))
+             (gutter-update
+              (custom 'gutter-update
+                      (cond (neutral-p paper-yellow)
+                            (dark-p (blend accent-yellow fg-main 0.12))
+                            (t accent-yellow))))
+             (gutter-move
+              (custom 'gutter-move
+                      (cond (calm-p (if dark-p (blend indigo fg-dim 0.20) indigo))
+                            (neutral-p paper-grey)
+                            (t accent-grey))))
+             (add-gut-fg
+              (if calm-p
+                  (custom 'gutter-insert
+                          (if dark-p (blend green-faint fg-dim 0.30) fg-added))
+                gutter-insert))
+             (rem-gut-fg
+              (if calm-p
+                  (custom 'gutter-delete
+                          (if dark-p (blend red-faint fg-dim 0.30) fg-removed))
+                gutter-delete))
+             (chg-gut-fg
+              (if calm-p
+                  (custom 'gutter-update
+                          (if dark-p (blend yellow-faint fg-dim 0.25) fg-changed))
+                gutter-update)))
+        (list :dark-p dark-p
+              :bg-main bg-main
+              :bg-active bg-active
+              :bg-card bg-card
+              :bg-chrome bg-chrome
+              :bg-hunk (if dark-p bg-inactive bg-dim)
+              :border border
+              :hunk-border (if dark-p (blend bg-active border 0.50) border)
+              :accent accent
+              :hunk-accent (if dark-p (blend accent fg-dim 0.25) accent)
+              :fg-main fg-main
+              :fg-dim fg-dim
+              :blue-cooler blue-cooler
+              :add-bg (cond (omni-p (blend accent-green bg-main (if dark-p 0.88 0.93)))
+                            (neutral-p (blend paper-green bg-main (if dark-p 0.88 0.93)))
+                            (dark-p (blend bg-green-nuanced bg-main 0.38))
+                            (t bg-added-faint))
+              :add-fg (cond (omni-p fg-main)
+                            (neutral-p paper-fg)
+                            (dark-p (blend fg-soft green-faint 0.45))
+                            (t fg-added))
+              :add-ref-bg (if calm-p (if dark-p bg-sage bg-added-refine) insert-bg)
+              :add-gut-fg add-gut-fg
+              :rem-bg (cond (omni-p (blend accent-red bg-main (if dark-p 0.88 0.93)))
+                            (neutral-p (blend paper-red bg-main (if dark-p 0.88 0.93)))
+                            (dark-p (blend bg-removed-faint bg-main 0.40))
+                            (t bg-removed-faint))
+              :rem-fg (cond (omni-p fg-main)
+                            (neutral-p paper-fg)
+                            (dark-p (blend fg-soft fg-removed 0.45))
+                            (t fg-removed))
+              :rem-ref-bg (if calm-p (if dark-p bg-plum bg-removed-refine) delete-bg)
+              :rem-gut-fg rem-gut-fg
+              :chg-bg (cond (omni-p (blend accent-yellow bg-main (if dark-p 0.88 0.93)))
+                            (neutral-p (blend paper-yellow bg-main (if dark-p 0.88 0.93)))
+                            (dark-p (blend bg-changed-faint bg-main 0.35))
+                            (t bg-changed-faint))
+              :chg-fg (cond (omni-p fg-main)
+                            (neutral-p paper-fg)
+                            (dark-p (blend fg-soft fg-ochre 0.55))
+                            (t fg-changed))
+              :chg-ref-bg (if calm-p (if dark-p bg-ochre bg-changed-refine) update-bg)
+              :chg-gut-fg chg-gut-fg
+              :mov-bg (cond (omni-p (blend accent-grey bg-main (if dark-p 0.86 0.92)))
+                            (neutral-p (blend paper-grey bg-main (if dark-p 0.85 0.90)))
+                            (dark-p (blend bg-lavender bg-main 0.72))
+                            (t raw-moved))
+              :mov-fg (cond (omni-p fg-soft)
+                            (neutral-p paper-fg)
+                            (dark-p (blend fg-main fg-dim 0.22))
+                            (t fg-main))
+              :mov-gut-fg gutter-move
+              :ref-fg (cond (omni-p overlay-fg)
+                            (neutral-p (blend fg-main fg-dim 0.08))
+                            (dark-p fg-soft)
+                            (t fg-main))
+              :ref-weight (if calm-p 'semi-bold 'normal)
+              :side-before-bg (if dark-p (blend bg-removed-faint bg-dim 0.35) bg-removed-faint)
+              :side-after-bg (if dark-p (blend bg-green-nuanced bg-dim 0.35) bg-added-faint)
+              :stat-add-fg (cond (neutral-p paper-green) (dark-p green-faint) (t fg-added))
+              :stat-rem-fg (cond (neutral-p paper-red) (dark-p red-faint) (t fg-removed))
+              :stat-chg-fg (cond (neutral-p paper-yellow) (dark-p yellow-faint) (t fg-changed))
+              :stat-mov-fg (if calm-p indigo gutter-move)
+              :insert-bg insert-bg
+              :delete-bg delete-bg
+              :update-bg update-bg
+              :move-bg move-bg
+              :cross-bg cross-bg
+              :active-bg active-bg
+              :overlay-fg overlay-fg
+              :gutter-insert gutter-insert
+              :gutter-delete gutter-delete
+              :gutter-update gutter-update
+              :gutter-move gutter-move)))))
 
 (defun omnidiff-theme--face-color-attrs (p)
   "Build `(FACE . ATTRS)' alist for `((class color) (min-colors 88))' from P."
-  (let* ((bg-main (omnidiff-theme--palette-bg-main p))
-         (bg-active (omnidiff-theme--palette-bg-active p))
-         (bg-card (omnidiff-theme--palette-bg-card p))
-         (bg-chrome (omnidiff-theme--palette-bg-chrome p))
-         (bg-hunk (omnidiff-theme--palette-bg-hunk p))
-         (border (omnidiff-theme--palette-border p))
-         (hunk-border (omnidiff-theme--palette-hunk-border p))
-         (accent (omnidiff-theme--palette-accent p))
-         (hunk-accent (omnidiff-theme--palette-hunk-accent p))
-         (fg-main (omnidiff-theme--palette-fg-main p))
-         (fg-dim (omnidiff-theme--palette-fg-dim p))
-         (blue-cooler (omnidiff-theme--palette-blue-cooler p))
-         (add-bg (omnidiff-theme--palette-add-bg p))
-         (add-fg (omnidiff-theme--palette-add-fg p))
-         (add-ref-bg (omnidiff-theme--palette-add-ref-bg p))
-         (add-gut-fg (omnidiff-theme--palette-add-gut-fg p))
-         (rem-bg (omnidiff-theme--palette-rem-bg p))
-         (rem-fg (omnidiff-theme--palette-rem-fg p))
-         (rem-ref-bg (omnidiff-theme--palette-rem-ref-bg p))
-         (rem-gut-fg (omnidiff-theme--palette-rem-gut-fg p))
-         (chg-bg (omnidiff-theme--palette-chg-bg p))
-         (chg-fg (omnidiff-theme--palette-chg-fg p))
-         (chg-ref-bg (omnidiff-theme--palette-chg-ref-bg p))
-         (chg-gut-fg (omnidiff-theme--palette-chg-gut-fg p))
-         (mov-bg (omnidiff-theme--palette-mov-bg p))
-         (mov-fg (omnidiff-theme--palette-mov-fg p))
-         (mov-gut-fg (omnidiff-theme--palette-mov-gut-fg p))
-         (mov-hdr-fg (omnidiff-theme--palette-mov-hdr-fg p))
-         (ref-fg (omnidiff-theme--palette-ref-fg p))
-         (ref-weight (omnidiff-theme--palette-ref-weight p))
-         (side-before-bg (omnidiff-theme--palette-side-before-bg p))
-         (side-after-bg (omnidiff-theme--palette-side-after-bg p))
-         (stat-add-fg (omnidiff-theme--palette-stat-add-fg p))
-         (stat-rem-fg (omnidiff-theme--palette-stat-rem-fg p))
-         (stat-chg-fg (omnidiff-theme--palette-stat-chg-fg p))
-         (stat-mov-fg (omnidiff-theme--palette-stat-mov-fg p))
-         (token-insert-bg (omnidiff-theme--palette-token-insert-bg p))
-         (token-delete-bg (omnidiff-theme--palette-token-delete-bg p))
-         (token-update-bg (omnidiff-theme--palette-token-update-bg p))
-         (token-move-bg (omnidiff-theme--palette-token-move-bg p))
-         (token-cross-bg (omnidiff-theme--palette-token-cross-bg p))
-         (token-active-bg (omnidiff-theme--palette-token-active-bg p))
-         (token-active-border (omnidiff-theme--palette-token-active-border p))
-         (token-overlay-fg (omnidiff-theme--palette-token-overlay-fg p))
-         (dual-gutter-insert (omnidiff-theme--palette-dual-gutter-insert p))
-         (dual-gutter-delete (omnidiff-theme--palette-dual-gutter-delete p))
-         (dual-gutter-update (omnidiff-theme--palette-dual-gutter-update p))
-         (dual-gutter-move (omnidiff-theme--palette-dual-gutter-move p))
-         (uniform-fg (when (eq omnidiff-dual-overlay-foreground 'uniform)
-                       (list :foreground token-overlay-fg)))
-         (fold-rule (omnidiff-theme--blend-hex border bg-main 0.35)))
-    `((omnidiff-header-line
-       :inherit omnidiff-ui :background ,bg-main :foreground ,fg-dim
-       :underline (:color ,border :position t))
-      (omnidiff-header-badge
-       :inherit omnidiff-ui :background ,bg-card :foreground ,accent :weight bold
-       :underline (:color ,border :position t))
-      (omnidiff-header-file
-       :inherit omnidiff-ui :background ,bg-main :foreground ,fg-main
-       :weight semi-bold :underline (:color ,border :position t))
-      (omnidiff-file-header
-       :inherit omnidiff-ui :background ,bg-card :foreground ,fg-main
-       :weight bold :overline ,bg-active :extend t)
-      (omnidiff-file-accent
-       :inherit omnidiff-file-header :foreground ,accent)
-      (omnidiff-stat-added
-       :inherit omnidiff-file-header :foreground ,stat-add-fg :weight semi-bold)
-      (omnidiff-stat-removed
-       :inherit omnidiff-file-header :foreground ,stat-rem-fg :weight semi-bold)
-      (omnidiff-stat-changed
-       :inherit omnidiff-file-header :foreground ,stat-chg-fg :weight semi-bold)
-      (omnidiff-stat-moved
-       :inherit omnidiff-file-header :foreground ,stat-mov-fg :weight semi-bold)
-      (omnidiff-stat-index
-       :inherit omnidiff-file-header :foreground ,fg-dim :weight normal)
-      (omnidiff-file-status-added
-       :inherit omnidiff-file-header :background ,side-after-bg :foreground ,add-gut-fg
-       :box (:line-width -1 :color ,border))
-      (omnidiff-file-status-deleted
-       :inherit omnidiff-file-header :background ,side-before-bg :foreground ,rem-gut-fg
-       :box (:line-width -1 :color ,border))
-      (omnidiff-file-status-renamed
-       :inherit omnidiff-file-header
-       :background ,(omnidiff-theme--blend-hex chg-ref-bg bg-card 0.55)
-       :foreground ,chg-gut-fg
-       :box (:line-width -1 :color ,border))
-      (omnidiff-hunk-header
-       :inherit omnidiff-ui :background ,bg-hunk :foreground ,fg-main
-       :weight semi-bold :overline ,hunk-border :extend t)
-      (omnidiff-hunk-accent
-       :inherit omnidiff-hunk-header :foreground ,hunk-accent :weight bold)
-      (omnidiff-hunk-meta
-       :inherit omnidiff-hunk-header :foreground ,fg-dim :weight normal)
-      (omnidiff-hunk-stat-added
-       :inherit omnidiff-hunk-header :foreground ,stat-add-fg :weight semi-bold)
-      (omnidiff-hunk-stat-removed
-       :inherit omnidiff-hunk-header :foreground ,stat-rem-fg :weight semi-bold)
-      (omnidiff-hunk-stat-changed
-       :inherit omnidiff-hunk-header :foreground ,stat-chg-fg :weight semi-bold)
-      (omnidiff-hunk-stat-moved
-       :inherit omnidiff-hunk-header :foreground ,stat-mov-fg :weight semi-bold)
-      (omnidiff-side-bar
-       :inherit omnidiff-ui :background ,bg-main :foreground ,fg-dim :extend t)
-      (omnidiff-side-before
-       :inherit omnidiff-ui :background ,side-before-bg :foreground ,rem-gut-fg
-       :weight semi-bold)
-      (omnidiff-side-after
-       :inherit omnidiff-ui :background ,side-after-bg :foreground ,add-gut-fg
-       :weight semi-bold)
-      (omnidiff-gap
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
-       :slant italic :extend t)
-      (omnidiff-scope
-       :background ,bg-chrome :foreground ,fg-dim :extend t)
-      (omnidiff-lineno
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim)
-      (omnidiff-lineno-added
-       :inherit omnidiff-ui :background ,add-bg :foreground ,add-gut-fg)
-      (omnidiff-lineno-removed
-       :inherit omnidiff-ui :background ,rem-bg :foreground ,rem-gut-fg)
-      (omnidiff-lineno-changed
-       :inherit omnidiff-ui :background ,chg-bg :foreground ,chg-gut-fg)
-      (omnidiff-lineno-moved
-       :inherit omnidiff-ui :background ,mov-bg :foreground ,mov-gut-fg)
-      (omnidiff-moved-indicator
-       :foreground ,mov-gut-fg)
-      (omnidiff-added
-       :background ,add-bg :foreground ,add-fg :extend t)
-      (omnidiff-added-refine
-       :background ,add-ref-bg :foreground ,ref-fg :weight ,ref-weight)
-      (omnidiff-removed
-       :background ,rem-bg :foreground ,rem-fg :extend t)
-      (omnidiff-removed-refine
-       :background ,rem-ref-bg :foreground ,ref-fg :weight ,ref-weight)
-      (omnidiff-changed
-       :background ,chg-bg :foreground ,chg-fg :extend t)
-      (omnidiff-changed-refine
-       :background ,chg-ref-bg :foreground ,ref-fg :weight ,ref-weight)
-      (omnidiff-moved
-       :background ,mov-bg :foreground ,mov-fg :extend t)
-      (omnidiff-moved-header
-       :inherit omnidiff-ui :background ,mov-bg :foreground ,mov-hdr-fg
-       :slant italic :extend t)
-      (omnidiff-commit-hash
-       :foreground ,blue-cooler :weight bold)
-      (omnidiff-commit-meta
-       :foreground ,fg-dim)
-      (omnidiff-image-bar
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim :extend t)
-      (omnidiff-image-mode-active
-       :inherit omnidiff-ui :background ,bg-card :foreground ,accent :weight bold)
-      (omnidiff-image-mode-inactive
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim)
-      (omnidiff-image-meta
-       :inherit omnidiff-ui :foreground ,fg-dim)
-      (omnidiff-image-stat-delta
-       :inherit omnidiff-file-header :foreground ,stat-chg-fg :weight semi-bold)
-      (omnidiff-image-divider
-       :foreground ,accent :weight bold)
-      (omnidiff-image-frame
-       :foreground ,(omnidiff-theme--blend-hex border bg-main 0.30))
-      (omnidiff-image-diff-highlight
-       :foreground ,(if (omnidiff-theme--dark-color-p bg-main)
-                        "#e65c8e" "#c82d63"))
-      ;; Semantic token faces (no `:extend t')
-      (omnidiff-token-insert
-       :background ,token-insert-bg ,@uniform-fg)
-      (omnidiff-token-delete
-       :background ,token-delete-bg ,@uniform-fg)
-      (omnidiff-token-update
-       :background ,token-update-bg ,@uniform-fg)
-      (omnidiff-token-move
-       :background ,token-move-bg ,@uniform-fg)
-      (omnidiff-token-cross-highlight
-       :background ,token-cross-bg
-       :underline (:color ,blue-cooler :style line)
-       ,@uniform-fg)
-      (omnidiff-token-active
-       :background ,token-active-bg
-       :box (:line-width -1 :color ,token-active-border)
-       ,@uniform-fg)
-      ;; Dual viewer chrome & gutter faces
-      (omnidiff-dual-header-before
-       :inherit omnidiff-ui :background ,side-before-bg
-       :foreground ,dual-gutter-delete :weight semi-bold
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-after
-       :inherit omnidiff-ui :background ,side-after-bg
-       :foreground ,dual-gutter-insert :weight semi-bold
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-meta
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-before-inactive
-       :inherit omnidiff-ui :background ,bg-chrome
-       :foreground ,rem-gut-fg :weight normal
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-after-inactive
-       :inherit omnidiff-ui :background ,bg-chrome
-       :foreground ,add-gut-fg :weight normal
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-file
-       :inherit omnidiff-ui :background ,bg-chrome
-       :foreground ,fg-main :weight semi-bold
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-file-inactive
-       :inherit omnidiff-ui :background ,bg-chrome
-       :foreground ,fg-dim :weight normal
-       :underline (:color ,border :position t))
-      (omnidiff-dual-header-badge
-       :inherit omnidiff-ui :background ,bg-card
-       :foreground ,accent :weight semi-bold
-       :underline (:color ,border :position t))
-      (omnidiff-dual-fold-banner
-       :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
-       :slant italic :overline ,fold-rule
-       :underline (:color ,fold-rule :position t) :extend t)
-      (omnidiff-dual-gutter-insert
-       :inherit omnidiff-ui :foreground ,dual-gutter-insert :weight bold)
-      (omnidiff-dual-gutter-delete
-       :inherit omnidiff-ui :foreground ,dual-gutter-delete :weight bold)
-      (omnidiff-dual-gutter-update
-       :inherit omnidiff-ui :foreground ,dual-gutter-update :weight bold)
-      (omnidiff-dual-gutter-move
-       :inherit omnidiff-ui :foreground ,dual-gutter-move :weight bold)
-      ;; Semantic summary & container faces
-      (omnidiff-summary-badge
-       :inherit omnidiff-ui :background ,bg-card :foreground ,accent
-       :weight semi-bold :box (:line-width -1 :color ,border))
-      (omnidiff-container-member-changed
-       :inherit omnidiff-ui :foreground ,dual-gutter-update :weight semi-bold)
-      (omnidiff-container-member-added
-       :inherit omnidiff-ui :foreground ,dual-gutter-insert :weight semi-bold)
-      (omnidiff-container-member-removed
-       :inherit omnidiff-ui :foreground ,dual-gutter-delete :weight semi-bold))))
+  (cl-destructuring-bind
+      (&key dark-p bg-main bg-active bg-card bg-chrome bg-hunk
+            border hunk-border accent hunk-accent fg-main fg-dim blue-cooler
+            add-bg add-fg add-ref-bg add-gut-fg
+            rem-bg rem-fg rem-ref-bg rem-gut-fg
+            chg-bg chg-fg chg-ref-bg chg-gut-fg
+            mov-bg mov-fg mov-gut-fg
+            ref-fg ref-weight side-before-bg side-after-bg
+            stat-add-fg stat-rem-fg stat-chg-fg stat-mov-fg
+            insert-bg delete-bg update-bg move-bg cross-bg active-bg overlay-fg
+            gutter-insert gutter-delete gutter-update gutter-move
+            &allow-other-keys)
+      p
+    (let ((uniform-fg (when (eq omnidiff-dual-overlay-foreground 'uniform)
+                        (list :foreground overlay-fg)))
+          (fold-rule (omnidiff-theme--blend-hex border bg-main 0.35)))
+      `((omnidiff-header-line
+         :inherit omnidiff-ui :background ,bg-main :foreground ,fg-dim
+         :underline (:color ,border :position t))
+        (omnidiff-header-badge
+         :inherit omnidiff-ui :background ,bg-card :foreground ,accent :weight bold
+         :underline (:color ,border :position t))
+        (omnidiff-header-file
+         :inherit omnidiff-ui :background ,bg-main :foreground ,fg-main
+         :weight semi-bold :underline (:color ,border :position t))
+        (omnidiff-file-header
+         :inherit omnidiff-ui :background ,bg-card :foreground ,fg-main
+         :weight bold :overline ,bg-active :extend t)
+        (omnidiff-file-accent
+         :inherit omnidiff-file-header :foreground ,accent)
+        (omnidiff-stat-added
+         :inherit omnidiff-file-header :foreground ,stat-add-fg :weight semi-bold)
+        (omnidiff-stat-removed
+         :inherit omnidiff-file-header :foreground ,stat-rem-fg :weight semi-bold)
+        (omnidiff-stat-changed
+         :inherit omnidiff-file-header :foreground ,stat-chg-fg :weight semi-bold)
+        (omnidiff-stat-moved
+         :inherit omnidiff-file-header :foreground ,stat-mov-fg :weight semi-bold)
+        (omnidiff-stat-index
+         :inherit omnidiff-file-header :foreground ,fg-dim :weight normal)
+        (omnidiff-file-status-added
+         :inherit omnidiff-file-header :background ,side-after-bg :foreground ,add-gut-fg
+         :box (:line-width -1 :color ,border))
+        (omnidiff-file-status-deleted
+         :inherit omnidiff-file-header :background ,side-before-bg :foreground ,rem-gut-fg
+         :box (:line-width -1 :color ,border))
+        (omnidiff-file-status-renamed
+         :inherit omnidiff-file-header
+         :background ,(omnidiff-theme--blend-hex chg-ref-bg bg-card 0.55)
+         :foreground ,chg-gut-fg
+         :box (:line-width -1 :color ,border))
+        (omnidiff-hunk-header
+         :inherit omnidiff-ui :background ,bg-hunk :foreground ,fg-main
+         :weight semi-bold :overline ,hunk-border :extend t)
+        (omnidiff-hunk-accent
+         :inherit omnidiff-hunk-header :foreground ,hunk-accent :weight bold)
+        (omnidiff-hunk-meta
+         :inherit omnidiff-hunk-header :foreground ,fg-dim :weight normal)
+        (omnidiff-hunk-stat-added
+         :inherit omnidiff-hunk-header :foreground ,stat-add-fg :weight semi-bold)
+        (omnidiff-hunk-stat-removed
+         :inherit omnidiff-hunk-header :foreground ,stat-rem-fg :weight semi-bold)
+        (omnidiff-hunk-stat-changed
+         :inherit omnidiff-hunk-header :foreground ,stat-chg-fg :weight semi-bold)
+        (omnidiff-hunk-stat-moved
+         :inherit omnidiff-hunk-header :foreground ,stat-mov-fg :weight semi-bold)
+        (omnidiff-side-bar
+         :inherit omnidiff-ui :background ,bg-main :foreground ,fg-dim :extend t)
+        (omnidiff-side-before
+         :inherit omnidiff-ui :background ,side-before-bg :foreground ,rem-gut-fg
+         :weight semi-bold)
+        (omnidiff-side-after
+         :inherit omnidiff-ui :background ,side-after-bg :foreground ,add-gut-fg
+         :weight semi-bold)
+        (omnidiff-gap
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
+         :slant italic :extend t)
+        (omnidiff-lineno
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim)
+        (omnidiff-lineno-added
+         :inherit omnidiff-ui :background ,add-bg :foreground ,add-gut-fg)
+        (omnidiff-lineno-removed
+         :inherit omnidiff-ui :background ,rem-bg :foreground ,rem-gut-fg)
+        (omnidiff-lineno-changed
+         :inherit omnidiff-ui :background ,chg-bg :foreground ,chg-gut-fg)
+        (omnidiff-lineno-moved
+         :inherit omnidiff-ui :background ,mov-bg :foreground ,mov-gut-fg)
+        (omnidiff-moved-indicator
+         :foreground ,mov-gut-fg)
+        (omnidiff-added
+         :background ,add-bg :foreground ,add-fg :extend t)
+        (omnidiff-added-refine
+         :background ,add-ref-bg :foreground ,ref-fg :weight ,ref-weight)
+        (omnidiff-removed
+         :background ,rem-bg :foreground ,rem-fg :extend t)
+        (omnidiff-removed-refine
+         :background ,rem-ref-bg :foreground ,ref-fg :weight ,ref-weight)
+        (omnidiff-changed
+         :background ,chg-bg :foreground ,chg-fg :extend t)
+        (omnidiff-changed-refine
+         :background ,chg-ref-bg :foreground ,ref-fg :weight ,ref-weight)
+        (omnidiff-moved
+         :background ,mov-bg :foreground ,mov-fg :extend t)
+        (omnidiff-commit-hash
+         :foreground ,blue-cooler :weight bold)
+        (omnidiff-commit-meta
+         :foreground ,fg-dim)
+        (omnidiff-image-bar
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim :extend t)
+        (omnidiff-image-mode-active
+         :inherit omnidiff-ui :background ,bg-card :foreground ,accent :weight bold)
+        (omnidiff-image-mode-inactive
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim)
+        (omnidiff-image-meta
+         :inherit omnidiff-ui :foreground ,fg-dim)
+        (omnidiff-image-divider
+         :foreground ,accent :weight bold)
+        (omnidiff-image-frame
+         :foreground ,(omnidiff-theme--blend-hex border bg-main 0.30))
+        (omnidiff-image-diff-highlight
+         :foreground ,(if dark-p "#e65c8e" "#c82d63"))
+        ;; Semantic token faces (no `:extend t')
+        (omnidiff-token-insert
+         :background ,insert-bg ,@uniform-fg)
+        (omnidiff-token-delete
+         :background ,delete-bg ,@uniform-fg)
+        (omnidiff-token-update
+         :background ,update-bg ,@uniform-fg)
+        (omnidiff-token-move
+         :background ,move-bg ,@uniform-fg)
+        (omnidiff-token-cross-highlight
+         :background ,cross-bg
+         :underline (:color ,blue-cooler :style line)
+         ,@uniform-fg)
+        (omnidiff-token-active
+         :background ,active-bg
+         :box (:line-width -1 :color ,accent)
+         ,@uniform-fg)
+        ;; Dual viewer chrome & gutter faces
+        (omnidiff-dual-header-before
+         :inherit omnidiff-ui :background ,side-before-bg
+         :foreground ,gutter-delete :weight semi-bold
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-after
+         :inherit omnidiff-ui :background ,side-after-bg
+         :foreground ,gutter-insert :weight semi-bold
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-meta
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-before-inactive
+         :inherit omnidiff-ui :background ,bg-chrome
+         :foreground ,rem-gut-fg :weight normal
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-after-inactive
+         :inherit omnidiff-ui :background ,bg-chrome
+         :foreground ,add-gut-fg :weight normal
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-file
+         :inherit omnidiff-ui :background ,bg-chrome
+         :foreground ,fg-main :weight semi-bold
+         :underline (:color ,border :position t))
+        (omnidiff-dual-header-badge
+         :inherit omnidiff-ui :background ,bg-card
+         :foreground ,accent :weight semi-bold
+         :underline (:color ,border :position t))
+        (omnidiff-dual-fold-banner
+         :inherit omnidiff-ui :background ,bg-chrome :foreground ,fg-dim
+         :slant italic :overline ,fold-rule
+         :underline (:color ,fold-rule :position t) :extend t)
+        (omnidiff-dual-gutter-insert
+         :inherit omnidiff-ui :foreground ,gutter-insert :weight bold)
+        (omnidiff-dual-gutter-delete
+         :inherit omnidiff-ui :foreground ,gutter-delete :weight bold)
+        (omnidiff-dual-gutter-update
+         :inherit omnidiff-ui :foreground ,gutter-update :weight bold)
+        (omnidiff-dual-gutter-move
+         :inherit omnidiff-ui :foreground ,gutter-move :weight bold)
+        ;; Semantic summary & container faces
+        (omnidiff-summary-badge
+         :inherit omnidiff-ui :background ,bg-card :foreground ,accent
+         :weight semi-bold :box (:line-width -1 :color ,border))
+        (omnidiff-container-member-changed
+         :inherit omnidiff-ui :foreground ,gutter-update :weight semi-bold)
+        (omnidiff-container-member-added
+         :inherit omnidiff-ui :foreground ,gutter-insert :weight semi-bold)
+        (omnidiff-container-member-removed
+         :inherit omnidiff-ui :foreground ,gutter-delete :weight semi-bold)))))
+
+(defun omnidiff-theme--fallback-attrs (face)
+  "Return the `(t ...)' fallback attribute plist from FACE's defface spec."
+  (cdr (assq t (get face 'face-defface-spec))))
 
 (defun omnidiff-theme--face-specs (p &optional light-palette)
-  "Build face specification list from `omnidiff-theme--palette' P.
-Wraps hex-color specs under `((class color) (min-colors 88))' and includes
-a clean `(t ...)' fallback clause for 8-color/16-color TTY and monochrome
+  "Build face specification list from palette plist P.
+Wraps hex-color specs under `((class color) (min-colors 88))' and preserves
+each face's `(t ...)' fallback clause for 8-color/16-color TTY and monochrome
 displays.  When LIGHT-PALETTE is non-nil, P provides `(background dark)'
 specs and LIGHT-PALETTE provides `(background light)' specs."
   (let* ((ui-spec `(omnidiff-ui
@@ -1480,7 +1195,7 @@ specs and LIGHT-PALETTE provides `(background light)' specs."
          (cl-mapcar
           (lambda (dark-entry light-entry)
             (let* ((face (car dark-entry))
-                   (fallback (cdr (assq face omnidiff-theme--fallback-specs))))
+                   (fallback (omnidiff-theme--fallback-attrs face)))
               (list face
                     (list (cons '((class color) (min-colors 88) (background dark))
                                 (cdr dark-entry))
@@ -1492,7 +1207,7 @@ specs and LIGHT-PALETTE provides `(background light)' specs."
        (mapcar
         (lambda (entry)
           (let* ((face (car entry))
-                 (fallback (cdr (assq face omnidiff-theme--fallback-specs))))
+                 (fallback (omnidiff-theme--fallback-attrs face)))
             (list face
                   (list (cons '((class color) (min-colors 88))
                               (cdr entry))
@@ -1513,82 +1228,96 @@ specs and LIGHT-PALETTE provides `(background light)' specs."
 Keys include `:insert-bg', `:delete-bg', `:update-bg', `:move-bg',
 `:cross-bg', `:active-bg', `:overlay-fg', `:bg-main', `:bg-chrome',
 `:bg-card', `:border', `:fg-main', `:fg-dim', `:accent',
-`:gutter-insert', `:gutter-delete', `:gutter-update', and `:gutter-move'."
-  (let* ((base (if (omnidiff-theme--active-modus-theme)
-                   (omnidiff-theme--modus-base)
-                 (omnidiff-theme--generic-base)))
-         (p (omnidiff-theme--resolve-palette base omnidiff-color-scheme)))
-    (list :insert-bg (omnidiff-theme--palette-token-insert-bg p)
-          :delete-bg (omnidiff-theme--palette-token-delete-bg p)
-          :update-bg (omnidiff-theme--palette-token-update-bg p)
-          :move-bg (omnidiff-theme--palette-token-move-bg p)
-          :cross-bg (omnidiff-theme--palette-token-cross-bg p)
-          :active-bg (omnidiff-theme--palette-token-active-bg p)
-          :overlay-fg (omnidiff-theme--palette-token-overlay-fg p)
-          :bg-main (omnidiff-theme--palette-bg-main p)
-          :bg-chrome (omnidiff-theme--palette-bg-chrome p)
-          :bg-card (omnidiff-theme--palette-bg-card p)
-          :border (omnidiff-theme--palette-border p)
-          :fg-main (omnidiff-theme--palette-fg-main p)
-          :fg-dim (omnidiff-theme--palette-fg-dim p)
-          :accent (omnidiff-theme--palette-accent p)
-          :gutter-insert (omnidiff-theme--palette-dual-gutter-insert p)
-          :gutter-delete (omnidiff-theme--palette-dual-gutter-delete p)
-          :gutter-update (omnidiff-theme--palette-dual-gutter-update p)
-          :gutter-move (omnidiff-theme--palette-dual-gutter-move p))))
-
-(defvar omnidiff-theme--revision 0
-  "Monotonic revision counter incremented whenever `omnidiff-apply-theme' runs.")
-
-(defvar omnidiff-theme-after-apply-hook nil
-  "Normal hook run after `omnidiff-apply-theme' updates palette faces.")
+`:gutter-insert', `:gutter-delete', `:gutter-update', and `:gutter-move'.
+Results are cached per theme revision and returned as a fresh copy."
+  (let* ((modus (omnidiff-theme--active-modus-theme))
+         (key (list omnidiff-theme--revision
+                    modus
+                    omnidiff-color-scheme
+                    omnidiff-custom-palette
+                    (frame-parameter nil 'background-mode)
+                    (>= (or (display-color-cells) 0) 88))))
+    (unless (and omnidiff-theme--semantic-colors-cache
+                 (equal (car omnidiff-theme--semantic-colors-cache) key))
+      (let* ((base (if modus
+                       (omnidiff-theme--modus-base)
+                     (omnidiff-theme--generic-base)))
+             (palette (omnidiff-theme--resolve-palette base omnidiff-color-scheme))
+             (result (cl-loop for k in omnidiff-theme--semantic-color-keys
+                              nconc (list k (plist-get palette k)))))
+        (setq omnidiff-theme--semantic-colors-cache
+              (cons (copy-tree key) result))))
+    (copy-sequence (cdr omnidiff-theme--semantic-colors-cache))))
 
 (defun omnidiff-theme--on-disable-theme (_theme)
   "Reapply `omnidiff' faces after disabling a custom theme."
   (omnidiff-apply-theme))
 
+(defun omnidiff-theme--on-first-rich-frame (frame)
+  "Reapply `omnidiff' faces on the first >=88-color FRAME after daemon startup."
+  (when (and (frame-live-p frame)
+             (>= (or (display-color-cells frame) 0) 88))
+    (remove-hook 'after-make-frame-functions
+                 #'omnidiff-theme--on-first-rich-frame)
+    (with-selected-frame frame
+      (omnidiff-apply-theme nil t))))
+
 ;;;###autoload
-(defun omnidiff-apply-theme (&optional theme)
+(defun omnidiff-apply-theme (&optional theme force)
   "Apply active theme palette faces for `omnidiff-mode'.
 When THEME is non-nil and not enabled in `custom-enabled-themes', do nothing.
 Uses Modus palette values when a Modus theme is active, and derives colors
-from the active Emacs faces on all other themes.  Return non-nil when applied."
+from the active Emacs faces on all other themes.  Updates only each managed
+face's `face-defface-spec' so user (`custom-set-faces') and third-party
+theme overrides are preserved.  Skips redundant re-application when the
+effective theme state is unchanged unless FORCE is non-nil.  Return non-nil
+when applied."
   (when (or (null theme) (memq theme custom-enabled-themes))
-    (setq omnidiff-theme--revision (1+ omnidiff-theme--revision))
-    (face-spec-set 'omnidiff-ui
-                   `((t ,@(when omnidiff-ui-font-height
-                            (list :height omnidiff-ui-font-height))))
-                   'face-defface-spec)
     (let* ((modus-current (omnidiff-theme--active-modus-theme))
            (use-modus (and modus-current
                            (or (null theme) (eq theme modus-current))))
-           (target-theme (if use-modus
-                             modus-current
-                           (or theme (car custom-enabled-themes))))
-           (specs
-            (if target-theme
-                (let* ((base (if use-modus
-                                 (omnidiff-theme--modus-base)
-                               (omnidiff-theme--generic-base)))
-                       (palette (omnidiff-theme--resolve-palette
-                                 base omnidiff-color-scheme)))
-                  (omnidiff-theme--face-specs palette))
-              (let* ((dark-palette (omnidiff-theme--resolve-palette
-                                    (omnidiff-theme--generic-base 'dark)
-                                    omnidiff-color-scheme))
-                     (light-palette (omnidiff-theme--resolve-palette
-                                     (omnidiff-theme--generic-base 'light)
-                                     omnidiff-color-scheme)))
-                (omnidiff-theme--face-specs dark-palette light-palette)))))
-      (if target-theme
-          (progn
-            (apply #'custom-theme-set-faces target-theme specs)
-            (dolist (entry specs)
-              (custom-theme-recalc-face (car entry))))
-        (dolist (entry specs)
-          (face-spec-set (car entry) (cadr entry) 'face-defface-spec)))
-      (run-hooks 'omnidiff-theme-after-apply-hook)
-      t)))
+           (cells (or (display-color-cells) 0))
+           (rich-color-p (>= cells 88))
+           (key (list (copy-sequence custom-enabled-themes)
+                      modus-current
+                      omnidiff-color-scheme
+                      (copy-tree omnidiff-custom-palette)
+                      omnidiff-dual-overlay-foreground
+                      omnidiff-ui-font-height
+                      (frame-parameter nil 'background-mode)
+                      cells
+                      (when rich-color-p
+                        (list (omnidiff-theme--face-hex 'default :background)
+                              (omnidiff-theme--face-hex 'default :foreground))))))
+      (when (or force (not (equal key omnidiff-theme--last-applied-key)))
+        (setq omnidiff-theme--last-applied-key key
+              omnidiff-theme--revision (1+ omnidiff-theme--revision)
+              omnidiff-theme--semantic-colors-cache nil)
+        (if rich-color-p
+            (remove-hook 'after-make-frame-functions
+                         #'omnidiff-theme--on-first-rich-frame)
+          (add-hook 'after-make-frame-functions
+                    #'omnidiff-theme--on-first-rich-frame))
+        (let* ((dual-branch-p (and (not use-modus)
+                                   (or (not rich-color-p)
+                                       (null custom-enabled-themes))))
+               (specs
+                (if dual-branch-p
+                    (omnidiff-theme--face-specs
+                     (omnidiff-theme--resolve-palette
+                      (omnidiff-theme--generic-base 'dark) omnidiff-color-scheme)
+                     (omnidiff-theme--resolve-palette
+                      (omnidiff-theme--generic-base 'light) omnidiff-color-scheme))
+                  (let* ((base (if use-modus
+                                   (omnidiff-theme--modus-base)
+                                 (omnidiff-theme--generic-base)))
+                         (palette (omnidiff-theme--resolve-palette
+                                   base omnidiff-color-scheme)))
+                    (omnidiff-theme--face-specs palette)))))
+          (dolist (entry specs)
+            (face-spec-set (car entry) (cadr entry) 'face-defface-spec)))
+        (run-hooks 'omnidiff-theme-after-apply-hook)
+        t))))
 
 (add-hook 'enable-theme-functions #'omnidiff-apply-theme)
 (add-hook 'disable-theme-functions #'omnidiff-theme--on-disable-theme)

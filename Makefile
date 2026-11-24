@@ -6,6 +6,7 @@ SRCS = omnidiff-theme.el \
        omnidiff-image.el \
        omnidiff-dual.el \
        omnidiff-render.el \
+       omnidiff-git.el \
        omnidiff.el
 
 .PHONY: all compile test test-src clean

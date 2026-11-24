@@ -42,21 +42,9 @@
 (require 'json)
 (require 'subr-x)
 
-;;; Shared protocol sentinels & core diff model
+;;; Core diff model
 
-(defconst omnidiff-engine-file-sentinel "\x1cOMNIDIFF-FILE\x00"
-  "Per-file sentinel emitted by the `GIT_EXTERNAL_DIFF' shell wrapper.")
-
-(defconst omnidiff-engine-mode-sentinel "\x1cOMNIDIFF-MODE\x00"
-  "Optional mode-change marker emitted after file metadata when modes differ.")
-
-(defconst omnidiff-engine-oid-sentinel "\x1cOMNIDIFF-OID\x00"
-  "Optional Git OID marker emitted after file metadata for blob retrieval.")
-
-(defconst omnidiff-engine-end-sentinel "\x1cOMNIDIFF-END\x00"
-  "End-of-record sentinel emitted after JSON output under `GIT_EXTERNAL_DIFF'.")
-
-(defun omnidiff-engine--normalize-mode (mode)
+(defun omnidiff-engine-normalize-mode (mode)
   "Return Git MODE string if meaningful, else nil."
   (when (and (stringp mode)
              (not (string-empty-p mode))
@@ -64,7 +52,7 @@
              (not (string= mode "000000")))
     mode))
 
-(defun omnidiff-engine--normalize-oid (oid)
+(defun omnidiff-engine-normalize-oid (oid)
   "Return Git OID string if it is a non-zero SHA-1/SHA-256 hex ID, else nil."
   (when (and (stringp oid)
              (or (= (length oid) 40) (= (length oid) 64))
@@ -103,7 +91,6 @@
   (total-pixels nil)
   (region-count 0 :type integer)
   (regions nil :type list)
-  (more-regions 0 :type integer)
   (svg-p nil :type boolean))
 
 (cl-defstruct (omnidiff-file (:copier nil))
@@ -116,8 +103,8 @@
   (new-mode nil)
   (old-oid nil)
   (new-oid nil)
-  (picture nil)
   (note nil)
+  (too-large-p nil :type boolean)
   (added 0 :type integer)
   (removed 0 :type integer)
   (updated 0 :type integer)
@@ -128,11 +115,6 @@
   (after-source nil) ; decoded AFTER text string | nil
   (before-disk-path nil) ; real or temp filesystem path for BEFORE | nil
   (after-disk-path nil) ; real or temp filesystem path for AFTER | nil
-  (summary nil) ; nil | no-changes | new-file | deleted-file | whitespace-only | comment-only | refactor-moved-only
-  (language nil) ; detected language string | nil
-  (large-residual nil :type boolean)
-  (binary-p nil :type boolean)
-  (container nil) ; omnidiff-json-container | nil
   (json-render-plan nil) ; cached `omnidiff-json-render-plan' | nil
   (json-render-plan-key nil)) ; cache key validating `json-render-plan'
 
@@ -140,6 +122,31 @@
   "Top-level parsed `git --ext-diff' + `omnidiff' output."
   (preamble nil)
   (files nil :type list))
+
+(defun omnidiff-engine-file-picture (file)
+  "Return the `omnidiff-picture' associated with `omnidiff-file' FILE, or nil."
+  (when-let* ((jd (and file (omnidiff-file-json-diff file))))
+    (omnidiff-json-diff-picture jd)))
+
+(defun omnidiff-engine-file-summary (file)
+  "Return the summary symbol associated with `omnidiff-file' FILE, or nil."
+  (when-let* ((jd (and file (omnidiff-file-json-diff file))))
+    (omnidiff-json-diff-summary jd)))
+
+(defun omnidiff-engine-file-binary-p (file)
+  "Return non-nil if `omnidiff-file' FILE is a binary diff."
+  (when-let* ((jd (and file (omnidiff-file-json-diff file))))
+    (omnidiff-json-diff-binary-p jd)))
+
+(defun omnidiff-engine-file-container (file)
+  "Return the `omnidiff-json-container' for `omnidiff-file' FILE, or nil."
+  (when-let* ((jd (and file (omnidiff-file-json-diff file))))
+    (omnidiff-json-diff-container jd)))
+
+(defun omnidiff-engine-file-large-residual (file)
+  "Return non-nil if `omnidiff-file' FILE hit `omnidiff''s large-residual limit."
+  (when-let* ((jd (and file (omnidiff-file-json-diff file))))
+    (omnidiff-json-diff-large-residual jd)))
 
 (defvar omnidiff-executable)
 
@@ -184,7 +191,11 @@ to fast common prefix/suffix anchors plus linear interpolation."
   (path "" :type string)
   (language nil)
   (encoding nil)
-  (hunks nil :type list))
+  (hunks nil :type list)
+  ;; Lazily populated O(log H) query index invalidated when `hunks' changes.
+  (hunk-vec nil)
+  (prefix-max-row nil)
+  (indexed-hunks nil))
 
 (cl-defstruct (omnidiff-json-container-side (:copier nil))
   "Format and size metadata for one side of a container diff."
@@ -232,7 +243,7 @@ to fast common prefix/suffix anchors plus linear interpolation."
   (before-to-after nil) ; vector of (integer | nil)
   (after-to-before nil) ; vector of (integer | nil)
   (anchors nil :type list) ; strictly increasing list of (before-row . after-row)
-  (anchor-vec nil)) ; internal vector mirror of `anchors' for O(log A) lookup
+  (anchor-vec [] :type vector)) ; vector mirror of `anchors' for O(log A) lookup
 
 ;;; JSON parsing
 
@@ -356,7 +367,7 @@ to fast common prefix/suffix anchors plus linear interpolation."
               (cpix (or (gethash "changed_pixels" cmp) 0))
               (tpix (or (gethash "total_pixels" cmp) 0)))
          (setq total-pixels tpix)
-         (if (null regs)
+         (if (and (null regs) (zerop cpix))
              (setq comparison 'identical
                    changed-pct 0.0
                    changed-pixels 0
@@ -372,11 +383,12 @@ to fast common prefix/suffix anchors plus linear interpolation."
          (if (hash-table-p scaled)
              (let* ((regs (omnidiff-engine--parse-picture-regions (gethash "regions" scaled)))
                     (cpix (or (gethash "changed_pixels" scaled) 0))
-                    (tpix (or (gethash "total_pixels" scaled) 0)))
+                    (tpix (or (gethash "total_pixels" scaled) 0))
+                    (ident-p (and (null regs) (zerop cpix))))
                (setq comparison 'resized-scaled
                      total-pixels tpix
-                     changed-pixels (if (null regs) 0 cpix)
-                     changed-pct (if (null regs)
+                     changed-pixels (if ident-p 0 cpix)
+                     changed-pct (if ident-p
                                      0.0
                                    (* 100.0 (/ (float cpix) (max 1 tpix))))
                      region-count (length regs)
@@ -412,7 +424,6 @@ to fast common prefix/suffix anchors plus linear interpolation."
      :total-pixels total-pixels
      :region-count region-count
      :regions regions
-     :more-regions 0
      :svg-p nil)))
 
 (defun omnidiff-engine--parse-container-side (ht)
@@ -597,22 +608,29 @@ and Unicode White_Space characters."
                 i (1+ i)))
         bytes)))))
 
-(defun omnidiff-engine--range-last-row (range num-rows)
-  "Return inclusive 0-based last row covered by RANGE within NUM-ROWS, or nil."
-  (let ((sr (omnidiff-json-range-start-row range))
-        (sc (omnidiff-json-range-start-col range))
-        (er (omnidiff-json-range-end-row range))
-        (ec (omnidiff-json-range-end-col range)))
-    (when (and (> num-rows 0)
-               (>= sr 0)
-               (< sr num-rows)
-               (<= sr er)
-               (or (> er sr) (> ec sc)))
-      (let ((last (if (and (> er sr) (= ec 0))
-                      (1- (min er num-rows))
-                    (min er (1- num-rows)))))
-        (when (>= last sr)
-          last)))))
+(defun omnidiff-engine-range-last-row (range &optional num-rows)
+  "Return inclusive 0-based last row covered by RANGE, or nil if empty.
+When NUM-ROWS is non-nil, clamp to `[0, NUM-ROWS - 1]' and return nil
+when RANGE starts outside `[0, NUM-ROWS)'."
+  (when range
+    (let ((sr (omnidiff-json-range-start-row range))
+          (sc (omnidiff-json-range-start-col range))
+          (er (omnidiff-json-range-end-row range))
+          (ec (omnidiff-json-range-end-col range)))
+      (when (and (>= sr 0)
+                 (<= sr er)
+                 (or (> er sr) (> ec sc))
+                 (or (null num-rows)
+                     (and (> num-rows 0) (< sr num-rows))))
+        (let ((last (if num-rows
+                        (if (and (> er sr) (= ec 0))
+                            (1- (min er num-rows))
+                          (min er (1- num-rows)))
+                      (if (and (> er sr) (= ec 0))
+                          (1- er)
+                        er))))
+          (when (>= last sr)
+            last))))))
 
 (defun omnidiff-engine-range-line-spans (range lines-vec)
   "Split RANGE over LINES-VEC into `(ROW START-CHAR END-CHAR)' tuples.
@@ -624,7 +642,7 @@ columns on the final row so trailing-whitespace diffs stay visible."
          (sc (omnidiff-json-range-start-col range))
          (er (omnidiff-json-range-end-row range))
          (ec (omnidiff-json-range-end-col range))
-         (last-row (omnidiff-engine--range-last-row range num-rows))
+         (last-row (omnidiff-engine-range-last-row range num-rows))
          (spans nil))
     (when last-row
       (let ((row sr))
@@ -661,7 +679,7 @@ LINE-STARTS must be a vector from `omnidiff-engine-buffer-line-offsets'."
          (sc (omnidiff-json-range-start-col range))
          (er (omnidiff-json-range-end-row range))
          (ec (omnidiff-json-range-end-col range))
-         (last-row (omnidiff-engine--range-last-row range num-rows))
+         (last-row (omnidiff-engine-range-last-row range num-rows))
          (regions nil))
     (when last-row
       (with-current-buffer buf
@@ -867,7 +885,7 @@ LINE-STARTS must be a vector from `omnidiff-engine-buffer-line-offsets'."
   "Return boolean vector marking rows touched by any hunk in HUNKS."
   (let ((marked (make-vector num-rows nil)))
     (dolist (h hunks)
-      (when-let* ((last (omnidiff-engine--range-last-row
+      (when-let* ((last (omnidiff-engine-range-last-row
                          (omnidiff-json-hunk-range h) num-rows)))
         (let ((r (omnidiff-json-range-start-row (omnidiff-json-hunk-range h))))
           (while (<= r last)
@@ -875,18 +893,18 @@ LINE-STARTS must be a vector from `omnidiff-engine-buffer-line-offsets'."
             (setq r (1+ r))))))
     marked))
 
-(defun omnidiff-engine--record-move-mappings (hunks src-len dst-len src-to-dst dst-to-src)
-  "Populate SRC-TO-DST and DST-TO-SRC with `move-target' row mappings for HUNKS.
-Never overwrites already populated unchanged anchor slots."
+(defun omnidiff-engine--each-move-row-pair (hunks src-len dst-len fn)
+  "Call FN with `(SRC-ROW DST-ROW)' for each interpolated row of move HUNKS.
+SRC-LEN and DST-LEN bound source and destination ranges."
   (dolist (h hunks)
     (when (and (eq (omnidiff-json-hunk-operation h) 'move)
                (omnidiff-json-hunk-move-target h))
       (let* ((srng (omnidiff-json-hunk-range h))
              (drng (omnidiff-json-hunk-move-target h))
              (s0 (omnidiff-json-range-start-row srng))
-             (s1 (omnidiff-engine--range-last-row srng src-len))
+             (s1 (omnidiff-engine-range-last-row srng src-len))
              (d0 (omnidiff-json-range-start-row drng))
-             (d1 (omnidiff-engine--range-last-row drng dst-len)))
+             (d1 (omnidiff-engine-range-last-row drng dst-len)))
         (when (and s1 d1)
           (let ((s-span (- s1 s0))
                 (d-span (- d1 d0))
@@ -895,11 +913,19 @@ Never overwrites already populated unchanged anchor slots."
               (let ((mapped (if (= s-span 0)
                                 d0
                               (min d1 (+ d0 (round (* (float (- r s0)) d-span) s-span))))))
-                (when (null (aref src-to-dst r))
-                  (aset src-to-dst r mapped))
-                (when (null (aref dst-to-src mapped))
-                  (aset dst-to-src mapped r)))
+                (funcall fn r mapped))
               (setq r (1+ r)))))))))
+
+(defun omnidiff-engine--record-move-mappings (hunks src-len dst-len src-to-dst dst-to-src)
+  "Populate SRC-TO-DST and DST-TO-SRC with `move-target' row mappings for HUNKS.
+Never overwrites already populated unchanged anchor slots."
+  (omnidiff-engine--each-move-row-pair
+   hunks src-len dst-len
+   (lambda (r mapped)
+     (when (null (aref src-to-dst r))
+       (aset src-to-dst r mapped))
+     (when (null (aref dst-to-src mapped))
+       (aset dst-to-src mapped r)))))
 
 (defun omnidiff-engine--collect-move-pairs (b-hunks a-hunks nb na)
   "Collect deduplicated `(BEFORE . AFTER)' move-target pairs sorted by `car'."
@@ -908,44 +934,12 @@ Never overwrites already populated unchanged anchor slots."
                 (when (and (>= b 0) (< b nb) (>= a 0) (< a na)
                            (null (gethash b by-b)))
                   (puthash b a by-b))))
-      (dolist (h b-hunks)
-        (when (and (eq (omnidiff-json-hunk-operation h) 'move)
-                   (omnidiff-json-hunk-move-target h))
-          (let* ((srng (omnidiff-json-hunk-range h))
-                 (drng (omnidiff-json-hunk-move-target h))
-                 (s0 (omnidiff-json-range-start-row srng))
-                 (s1 (omnidiff-engine--range-last-row srng nb))
-                 (d0 (omnidiff-json-range-start-row drng))
-                 (d1 (omnidiff-engine--range-last-row drng na)))
-            (when (and s1 d1)
-              (let ((s-span (- s1 s0))
-                    (d-span (- d1 d0))
-                    (r s0))
-                (while (<= r s1)
-                  (let ((mapped (if (= s-span 0)
-                                    d0
-                                  (min d1 (+ d0 (round (* (float (- r s0)) d-span) s-span))))))
-                    (add-pair r mapped))
-                  (setq r (1+ r))))))))
-      (dolist (h a-hunks)
-        (when (and (eq (omnidiff-json-hunk-operation h) 'move)
-                   (omnidiff-json-hunk-move-target h))
-          (let* ((srng (omnidiff-json-hunk-range h))
-                 (drng (omnidiff-json-hunk-move-target h))
-                 (a0 (omnidiff-json-range-start-row srng))
-                 (a1 (omnidiff-engine--range-last-row srng na))
-                 (b0 (omnidiff-json-range-start-row drng))
-                 (b1 (omnidiff-engine--range-last-row drng nb)))
-            (when (and a1 b1)
-              (let ((a-span (- a1 a0))
-                    (b-span (- b1 b0))
-                    (r a0))
-                (while (<= r a1)
-                  (let ((mapped (if (= a-span 0)
-                                    b0
-                                  (min b1 (+ b0 (round (* (float (- r a0)) b-span) a-span))))))
-                    (add-pair mapped r))
-                  (setq r (1+ r)))))))))
+      (omnidiff-engine--each-move-row-pair
+       b-hunks nb na
+       (lambda (b a) (add-pair b a)))
+      (omnidiff-engine--each-move-row-pair
+       a-hunks na nb
+       (lambda (a b) (add-pair b a))))
     (let ((pairs nil))
       (maphash (lambda (b a) (push (cons b a) pairs)) by-b)
       (sort pairs (lambda (x y) (< (car x) (car y)))))))
@@ -1160,11 +1154,51 @@ BEFORE-LINES and AFTER-LINES may be vectors or lists of 0-based line strings."
      :anchors anchors
      :anchor-vec (vconcat anchors))))
 
-(defun omnidiff-engine--ensure-anchor-vec (alignment)
-  "Return vector of anchors for ALIGNMENT, lazily caching it if needed."
-  (or (omnidiff-line-alignment-anchor-vec alignment)
-      (setf (omnidiff-line-alignment-anchor-vec alignment)
-            (vconcat (omnidiff-line-alignment-anchors alignment)))))
+(defun omnidiff-engine-alignment-direct-anchor (alignment side row)
+  "Return counterpart 0-based row if ROW on SIDE is directly anchored in ALIGNMENT.
+SIDE is `before' or `after'.  Returns nil if ROW is not directly anchored."
+  (let* ((avec (omnidiff-line-alignment-anchor-vec alignment))
+         (before-p (eq side 'before))
+         (lo 0)
+         (hi (length avec))
+         (found nil))
+    (while (and (< lo hi) (null found))
+      (let* ((mid (/ (+ lo hi) 2))
+             (pair (aref avec mid))
+             (s (if before-p (car pair) (cdr pair))))
+        (cond
+         ((= s row) (setq found (if before-p (cdr pair) (car pair))))
+         ((< s row) (setq lo (1+ mid)))
+         (t (setq hi mid)))))
+    found))
+
+(defun omnidiff-engine-alignment-surrounding-anchors (alignment side r0 &optional r1)
+  "Return `(PREV . NEXT)' anchor pairs strictly surrounding [R0, R1] on SIDE.
+Each anchor is a `(BEFORE-ROW . AFTER-ROW)' cons cell or nil.
+When R1 is nil, defaults to R0 (strictly surrounding single row R0)."
+  (let* ((end-row (or r1 r0))
+         (avec (omnidiff-line-alignment-anchor-vec alignment))
+         (alen (length avec))
+         (before-p (eq side 'before))
+         (prev nil)
+         (next nil))
+    ;; Binary search for first anchor with src-row >= r0.
+    (let ((lo 0) (hi alen))
+      (while (< lo hi)
+        (let* ((mid (/ (+ lo hi) 2))
+               (s (if before-p (car (aref avec mid)) (cdr (aref avec mid)))))
+          (if (< s r0) (setq lo (1+ mid)) (setq hi mid))))
+      (when (> lo 0)
+        (setq prev (aref avec (1- lo)))))
+    ;; Binary search for first anchor with src-row > end-row.
+    (let ((lo 0) (hi alen))
+      (while (< lo hi)
+        (let* ((mid (/ (+ lo hi) 2))
+               (s (if before-p (car (aref avec mid)) (cdr (aref avec mid)))))
+          (if (<= s end-row) (setq lo (1+ mid)) (setq hi mid))))
+      (when (< lo alen)
+        (setq next (aref avec lo))))
+    (cons prev next)))
 
 (defun omnidiff-engine-map-row (alignment side row)
   "Map 0-based ROW on SIDE (`before' or `after') to its counterpart 0-based row.
@@ -1187,7 +1221,7 @@ linearly interpolates between the nearest surrounding monotonic anchors."
              (direct (and (< clamped src-len) (aref vec clamped))))
         (if (integerp direct)
             (max 0 (min max-dst direct))
-          (let* ((avec (omnidiff-engine--ensure-anchor-vec alignment))
+          (let* ((avec (omnidiff-line-alignment-anchor-vec alignment))
                  (alen (length avec)))
             (if (= alen 0)
                 (if (<= max-src 0)
@@ -1231,16 +1265,17 @@ linearly interpolates between the nearest surrounding monotonic anchors."
   "Return non-nil if (R1, C1) < (R2, C2)."
   (or (< r1 r2) (and (= r1 r2) (< c1 c2))))
 
-(defun omnidiff-engine--range-contains-p (range row byte-col)
-  "Return non-nil if right-open RANGE contains (ROW, BYTE-COL)."
-  (and (omnidiff-engine--pos-le-p
-        (omnidiff-json-range-start-row range)
-        (omnidiff-json-range-start-col range)
-        row byte-col)
-       (omnidiff-engine--pos-lt-p
-        row byte-col
-        (omnidiff-json-range-end-row range)
-        (omnidiff-json-range-end-col range))))
+(defun omnidiff-engine-range-contains-p (range row col)
+  "Return non-nil if right-open RANGE contains (ROW, COL)."
+  (when range
+    (and (omnidiff-engine--pos-le-p
+          (omnidiff-json-range-start-row range)
+          (omnidiff-json-range-start-col range)
+          row col)
+         (omnidiff-engine--pos-lt-p
+          row col
+          (omnidiff-json-range-end-row range)
+          (omnidiff-json-range-end-col range)))))
 
 (defun omnidiff-engine--range-effective-last-row (range)
   "Return inclusive 0-based last row of RANGE without needing file length."
@@ -1251,21 +1286,108 @@ linearly interpolates between the nearest surrounding monotonic anchors."
         (1- er)
       er)))
 
-(defun omnidiff-engine--hunk-at (hunks row byte-col)
-  "Return the most specific hunk in HUNKS containing (ROW, BYTE-COL)."
-  (let ((best nil)
-        (best-span most-positive-fixnum))
-    (dolist (h hunks)
-      (let ((r (omnidiff-json-hunk-range h)))
-        (when (omnidiff-engine--range-contains-p r row byte-col)
-          (let ((span (+ (* 100000 (- (omnidiff-json-range-end-row r)
-                                      (omnidiff-json-range-start-row r)))
-                         (abs (- (omnidiff-json-range-end-col r)
-                                 (omnidiff-json-range-start-col r))))))
-            (when (< span best-span)
-              (setq best h
-                    best-span span))))))
-    best))
+(defun omnidiff-engine--lower-bound-ge (vec target)
+  "Return smallest index `i' in non-decreasing integer VEC with `VEC[i] >= TARGET'."
+  (let ((lo 0)
+        (hi (length vec)))
+    (while (< lo hi)
+      (let ((mid (/ (+ lo hi) 2)))
+        (if (< (aref vec mid) target)
+            (setq lo (1+ mid))
+          (setq hi mid))))
+    lo))
+
+(defun omnidiff-engine--ensure-side-index (side)
+  "Ensure SIDE has cached `hunk-vec' and `prefix-max-row' matching its `hunks'.
+Returns `(HUNK-VEC . PREFIX-MAX-ROW)' where `HUNK-VEC' is sorted by range
+and `PREFIX-MAX-ROW[i]' is the running maximum effective last row up to `i'."
+  (let ((hunks (omnidiff-json-side-hunks side)))
+    (if (and (omnidiff-json-side-hunk-vec side)
+             (eq (omnidiff-json-side-indexed-hunks side) hunks))
+        (cons (omnidiff-json-side-hunk-vec side)
+              (omnidiff-json-side-prefix-max-row side))
+      (let* ((vec (vconcat hunks))
+             (n (length vec))
+             (sorted-p t))
+        (let ((i 1))
+          (while (and (< i n) sorted-p)
+            (when (omnidiff-engine--hunk-less-p (aref vec i) (aref vec (1- i)))
+              (setq sorted-p nil))
+            (setq i (1+ i))))
+        (unless sorted-p
+          (setq vec (vconcat (sort (append vec nil) #'omnidiff-engine--hunk-less-p))))
+        (let ((pmax (make-vector n 0))
+              (cur-max most-negative-fixnum))
+          (dotimes (i n)
+            (let ((lr (omnidiff-engine--range-effective-last-row
+                       (omnidiff-json-hunk-range (aref vec i)))))
+              (when (> lr cur-max)
+                (setq cur-max lr))
+              (aset pmax i cur-max)))
+          (setf (omnidiff-json-side-hunk-vec side) vec
+                (omnidiff-json-side-prefix-max-row side) pmax
+                (omnidiff-json-side-indexed-hunks side) hunks)
+          (cons vec pmax))))))
+
+(defun omnidiff-engine-hunk-at (side row col &optional fallback-on-row)
+  "Return the most specific `omnidiff-json-hunk' in SIDE at (ROW, COL).
+SIDE may be an `omnidiff-json-side' (using an O(log H) cached prefix-max
+row index), a sorted list of `omnidiff-json-hunk's, or nil.  ROW is
+0-based and COL is a 0-based UTF-8 byte column (nil defaults to 0).
+Exact span containment is preferred; narrower spans win by comparing
+`(end-row - start-row, end-col - start-col)' lexicographically.
+When FALLBACK-ON-ROW is non-nil and no hunk contains (ROW, COL), falls
+back to the nearest non-empty hunk covering ROW."
+  (when side
+    (let ((bcol (or col 0))
+          (exact nil)
+          (exact-dr most-positive-fixnum)
+          (exact-dc most-positive-fixnum)
+          (on-row nil)
+          (on-row-dist most-positive-fixnum))
+      (cl-flet ((consider (h)
+                  (let* ((r (omnidiff-json-hunk-range h))
+                         (sr (omnidiff-json-range-start-row r)))
+                    (cond
+                     ((omnidiff-engine-range-contains-p r row bcol)
+                      (let ((dr (- (omnidiff-json-range-end-row r) sr))
+                            (dc (- (omnidiff-json-range-end-col r)
+                                   (omnidiff-json-range-start-col r))))
+                        (when (or (< dr exact-dr)
+                                  (and (= dr exact-dr) (< dc exact-dc)))
+                          (setq exact h
+                                exact-dr dr
+                                exact-dc dc))))
+                     ((and fallback-on-row (null exact))
+                      (when-let* ((lr (omnidiff-engine-range-last-row r)))
+                        (when (and (<= sr row) (<= row lr))
+                          (let ((dist (if (= sr row)
+                                          (abs (- (omnidiff-json-range-start-col r) bcol))
+                                        0)))
+                            (when (< dist on-row-dist)
+                              (setq on-row h
+                                    on-row-dist dist))))))))))
+        (cond
+         ((omnidiff-json-side-p side)
+          (when (omnidiff-json-side-hunks side)
+            (pcase-let* ((`(,hvec . ,pmax) (omnidiff-engine--ensure-side-index side))
+                         (n (length hvec))
+                         (i (omnidiff-engine--lower-bound-ge pmax row)))
+              (while (< i n)
+                (let ((h (aref hvec i)))
+                  (if (> (omnidiff-json-range-start-row (omnidiff-json-hunk-range h)) row)
+                      (setq i n)
+                    (consider h)
+                    (setq i (1+ i))))))))
+         ((listp side)
+          (let ((rest side))
+            (while rest
+              (let ((h (car rest)))
+                (if (> (omnidiff-json-range-start-row (omnidiff-json-hunk-range h)) row)
+                    (setq rest nil)
+                  (consider h)
+                  (setq rest (cdr rest)))))))))
+      (or exact on-row))))
 
 (defun omnidiff-engine--op-counterpart-priority (src-op dst-op)
   "Return numeric preference (lower is better) for pairing SRC-OP with DST-OP."
@@ -1289,15 +1411,13 @@ byte column (nil defaults to 0)."
   (let* ((col (or byte-col 0))
          (before-p (eq side 'before))
          (other-side (if before-p 'after 'before))
-         (src-hunks (omnidiff-json-side-hunks
-                     (if before-p
-                         (omnidiff-json-diff-before json-diff)
-                       (omnidiff-json-diff-after json-diff))))
-         (dst-hunks (omnidiff-json-side-hunks
-                     (if before-p
-                         (omnidiff-json-diff-after json-diff)
-                       (omnidiff-json-diff-before json-diff))))
-         (hunk (omnidiff-engine--hunk-at src-hunks row col)))
+         (src-side (if before-p
+                       (omnidiff-json-diff-before json-diff)
+                     (omnidiff-json-diff-after json-diff)))
+         (dst-side (if before-p
+                       (omnidiff-json-diff-after json-diff)
+                     (omnidiff-json-diff-before json-diff)))
+         (hunk (omnidiff-engine-hunk-at src-side row col)))
     (cond
      ;; Exact move target.
      ((and hunk
@@ -1323,39 +1443,47 @@ byte column (nil defaults to 0)."
              (best-prio 99)
              (best-rdist most-positive-fixnum)
              (best-cdist most-positive-fixnum))
-        (dolist (dh dst-hunks)
-          (let* ((dr (omnidiff-json-hunk-range dh))
-                 (d0 (omnidiff-json-range-start-row dr))
-                 (d1 (omnidiff-engine--range-effective-last-row dr)))
-            (when (and (<= d0 hi) (<= lo d1))
-              ;; Reject opposing hunks whose overlapped rows are all anchored
-              ;; to source rows outside `srng' (e.g. zero-width gap clamping).
-              (let ((ov-r (max lo d0))
-                    (ov-hi (min hi d1))
-                    (compatible nil))
-                (while (and (<= ov-r ov-hi) (not compatible))
-                  (let ((back (when (and (>= ov-r 0) (< ov-r dst-len))
-                                (aref dst-vec ov-r))))
-                    (when (or (null back) (and (<= s0 back) (<= back s1)))
-                      (setq compatible t)))
-                  (setq ov-r (1+ ov-r)))
-                (when compatible
-                  (let* ((prio (omnidiff-engine--op-counterpart-priority
-                                src-op (omnidiff-json-hunk-operation dh)))
-                         (rdist (cond
-                                 ((< mapped-row d0) (- d0 mapped-row))
-                                 ((> mapped-row d1) (- mapped-row d1))
-                                 (t 0)))
-                         (cdist (abs (- (omnidiff-json-range-start-col dr) col))))
-                    (when (and (< prio 3)
-                               (or (< prio best-prio)
-                                   (and (= prio best-prio) (< rdist best-rdist))
-                                   (and (= prio best-prio) (= rdist best-rdist)
-                                        (< cdist best-cdist))))
-                      (setq best dh
-                            best-prio prio
-                            best-rdist rdist
-                            best-cdist cdist))))))))
+        (when (and dst-side (omnidiff-json-side-hunks dst-side))
+          (pcase-let* ((`(,dhvec . ,dpmax) (omnidiff-engine--ensure-side-index dst-side))
+                       (dn (length dhvec))
+                       (di (omnidiff-engine--lower-bound-ge dpmax lo)))
+            (while (< di dn)
+              (let* ((dh (aref dhvec di))
+                     (dr (omnidiff-json-hunk-range dh))
+                     (d0 (omnidiff-json-range-start-row dr)))
+                (if (> d0 hi)
+                    (setq di dn)
+                  (let ((d1 (omnidiff-engine--range-effective-last-row dr)))
+                    (when (<= lo d1)
+                      ;; Reject opposing hunks whose overlapped rows are all anchored
+                      ;; to source rows outside `srng' (e.g. zero-width gap clamping).
+                      (let ((ov-r (max lo d0))
+                            (ov-hi (min hi d1))
+                            (compatible nil))
+                        (while (and (<= ov-r ov-hi) (not compatible))
+                          (let ((back (when (and (>= ov-r 0) (< ov-r dst-len))
+                                        (aref dst-vec ov-r))))
+                            (when (or (null back) (and (<= s0 back) (<= back s1)))
+                              (setq compatible t)))
+                          (setq ov-r (1+ ov-r)))
+                        (when compatible
+                          (let* ((prio (omnidiff-engine--op-counterpart-priority
+                                        src-op (omnidiff-json-hunk-operation dh)))
+                                 (rdist (cond
+                                         ((< mapped-row d0) (- d0 mapped-row))
+                                         ((> mapped-row d1) (- mapped-row d1))
+                                         (t 0)))
+                                 (cdist (abs (- (omnidiff-json-range-start-col dr) col))))
+                            (when (and (< prio 3)
+                                       (or (< prio best-prio)
+                                           (and (= prio best-prio) (< rdist best-rdist))
+                                           (and (= prio best-prio) (= rdist best-rdist)
+                                                (< cdist best-cdist))))
+                              (setq best dh
+                                    best-prio prio
+                                    best-rdist rdist
+                                    best-cdist cdist)))))))
+                  (setq di (1+ di)))))))
         (cons other-side
               (if best
                   (omnidiff-json-hunk-range best)
@@ -1491,42 +1619,70 @@ merge only when both source rows and `move-target' rows are contiguous."
       (setq r (1+ r)))
     found))
 
-(defun omnidiff-engine-build-change-stops (json-diff alignment)
-  "Build an ordered list of `omnidiff-change-stop's for JSON-DIFF and ALIGNMENT.
-Merges paired before+after edits on aligned rows into one logical stop so
-navigation does not double-stop on replacements, while keeping pure inserts
-on `after', pure deletes on `before', and moves clearly navigable."
-  (let* ((nb (length (omnidiff-line-alignment-before-to-after alignment)))
-         (na (length (omnidiff-line-alignment-after-to-before alignment)))
-         (b-anc (make-vector nb nil))
-         (a-anc (make-vector na nil))
-         (_ (dolist (pair (omnidiff-line-alignment-anchors alignment))
-              (when (< (car pair) nb) (aset b-anc (car pair) t))
-              (when (< (cdr pair) na) (aset a-anc (cdr pair) t))))
-         (b-split (omnidiff-engine--coalesce-side-hunks
-                   (omnidiff-json-side-hunks (omnidiff-json-diff-before json-diff))
-                   b-anc))
-         (a-split (omnidiff-engine--coalesce-side-hunks
-                   (omnidiff-json-side-hunks (omnidiff-json-diff-after json-diff))
-                   a-anc))
-         (b-edits (vconcat (car b-split)))
-         (a-edits (vconcat (car a-split)))
-         (b-moves (vconcat (cdr b-split)))
-         (a-moves (vconcat (cdr a-split)))
+(defun omnidiff-engine-stop-sort-key (stop &optional alignment)
+  "Return reading-order sort key `(AFTER-ROW BEFORE-ROW COL)' for STOP.
+When STOP has no `counterpart-range' and ALIGNMENT is non-nil, maps its
+start row across ALIGNMENT so pure inserts and deletes interleave cleanly
+in reading order (falling back to the stop's own start row if ALIGNMENT is nil)."
+  (let* ((side (omnidiff-change-stop-side stop))
+         (rng (omnidiff-change-stop-range stop))
+         (cp-rng (omnidiff-change-stop-counterpart-range stop))
+         (sr (omnidiff-json-range-start-row rng))
+         (sc (omnidiff-json-range-start-col rng))
+         (cp-sr (when cp-rng (omnidiff-json-range-start-row cp-rng))))
+    (if (eq side 'after)
+        (list sr (or cp-sr (if alignment (omnidiff-engine-map-row alignment 'after sr) sr)) sc)
+      (list (or cp-sr (if alignment (omnidiff-engine-map-row alignment 'before sr) sr)) sr sc))))
+
+(defun omnidiff-engine-stop-key-less-p (k1 k2)
+  "Return non-nil if 3-element integer sort key K1 precedes K2 lexicographically."
+  (let ((a1 (car k1)) (a2 (car k2)))
+    (if (/= a1 a2)
+        (< a1 a2)
+      (let ((b1 (cadr k1)) (b2 (cadr k2)))
+        (if (/= b1 b2)
+            (< b1 b2)
+          (< (caddr k1) (caddr k2)))))))
+
+(defun omnidiff-engine--pair-edit-stops (a-edits b-edits a-anc b-anc alignment)
+  "Pair non-move edit groups across A-EDITS and B-EDITS in O((na+nb) log nb).
+Returns `(STOPS . PAIRED-BOXES)' where PAIRED-BOXES is a list of
+`(A0 A1 B0 B1)' tuples sorted by increasing `A0'."
+  (let* ((na-e (length a-edits))
          (nb-e (length b-edits))
-         (na-e (length a-edits))
          (b-e-used (make-vector nb-e nil))
          (b-e-mapped (make-vector nb-e nil))
          (b-e-anc (make-vector nb-e nil))
+         (b-pmax (make-vector nb-e 0))
+         (ba-order nil)
+         (ba-pmax nil)
          (paired-edit-boxes nil)
-         (entries nil))
-    ;; Precompute before-edit mapped bounds onto `after' and anchor flags.
-    (dotimes (bi nb-e)
-      (let ((bg (aref b-edits bi)))
-        (aset b-e-mapped bi
-              (omnidiff-engine--group-mapped-bounds alignment 'before bg))
-        (aset b-e-anc bi (omnidiff-engine--group-anchored-p bg b-anc))))
-    ;; 1. Pair non-move edits across `after' and `before'.
+         (stops nil))
+    ;; Precompute before-edit mapped bounds, anchor flags, and dual interval indexes.
+    (when (> nb-e 0)
+      (let ((cur-max most-negative-fixnum))
+        (dotimes (bi nb-e)
+          (let* ((bg (aref b-edits bi))
+                 (b1 (omnidiff-engine--hunk-group-last-row bg)))
+            (when (> b1 cur-max) (setq cur-max b1))
+            (aset b-pmax bi cur-max)
+            (aset b-e-mapped bi
+                  (omnidiff-engine--group-mapped-bounds alignment 'before bg))
+            (aset b-e-anc bi (omnidiff-engine--group-anchored-p bg b-anc)))))
+      (when (> na-e 0)
+        (setq ba-order
+              (vconcat
+               (sort (number-sequence 0 (1- nb-e))
+                     (lambda (i j)
+                       (let ((li (car (aref b-e-mapped i)))
+                             (lj (car (aref b-e-mapped j))))
+                         (if (/= li lj) (< li lj) (< i j))))))
+              ba-pmax (make-vector nb-e 0))
+        (let ((cur-max most-negative-fixnum))
+          (dotimes (k nb-e)
+            (let ((hi (cdr (aref b-e-mapped (aref ba-order k)))))
+              (when (> hi cur-max) (setq cur-max hi))
+              (aset ba-pmax k cur-max))))))
     (dotimes (ai na-e)
       (let* ((ag (aref a-edits ai))
              (a0 (omnidiff-engine--hunk-group-start-row ag))
@@ -1538,177 +1694,280 @@ on `after', pure deletes on `before', and moves clearly navigable."
              (best-bi nil)
              (best-prio 99)
              (best-dist most-positive-fixnum))
-        (dotimes (bi nb-e)
-          (unless (aref b-e-used bi)
-            (let* ((bg (aref b-edits bi))
-                   (b0 (omnidiff-engine--hunk-group-start-row bg))
-                   (b1 (omnidiff-engine--hunk-group-last-row bg))
-                   (b-anc-p (aref b-e-anc bi))
-                   (ba (aref b-e-mapped bi))
-                   (ba-lo (car ba))
-                   (ba-hi (cdr ba))
-                   (ab-ov (omnidiff-engine--rows-overlap-p ab-lo ab-hi b0 b1))
-                   (ba-ov (omnidiff-engine--rows-overlap-p ba-lo ba-hi a0 a1)))
-              ;; Do not let an unanchored zero-width gap clamp onto an adjacent
-              ;; anchored group whose own anchor maps elsewhere.
-              (when (cond
-                     ((and a-anc-p b-anc-p) (and ab-ov ba-ov))
-                     (a-anc-p ab-ov)
-                     (b-anc-p ba-ov)
-                     (t (or ab-ov ba-ov)))
-                (let ((prio (omnidiff-engine--op-counterpart-priority
-                             (omnidiff-engine--hunk-group-operation ag)
-                             (omnidiff-engine--hunk-group-operation bg)))
-                      (dist (+ (abs (- ab-lo b0)) (abs (- ba-lo a0)))))
-                  (when (or (< prio best-prio)
-                            (and (= prio best-prio) (< dist best-dist)))
-                    (setq best-bi bi
-                          best-prio prio
-                          best-dist dist)))))))
+        (cl-flet ((consider (bi)
+                    (unless (aref b-e-used bi)
+                      (let* ((bg (aref b-edits bi))
+                             (b0 (omnidiff-engine--hunk-group-start-row bg))
+                             (b1 (omnidiff-engine--hunk-group-last-row bg))
+                             (b-anc-p (aref b-e-anc bi))
+                             (ba (aref b-e-mapped bi))
+                             (ba-lo (car ba))
+                             (ba-hi (cdr ba))
+                             (ab-ov (omnidiff-engine--rows-overlap-p ab-lo ab-hi b0 b1))
+                             (ba-ov (omnidiff-engine--rows-overlap-p ba-lo ba-hi a0 a1)))
+                        ;; Do not let an unanchored zero-width gap clamp onto an adjacent
+                        ;; anchored group whose own anchor maps elsewhere.
+                        (when (cond
+                               ((and a-anc-p b-anc-p) (and ab-ov ba-ov))
+                               (a-anc-p ab-ov)
+                               (b-anc-p ba-ov)
+                               (t (or ab-ov ba-ov)))
+                          (let ((prio (omnidiff-engine--op-counterpart-priority
+                                       (omnidiff-engine--hunk-group-operation ag)
+                                       (omnidiff-engine--hunk-group-operation bg)))
+                                (dist (+ (abs (- ab-lo b0)) (abs (- ba-lo a0)))))
+                            (when (or (< prio best-prio)
+                                      (and (= prio best-prio)
+                                           (or (< dist best-dist)
+                                               (and (= dist best-dist)
+                                                    (or (null best-bi) (< bi best-bi))))))
+                              (setq best-bi bi
+                                    best-prio prio
+                                    best-dist dist))))))))
+          (when (> nb-e 0)
+            ;; Candidates overlapping `[ab-lo, ab-hi]' in `b-edits' own rows.
+            (let ((bi (omnidiff-engine--lower-bound-ge b-pmax ab-lo)))
+              (while (and (< bi nb-e)
+                          (<= (omnidiff-engine--hunk-group-start-row (aref b-edits bi)) ab-hi))
+                (consider bi)
+                (setq bi (1+ bi))))
+            ;; When `ag' is unanchored, `ba-ov' alone can match even without `ab-ov'.
+            (unless a-anc-p
+              (let ((k (omnidiff-engine--lower-bound-ge ba-pmax a0)))
+                (while (and (< k nb-e)
+                            (<= (car (aref b-e-mapped (aref ba-order k))) a1))
+                  (consider (aref ba-order k))
+                  (setq k (1+ k)))))))
         (if best-bi
             (let* ((bg (aref b-edits best-bi))
                    (b0 (omnidiff-engine--hunk-group-start-row bg))
                    (b1 (omnidiff-engine--hunk-group-last-row bg)))
               (aset b-e-used best-bi t)
               (push (list a0 a1 b0 b1) paired-edit-boxes)
-              (push (list (list a0 b0 (omnidiff-json-range-start-col
-                                       (omnidiff-engine--hunk-group-range ag)))
-                          (make-omnidiff-change-stop
-                           :side 'after
-                           :operation 'update
-                           :range (omnidiff-engine--hunk-group-range ag)
-                           :counterpart-side 'before
-                           :counterpart-range (omnidiff-engine--hunk-group-range bg)
-                           :reference-line (or (omnidiff-engine--hunk-group-reference-line ag)
-                                               (omnidiff-engine--hunk-group-reference-line bg))))
-                    entries))
-          (push (list (list a0 ab-lo (omnidiff-json-range-start-col
-                                      (omnidiff-engine--hunk-group-range ag)))
-                      (make-omnidiff-change-stop
-                       :side 'after
-                       :operation (omnidiff-engine--hunk-group-operation ag)
-                       :range (omnidiff-engine--hunk-group-range ag)
-                       :counterpart-side 'before
-                       :counterpart-range nil
-                       :reference-line (omnidiff-engine--hunk-group-reference-line ag)))
-                entries))))
+              (push (make-omnidiff-change-stop
+                     :side 'after
+                     :operation 'update
+                     :range (omnidiff-engine--hunk-group-range ag)
+                     :counterpart-side 'before
+                     :counterpart-range (omnidiff-engine--hunk-group-range bg)
+                     :reference-line (or (omnidiff-engine--hunk-group-reference-line ag)
+                                         (omnidiff-engine--hunk-group-reference-line bg)))
+                    stops))
+          (push (make-omnidiff-change-stop
+                 :side 'after
+                 :operation (omnidiff-engine--hunk-group-operation ag)
+                 :range (omnidiff-engine--hunk-group-range ag)
+                 :counterpart-side 'before
+                 :counterpart-range nil
+                 :reference-line (omnidiff-engine--hunk-group-reference-line ag))
+                stops))))
     ;; Remaining unpaired `before' non-move edits (pure deletes).
     (dotimes (bi nb-e)
       (unless (aref b-e-used bi)
-        (let* ((bg (aref b-edits bi))
-               (b0 (omnidiff-engine--hunk-group-start-row bg))
-               (ba-lo (car (aref b-e-mapped bi))))
-          (push (list (list ba-lo b0 (omnidiff-json-range-start-col
-                                      (omnidiff-engine--hunk-group-range bg)))
-                      (make-omnidiff-change-stop
-                       :side 'before
-                       :operation (omnidiff-engine--hunk-group-operation bg)
-                       :range (omnidiff-engine--hunk-group-range bg)
-                       :counterpart-side 'after
-                       :counterpart-range nil
-                       :reference-line (omnidiff-engine--hunk-group-reference-line bg)))
-                entries))))
-    ;; 2. Pair move groups (suppressing inline syntax-shift moves subsumed by a paired edit).
-    (let* ((nb-m (length b-moves))
-           (na-m (length a-moves))
-           (b-m-used (make-vector nb-m nil)))
-      (cl-flet ((subsumed-by-paired-edit-p (a0 a1 b0 b1)
-                  (cl-some (lambda (box)
-                             (pcase-let ((`(,ea0 ,ea1 ,eb0 ,eb1) box))
-                               (and (>= a0 ea0) (<= a1 ea1)
-                                    (>= b0 eb0) (<= b1 eb1))))
-                           paired-edit-boxes)))
-        (dotimes (ai na-m)
-          (let* ((ag (aref a-moves ai))
-                 (a0 (omnidiff-engine--hunk-group-start-row ag))
-                 (a1 (omnidiff-engine--hunk-group-last-row ag))
-                 (amt (omnidiff-engine--hunk-group-move-target ag))
-                 (amt0 (when amt (omnidiff-json-range-start-row amt)))
-                 (amt1 (when amt (omnidiff-engine--range-effective-last-row amt)))
-                 (best-bi nil)
-                 (best-dist most-positive-fixnum))
-            (dotimes (bi nb-m)
-              (unless (aref b-m-used bi)
-                (let* ((bg (aref b-moves bi))
-                       (b0 (omnidiff-engine--hunk-group-start-row bg))
-                       (b1 (omnidiff-engine--hunk-group-last-row bg))
-                       (bmt (omnidiff-engine--hunk-group-move-target bg))
-                       (bmt0 (when bmt (omnidiff-json-range-start-row bmt)))
-                       (bmt1 (when bmt (omnidiff-engine--range-effective-last-row bmt))))
-                  (when (or (and amt0 amt1 (omnidiff-engine--rows-overlap-p amt0 amt1 b0 b1))
-                            (and bmt0 bmt1 (omnidiff-engine--rows-overlap-p bmt0 bmt1 a0 a1)))
-                    (let ((dist (if amt0 (abs (- amt0 b0)) 0)))
-                      (when (< dist best-dist)
-                        (setq best-bi bi
-                              best-dist dist)))))))
-            (if best-bi
-                (let* ((bg (aref b-moves best-bi))
-                       (b0 (omnidiff-engine--hunk-group-start-row bg))
-                       (b1 (omnidiff-engine--hunk-group-last-row bg)))
-                  (aset b-m-used best-bi t)
-                  (unless (subsumed-by-paired-edit-p a0 a1 b0 b1)
-                    (push (list (list a0 b0 (omnidiff-json-range-start-col
-                                             (omnidiff-engine--hunk-group-range ag)))
-                                (make-omnidiff-change-stop
-                                 :side 'after
-                                 :operation 'move
-                                 :range (omnidiff-engine--hunk-group-range ag)
-                                 :counterpart-side 'before
-                                 :counterpart-range (omnidiff-engine--hunk-group-range bg)
-                                 :reference-line (or (omnidiff-engine--hunk-group-reference-line ag)
-                                                     (omnidiff-engine--hunk-group-reference-line bg))))
-                          entries)))
-              (unless (and amt0 amt1 (subsumed-by-paired-edit-p a0 a1 amt0 amt1))
-                (push (list (list a0 (or amt0 (omnidiff-engine-map-row alignment 'after a0))
-                                  (omnidiff-json-range-start-col
-                                   (omnidiff-engine--hunk-group-range ag)))
-                            (make-omnidiff-change-stop
-                             :side 'after
-                             :operation 'move
-                             :range (omnidiff-engine--hunk-group-range ag)
-                             :counterpart-side 'before
-                             :counterpart-range amt
-                             :reference-line (omnidiff-engine--hunk-group-reference-line ag)))
-                      entries)))))
+        (let ((bg (aref b-edits bi)))
+          (push (make-omnidiff-change-stop
+                 :side 'before
+                 :operation (omnidiff-engine--hunk-group-operation bg)
+                 :range (omnidiff-engine--hunk-group-range bg)
+                 :counterpart-side 'after
+                 :counterpart-range nil
+                 :reference-line (omnidiff-engine--hunk-group-reference-line bg))
+                stops))))
+    (cons (nreverse stops) (nreverse paired-edit-boxes))))
+
+(defun omnidiff-engine--pair-move-stops (a-moves b-moves paired-edit-boxes)
+  "Pair move groups across A-MOVES and B-MOVES in O((na+nb) log (nb+P)).
+Suppresses inline syntax-shift moves subsumed by PAIRED-EDIT-BOXES
+(sorted by increasing `A0')."
+  (let* ((na-m (length a-moves))
+         (nb-m (length b-moves))
+         (b-m-used (make-vector nb-m nil))
+         (box-vec (vconcat paired-edit-boxes))
+         (np (length box-vec))
+         (box-pmax (make-vector np 0))
+         (bm-pmax (make-vector nb-m 0))
+         (bmt-bounds (make-vector nb-m nil))
+         (bmt-order nil)
+         (bmt-pmax nil)
+         (nb-mt 0)
+         (stops nil))
+    ;; Prefix-max `ea1' over `paired-edit-boxes' for O(log P) subsumption lookup.
+    (when (> np 0)
+      (let ((cur-max most-negative-fixnum))
+        (dotimes (i np)
+          (let ((ea1 (nth 1 (aref box-vec i))))
+            (when (> ea1 cur-max) (setq cur-max ea1))
+            (aset box-pmax i cur-max)))))
+    ;; Dual interval indexes over `b-moves' (own rows and `move-target' rows).
+    (when (> nb-m 0)
+      (let ((cur-max most-negative-fixnum)
+            (bmt-idxs nil))
         (dotimes (bi nb-m)
-          (unless (aref b-m-used bi)
-            (let* ((bg (aref b-moves bi))
-                   (b0 (omnidiff-engine--hunk-group-start-row bg))
-                   (b1 (omnidiff-engine--hunk-group-last-row bg))
-                   (bmt (omnidiff-engine--hunk-group-move-target bg))
-                   (bmt0 (when bmt (omnidiff-json-range-start-row bmt)))
-                   (bmt1 (when bmt (omnidiff-engine--range-effective-last-row bmt))))
-              (unless (and bmt0 bmt1 (subsumed-by-paired-edit-p bmt0 bmt1 b0 b1))
-                (push (list (list (or bmt0 (omnidiff-engine-map-row alignment 'before b0))
-                                  b0
-                                  (omnidiff-json-range-start-col
-                                   (omnidiff-engine--hunk-group-range bg)))
-                            (make-omnidiff-change-stop
-                             :side 'before
-                             :operation 'move
-                             :range (omnidiff-engine--hunk-group-range bg)
-                             :counterpart-side 'after
-                             :counterpart-range bmt
-                             :reference-line (omnidiff-engine--hunk-group-reference-line bg)))
-                      entries)))))))
-    ;; 3. Sort in reading order and assign 1-based indices.
-    (setq entries
-          (sort entries
-                (lambda (x y)
-                  (pcase-let ((`(,xa ,xb ,xc) (car x))
-                              (`(,ya ,yb ,yc) (car y)))
-                    (cond
-                     ((/= xa ya) (< xa ya))
-                     ((/= xb yb) (< xb yb))
-                     (t (< xc yc)))))))
-    (let ((idx 0)
-          (stops nil))
-      (dolist (e entries)
-        (setq idx (1+ idx))
-        (let ((stop (cadr e)))
-          (setf (omnidiff-change-stop-index stop) idx)
-          (push stop stops)))
-      (nreverse stops))))
+          (let* ((bg (aref b-moves bi))
+                 (b1 (omnidiff-engine--hunk-group-last-row bg))
+                 (bmt (omnidiff-engine--hunk-group-move-target bg)))
+            (when (> b1 cur-max) (setq cur-max b1))
+            (aset bm-pmax bi cur-max)
+            (when bmt
+              (aset bmt-bounds bi
+                    (cons (omnidiff-json-range-start-row bmt)
+                          (omnidiff-engine--range-effective-last-row bmt)))
+              (push bi bmt-idxs))))
+        (when bmt-idxs
+          (setq bmt-order
+                (vconcat
+                 (sort (nreverse bmt-idxs)
+                       (lambda (i j)
+                         (let ((li (car (aref bmt-bounds i)))
+                               (lj (car (aref bmt-bounds j))))
+                           (if (/= li lj) (< li lj) (< i j))))))
+                nb-mt (length bmt-order)
+                bmt-pmax (make-vector nb-mt 0))
+          (let ((mt-max most-negative-fixnum))
+            (dotimes (k nb-mt)
+              (let ((hi (cdr (aref bmt-bounds (aref bmt-order k)))))
+                (when (> hi mt-max) (setq mt-max hi))
+                (aset bmt-pmax k mt-max)))))))
+    (cl-flet ((subsumed-by-paired-edit-p (a0 a1 b0 b1)
+                (when (> np 0)
+                  (let ((i (omnidiff-engine--lower-bound-ge box-pmax a1))
+                        (found nil))
+                    (while (and (< i np) (not found))
+                      (pcase-let ((`(,ea0 ,ea1 ,eb0 ,eb1) (aref box-vec i)))
+                        (if (> ea0 a0)
+                            (setq i np)
+                          (when (and (<= a1 ea1) (>= b0 eb0) (<= b1 eb1))
+                            (setq found t))
+                          (setq i (1+ i)))))
+                    found))))
+      (dotimes (ai na-m)
+        (let* ((ag (aref a-moves ai))
+               (a0 (omnidiff-engine--hunk-group-start-row ag))
+               (a1 (omnidiff-engine--hunk-group-last-row ag))
+               (amt (omnidiff-engine--hunk-group-move-target ag))
+               (amt0 (when amt (omnidiff-json-range-start-row amt)))
+               (amt1 (when amt (omnidiff-engine--range-effective-last-row amt)))
+               (best-bi nil)
+               (best-dist most-positive-fixnum))
+          (cl-flet ((consider (bi)
+                      (unless (aref b-m-used bi)
+                        (let* ((bg (aref b-moves bi))
+                               (b0 (omnidiff-engine--hunk-group-start-row bg))
+                               (b1 (omnidiff-engine--hunk-group-last-row bg))
+                               (bmt-b (aref bmt-bounds bi))
+                               (bmt0 (car bmt-b))
+                               (bmt1 (cdr bmt-b)))
+                          (when (or (and amt0 amt1
+                                         (omnidiff-engine--rows-overlap-p amt0 amt1 b0 b1))
+                                    (and bmt0 bmt1
+                                         (omnidiff-engine--rows-overlap-p bmt0 bmt1 a0 a1)))
+                            (let ((dist (if amt0 (abs (- amt0 b0)) 0)))
+                              (when (or (< dist best-dist)
+                                        (and (= dist best-dist)
+                                             (or (null best-bi) (< bi best-bi))))
+                                (setq best-bi bi
+                                      best-dist dist))))))))
+            (when (and (> nb-m 0) amt0 amt1)
+              (let ((bi (omnidiff-engine--lower-bound-ge bm-pmax amt0)))
+                (while (and (< bi nb-m)
+                            (<= (omnidiff-engine--hunk-group-start-row (aref b-moves bi)) amt1))
+                  (consider bi)
+                  (setq bi (1+ bi)))))
+            (when (> nb-mt 0)
+              (let ((k (omnidiff-engine--lower-bound-ge bmt-pmax a0)))
+                (while (and (< k nb-mt)
+                            (<= (car (aref bmt-bounds (aref bmt-order k))) a1))
+                  (consider (aref bmt-order k))
+                  (setq k (1+ k))))))
+          (if best-bi
+              (let* ((bg (aref b-moves best-bi))
+                     (b0 (omnidiff-engine--hunk-group-start-row bg))
+                     (b1 (omnidiff-engine--hunk-group-last-row bg)))
+                (aset b-m-used best-bi t)
+                (unless (subsumed-by-paired-edit-p a0 a1 b0 b1)
+                  (push (make-omnidiff-change-stop
+                         :side 'after
+                         :operation 'move
+                         :range (omnidiff-engine--hunk-group-range ag)
+                         :counterpart-side 'before
+                         :counterpart-range (omnidiff-engine--hunk-group-range bg)
+                         :reference-line (or (omnidiff-engine--hunk-group-reference-line ag)
+                                             (omnidiff-engine--hunk-group-reference-line bg)))
+                        stops)))
+            (unless (and amt0 amt1 (subsumed-by-paired-edit-p a0 a1 amt0 amt1))
+              (push (make-omnidiff-change-stop
+                     :side 'after
+                     :operation 'move
+                     :range (omnidiff-engine--hunk-group-range ag)
+                     :counterpart-side 'before
+                     :counterpart-range amt
+                     :reference-line (omnidiff-engine--hunk-group-reference-line ag))
+                    stops)))))
+      (dotimes (bi nb-m)
+        (unless (aref b-m-used bi)
+          (let* ((bg (aref b-moves bi))
+                 (b0 (omnidiff-engine--hunk-group-start-row bg))
+                 (b1 (omnidiff-engine--hunk-group-last-row bg))
+                 (bmt (omnidiff-engine--hunk-group-move-target bg))
+                 (bmt-b (aref bmt-bounds bi))
+                 (bmt0 (car bmt-b))
+                 (bmt1 (cdr bmt-b)))
+            (unless (and bmt0 bmt1 (subsumed-by-paired-edit-p bmt0 bmt1 b0 b1))
+              (push (make-omnidiff-change-stop
+                     :side 'before
+                     :operation 'move
+                     :range (omnidiff-engine--hunk-group-range bg)
+                     :counterpart-side 'after
+                     :counterpart-range bmt
+                     :reference-line (omnidiff-engine--hunk-group-reference-line bg))
+                    stops))))))
+    (nreverse stops)))
+
+(defun omnidiff-engine--order-change-stops (stops alignment)
+  "Sort STOPS in reading order using ALIGNMENT and assign 1-based indices."
+  (let* ((keyed (mapcar (lambda (st)
+                          (cons (omnidiff-engine-stop-sort-key st alignment) st))
+                        stops))
+         (sorted (sort keyed (lambda (x y)
+                               (omnidiff-engine-stop-key-less-p (car x) (car y)))))
+         (idx 0)
+         (result nil))
+    (dolist (entry sorted)
+      (setq idx (1+ idx))
+      (let ((stop (cdr entry)))
+        (setf (omnidiff-change-stop-index stop) idx)
+        (push stop result)))
+    (nreverse result)))
+
+(defun omnidiff-engine-build-change-stops (json-diff alignment)
+  "Build an ordered list of `omnidiff-change-stop's for JSON-DIFF and ALIGNMENT.
+Merges paired before+after edits on aligned rows into one logical stop so
+navigation does not double-stop on replacements, while keeping pure inserts
+on `after', pure deletes on `before', and moves clearly navigable."
+  (let* ((nb (length (omnidiff-line-alignment-before-to-after alignment)))
+         (na (length (omnidiff-line-alignment-after-to-before alignment)))
+         (b-anc (make-vector nb nil))
+         (a-anc (make-vector na nil)))
+    (dolist (pair (omnidiff-line-alignment-anchors alignment))
+      (when (< (car pair) nb) (aset b-anc (car pair) t))
+      (when (< (cdr pair) na) (aset a-anc (cdr pair) t)))
+    (let* ((b-split (omnidiff-engine--coalesce-side-hunks
+                     (omnidiff-json-side-hunks (omnidiff-json-diff-before json-diff))
+                     b-anc))
+           (a-split (omnidiff-engine--coalesce-side-hunks
+                     (omnidiff-json-side-hunks (omnidiff-json-diff-after json-diff))
+                     a-anc))
+           (edit-res (omnidiff-engine--pair-edit-stops
+                      (vconcat (car a-split))
+                      (vconcat (car b-split))
+                      a-anc b-anc alignment))
+           (move-stops (omnidiff-engine--pair-move-stops
+                        (vconcat (cdr a-split))
+                        (vconcat (cdr b-split))
+                        (cdr edit-res))))
+      (omnidiff-engine--order-change-stops
+       (nconc (car edit-res) move-stops)
+       alignment))))
 
 (defun omnidiff-engine-summary-label (summary)
   "Return a concise human-readable badge string for SUMMARY symbol, or nil."
@@ -1744,9 +2003,82 @@ PAINT-REINDENT-MOVES default to `omnidiff-whole-updates' and
       (setq args (nconc args (list "--paint-reindent-moves"))))
     args))
 
-(defconst omnidiff-engine--raw-byte-regexp
+(defconst omnidiff-engine-raw-byte-regexp
   (string ?\[ #x3fff80 ?- #x3fffff ?\])
   "Regexp matching Emacs raw-byte characters produced by invalid UTF-8.")
+
+;;; Shared path, formatting & Git helpers
+
+(defun omnidiff-engine-expand-repo-path (rel-path root)
+  "Expand REL-PATH under ROOT without expanding a leading `~' as HOME.
+Non-tilde absolute paths are expanded as-is."
+  (if (string-prefix-p "~" rel-path)
+      (expand-file-name (concat "./" rel-path) root)
+    (expand-file-name rel-path root)))
+
+(defun omnidiff-engine-truncate-path (path max-cols)
+  "Truncate PATH to at most MAX-COLS display columns, keeping trailing segments."
+  (let ((w (string-width path)))
+    (cond
+     ((or (<= max-cols 0) (<= w max-cols)) path)
+     ((<= max-cols 4) (truncate-string-to-width path max-cols nil nil "…"))
+     ((string-search "/" path)
+      (let* ((parts (split-string path "/"))
+             (tail (car (last parts)))
+             (rest (nreverse (butlast parts)))
+             (acc tail))
+        (while (and rest
+                    (<= (+ 2 (string-width (car rest)) 1 (string-width acc))
+                        max-cols))
+          (setq acc (concat (pop rest) "/" acc)))
+        (let ((cand (concat "…/" acc)))
+          (if (<= (string-width cand) max-cols)
+              cand
+            (truncate-string-to-width cand max-cols nil nil "…")))))
+     (t
+      (truncate-string-to-width path max-cols nil nil "…")))))
+
+(defun omnidiff-engine-pick-path-hint (&rest candidates)
+  "Return the first usable non-empty, non-`/dev/null' path in CANDIDATES."
+  (cl-find-if
+   (lambda (p)
+     (and (stringp p) (not (string-empty-p p)) (not (string= p "/dev/null"))))
+   candidates))
+
+(defun omnidiff-engine-format-bytes (bytes)
+  "Format integer byte count BYTES using IEC binary units (B, KiB, MiB, GiB).
+Negative counts (such as size deltas) retain a leading `-'."
+  (let* ((abs-b (abs bytes))
+         (sign (if (< bytes 0) "-" "")))
+    (cond
+     ((< abs-b 1024)
+      (format "%s%d B" sign abs-b))
+     ((< abs-b 1048576)
+      (format "%s%.1f KiB" sign (/ (float abs-b) 1024.0)))
+     ((< abs-b 1073741824)
+      (format "%s%.1f MiB" sign (/ (float abs-b) 1048576.0)))
+     (t
+      (format "%s%.1f GiB" sign (/ (float abs-b) 1073741824.0))))))
+
+(defun omnidiff-engine-unstaged-worktree-diff-p (command)
+  "Return non-nil when Git argv list COMMAND is an unstaged working-tree diff.
+Expects the canonical `(\"git\" \"--no-pager\" \"diff\" ...)' command form."
+  (and (consp command)
+       (proper-list-p command)
+       (equal (nth 0 command) "git")
+       (equal (nth 2 command) "diff")
+       (let ((tail (nthcdr 4 command))
+             (non-worktree nil))
+         (while (and tail (not non-worktree))
+           (let ((arg (pop tail)))
+             (cond
+              ((not (stringp arg)) (setq non-worktree t))
+              ((string= arg "--") (setq tail nil))
+              ((or (member arg '("--cached" "--staged"))
+                   (string-search ".." arg)
+                   (not (string-prefix-p "-" arg)))
+               (setq non-worktree t)))))
+         (not non-worktree))))
 
 (defun omnidiff-engine--sniff-bom-encoding (raw)
   "Return BOM encoding name for unibyte RAW bytes, or nil for UTF-8."
@@ -1804,7 +2136,7 @@ non-UTF-8 text), and normalizes CRLF (`\\r\\n') line endings to LF (`\\n')."
                    ("UTF-32BE" (omnidiff-engine--decode-utf32 raw t))
                    (_
                     (let ((decoded (decode-coding-string raw 'utf-8-unix)))
-                      (if (string-match-p omnidiff-engine--raw-byte-regexp decoded)
+                      (if (string-match-p omnidiff-engine-raw-byte-regexp decoded)
                           (decode-coding-string raw 'undecided)
                         decoded))))))
       (if (string-search "\r\n" text)
@@ -1874,68 +2206,102 @@ string on failure (falling back to signaling an error if nil)."
                       (list "--" before-path after-path)))
          (out-buf (generate-new-buffer " *omnidiff-json-stdout*"))
          (err-buf (generate-new-buffer " *omnidiff-json-stderr*"))
-         (err-proc (make-pipe-process
-                    :name "omnidiff-json-stderr"
-                    :buffer err-buf
-                    :coding 'utf-8-unix
-                    :sentinel #'ignore
-                    :noquery t)))
-    (cl-flet ((cleanup ()
-                (when (process-live-p err-proc)
-                  (delete-process err-proc))
-                (when (buffer-live-p out-buf)
-                  (kill-buffer out-buf))
-                (when (buffer-live-p err-buf)
-                  (kill-buffer err-buf))))
-      (condition-case err
-          (make-process
-           :name "omnidiff-json"
-           :buffer out-buf
-           :command (cons bin args)
-           :stderr err-proc
-           :connection-type 'pipe
-           :coding 'utf-8-unix
-           :noquery t
-           :sentinel
-           (lambda (proc _event)
-             (unless (process-live-p proc)
-               (if (and (eq (process-status proc) 'exit)
-                        (zerop (process-exit-status proc)))
-                   (let ((raw (when (buffer-live-p out-buf)
-                                (with-current-buffer out-buf (buffer-string)))))
+         (err-proc nil)
+         (main-proc nil)
+         (main-done nil)
+         (err-done nil)
+         (finished nil))
+    (cl-labels
+        ((cleanup ()
+           (when (and err-proc (process-live-p err-proc))
+             (set-process-sentinel err-proc #'ignore)
+             (delete-process err-proc))
+           (when (buffer-live-p out-buf)
+             (kill-buffer out-buf))
+           (when (buffer-live-p err-buf)
+             (kill-buffer err-buf)))
+         (maybe-finish ()
+           (when (and (not finished) main-done)
+             (let ((ok (and main-proc
+                            (eq (process-status main-proc) 'exit)
+                            (zerop (process-exit-status main-proc)))))
+               (when (or ok err-done (null err-proc) (not (process-live-p err-proc)))
+                 (setq finished t)
+                 (if ok
+                     (let ((raw (when (buffer-live-p out-buf)
+                                  (with-current-buffer out-buf (buffer-string)))))
+                       (cleanup)
+                       (condition-case parse-err
+                           (funcall callback (omnidiff-engine-parse-json (or raw "")))
+                         (error
+                          (if error-callback
+                              (funcall error-callback (error-message-string parse-err))
+                            (signal (car parse-err) (cdr parse-err))))))
+                   (let* ((stderr (string-trim
+                                   (if (buffer-live-p err-buf)
+                                       (with-current-buffer err-buf (buffer-string))
+                                     "")))
+                          (msg (format "omnidiff exited with %s (%s)%s"
+                                       (if main-proc (process-exit-status main-proc) "?")
+                                       (if main-proc (process-status main-proc) 'unknown)
+                                       (if (string-empty-p stderr) "" (concat ": " stderr)))))
                      (cleanup)
-                     (condition-case parse-err
-                         (funcall callback (omnidiff-engine-parse-json (or raw "")))
-                       (error
-                        (if error-callback
-                            (funcall error-callback (error-message-string parse-err))
-                          (signal (car parse-err) (cdr parse-err))))))
-                 (when (process-live-p err-proc)
-                   (accept-process-output err-proc 0.05))
-                 (let* ((stderr (string-trim
-                                 (if (buffer-live-p err-buf)
-                                     (with-current-buffer err-buf (buffer-string))
-                                   "")))
-                        (msg (format "omnidiff exited with %s (%s)%s"
-                                     (process-exit-status proc)
-                                     (process-status proc)
-                                     (if (string-empty-p stderr) "" (concat ": " stderr)))))
-                   (cleanup)
-                   (if error-callback
-                       (funcall error-callback msg)
-                     (error "%s" msg)))))))
+                     (if error-callback
+                         (funcall error-callback msg)
+                       (error "%s" msg)))))))))
+      (condition-case err
+          (progn
+            (setq err-proc
+                  (make-pipe-process
+                   :name "omnidiff-json-stderr"
+                   :buffer err-buf
+                   :coding 'utf-8-unix
+                   :noquery t
+                   :sentinel
+                   (lambda (proc _event)
+                     (unless (process-live-p proc)
+                       (setq err-done t)
+                       (maybe-finish)))))
+            (setq main-proc
+                  (make-process
+                   :name "omnidiff-json"
+                   :buffer out-buf
+                   :command (cons bin args)
+                   :stderr err-proc
+                   :connection-type 'pipe
+                   :coding 'utf-8-unix
+                   :noquery t
+                   :sentinel
+                   (lambda (proc _event)
+                     (unless (process-live-p proc)
+                       (setq main-proc proc
+                             main-done t)
+                       (maybe-finish)))))
+            main-proc)
         (error
+         (setq finished t)
          (cleanup)
          (signal (car err) (cdr err)))))))
 
-(defun omnidiff-engine--sanitize-filename-hint (hint)
-  "Extract a safe single filename component from HINT preserving extension."
-  (let* ((stripped (replace-regexp-in-string "<[0-9]+>\\'" "" (or hint "")))
-         (base (file-name-nondirectory stripped))
-         (clean (replace-regexp-in-string "[/\\\x00]" "_" base)))
+(defun omnidiff-engine-sanitize-filename-hint (name &optional fallback)
+  "Extract a safe single filename component from NAME preserving extension.
+Strips directory prefixes (both `/' and `\\\\') and Emacs `<N>' uniquify
+suffixes, replaces control, non-ASCII, and special characters with `_',
+guards against `.'/`..' and leading `~', and falls back to FALLBACK
+(default `\"buffer\"') when empty."
+  (let* ((case-fold-search nil)
+         (default (or fallback "buffer"))
+         (raw (if (stringp name) name ""))
+         (stripped (replace-regexp-in-string "<[0-9]+>\\'" "" raw))
+         (norm (string-replace "\\" "/" stripped))
+         (base (file-name-nondirectory norm))
+         (clean (replace-regexp-in-string "[^A-Za-z0-9._+-]" "_" base)))
     (cond
-     ((or (string-empty-p clean) (string= clean ".") (string= clean ".."))
-      "buffer")
+     ((or (string-empty-p clean)
+          (string= clean ".")
+          (string= clean "..")
+          (string-match-p "\\`_+\\'" clean))
+      default)
      ((string-prefix-p "~" clean)
       (concat "_" clean))
      (t clean))))
@@ -1951,7 +2317,7 @@ Returns the written file path."
   (let* ((raw-hint (or (and (stringp name-hint) (not (string-empty-p name-hint)) name-hint)
                        (buffer-file-name buffer)
                        (buffer-name buffer)))
-         (base (omnidiff-engine--sanitize-filename-hint raw-hint))
+         (base (omnidiff-engine-sanitize-filename-hint raw-hint))
          (ext (file-name-extension base t))
          (dest (cond
                 (tmpdir

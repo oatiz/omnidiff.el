@@ -55,6 +55,8 @@
 (defvar omnidiff--layout)
 (defvar omnidiff--command)
 (defvar omnidiff-default-layout)
+(defvar omnidiff--sbs-resize-timer)
+(declare-function image-size "image.c" (spec &optional pixels frame))
 (declare-function omnidiff-toggle-fold "omnidiff" ())
 (declare-function omnidiff-cycle-layout "omnidiff" (&optional reset-pinned-p))
 (declare-function omnidiff-open-in-tui "omnidiff" ())
@@ -75,19 +77,6 @@ Automatically falls back to `side-by-side' when image aspect ratios differ."
                  (const :tag "Onion skin overlay" onion)
                  (const :tag "Blink (A/B toggle)" blink)
                  (const :tag "Stacked (vertical)" stacked))
-  :group 'omnidiff)
-
-(defcustom omnidiff-image-diff-backend 'auto
-  "Backend used for `diff' pixel-highlight mode.
-- `auto': Use ImageMagick (`magick' or `compare') asynchronously when
-  available, displaying the built-in SVG color-delta preview immediately
-  while the pixel mask computes, and falling back to `svg' when ImageMagick
-  is absent.
-- `magick': Prefer ImageMagick (`magick' / `compare'), falling back to `svg'.
-- `svg': Pure Emacs built-in `librsvg' RGB+alpha difference preview."
-  :type '(choice (const :tag "Auto (ImageMagick mask with SVG delta preview)" auto)
-                 (const :tag "ImageMagick pixel mask" magick)
-                 (const :tag "Built-in SVG delta preview" svg))
   :group 'omnidiff)
 
 (defcustom omnidiff-image-diff-style 'spotlight-sbs
@@ -155,20 +144,9 @@ Additional image cards render a compact summary until loaded with `L'."
                  (integer :tag "Pixels"))
   :group 'omnidiff)
 
-(defcustom omnidiff-image-swipe-step 0.05
-  "Coarse increment for adjusting the swipe split ratio with `h'/`l'."
-  :type 'float
-  :group 'omnidiff)
-
-(defcustom omnidiff-image-onion-step 0.1
-  "Increment for adjusting onion-skin opacity with `h'/`l'.
-Divides 1.0 evenly so stepping away from 50% always returns cleanly to 50%."
-  :type 'float
-  :group 'omnidiff)
-
 (defcustom omnidiff-image-external-viewer nil
   "Optional command string or argv list used by `omnidiff-image-open-external'.
-When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
+When nil, uses `open' on macOS or `xdg-open' when available."
   :type '(choice (const :tag "System default" nil)
                  (string :tag "Executable name or path")
                  (repeat :tag "Command argv" string))
@@ -196,6 +174,16 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
   (deferred nil :type boolean)
   (force-load nil :type boolean))
 
+(cl-defstruct (omnidiff-image--ctx (:copier nil))
+  "Resolved display & capability context for an image diff card."
+  status ; tty | deferred | too-large | dual | after-only | before-only | lfs-pointer | unsupported | missing
+  file pic state card-key repo-dir svg-p force-p
+  b-bytes b-key b-type b-mime b-lfs b-avail
+  a-bytes a-key a-type a-mime a-lfs a-avail
+  has-alpha backdrop dual-expected
+  bw bh b-kind aw ah a-kind
+  compat svg-embed-p magick-p avail-modes)
+
 (defconst omnidiff-image--svg-embeddable-mimes
   '("image/png" "image/jpeg" "image/gif" "image/webp" "image/svg+xml")
   "MIME types embeddable inside `librsvg' `<image href=data:...>' elements.")
@@ -216,9 +204,15 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
   '(0 1 2 5 10 20)
   "Ordered percentage fuzz tolerances for ImageMagick `compare'.")
 
-(defconst omnidiff-image--diff-styles
-  '(spotlight-sbs spotlight mask delta)
-  "Ordered visual styles cycled by `omnidiff-image-cycle-diff-style'.")
+(defconst omnidiff-image--swipe-step 0.05
+  "Coarse increment for adjusting the swipe split ratio with `h'/`l'.")
+
+(defconst omnidiff-image--onion-step 0.1
+  "Increment for adjusting onion-skin opacity with `h'/`l'.
+Divides 1.0 evenly so stepping away from 50% always returns cleanly to 50%.")
+
+(defconst omnidiff-image--magick-cache-per-card-limit 2
+  "Maximum number of cached ImageMagick diff outputs retained per image card.")
 
 (defconst omnidiff-image--tty-blocks
   " ▏▎▍▌▋▊▉█"
@@ -228,7 +222,7 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
   "Temporary directories created for external image viewers, removed on exit.")
 
 (defvar-local omnidiff-image--states nil
-  "Hash table mapping file path key to `omnidiff-image--state'.")
+  "Hash table mapping revision-aware card key to `omnidiff-image--state'.")
 
 (defvar-local omnidiff-image--bytes-cache nil
   "Hash table caching raw unibyte image data by source key.")
@@ -239,14 +233,14 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
 (defvar-local omnidiff-image--img-cache nil
   "Hash table caching Emacs image descriptors for O(1) slice/blink reuse.")
 
-(defvar-local omnidiff-image--onion-descs nil
-  "Hash table mapping file key to the latest onion descriptor for bounded reuse.")
+(defvar-local omnidiff-image--slot-descs nil
+  "Hash table mapping `(CARD-KEY . SLOT)' to `(DESC-KEY . IMG)' for bounded reuse.")
 
 (defvar-local omnidiff-image--magick-cache nil
   "Hash table caching async ImageMagick diff PNG bytes (or `pending'/`failed').")
 
-(defvar-local omnidiff-image--descriptors nil
-  "Image descriptors created for the current buffer, flushed on cleanup.")
+(defvar-local omnidiff-image--magick-card-keys nil
+  "Hash table mapping card key to MRU list of `--magick-cache' keys.")
 
 (defvar-local omnidiff-image--workers nil
   "List of `(PROC . TMPDIR)' for active async ImageMagick diff workers.")
@@ -307,15 +301,28 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
     (setq omnidiff-image--b64-cache (make-hash-table :test #'equal)))
   (unless omnidiff-image--img-cache
     (setq omnidiff-image--img-cache (make-hash-table :test #'equal)))
-  (unless omnidiff-image--onion-descs
-    (setq omnidiff-image--onion-descs (make-hash-table :test #'equal)))
+  (unless omnidiff-image--slot-descs
+    (setq omnidiff-image--slot-descs (make-hash-table :test #'equal)))
   (unless omnidiff-image--magick-cache
-    (setq omnidiff-image--magick-cache (make-hash-table :test #'equal))))
+    (setq omnidiff-image--magick-cache (make-hash-table :test #'equal)))
+  (unless omnidiff-image--magick-card-keys
+    (setq omnidiff-image--magick-card-keys (make-hash-table :test #'equal))))
+
+(defun omnidiff-image--card-key (file)
+  "Return revision-aware cache/state key for `omnidiff-file' FILE."
+  (let ((target (omnidiff-file-target-path file))
+        (old-oid (omnidiff-file-old-oid file))
+        (new-oid (omnidiff-file-new-oid file)))
+    (if (or old-oid new-oid)
+        (list target old-oid new-oid)
+      (list target
+            (omnidiff-file-before-disk-path file)
+            (omnidiff-file-after-disk-path file)))))
 
 (defun omnidiff-image--state-for (file)
   "Return or create the `omnidiff-image--state' for `omnidiff-file' FILE."
   (omnidiff-image--ensure-caches)
-  (let ((key (omnidiff-file-target-path file)))
+  (let ((key (omnidiff-image--card-key file)))
     (or (gethash key omnidiff-image--states)
         (puthash key (make-omnidiff-image--state) omnidiff-image--states))))
 
@@ -326,8 +333,10 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
     (dolist (entry workers)
       (let ((proc (car entry))
             (dir (cdr entry)))
-        (when (and proc (process-live-p proc))
-          (delete-process proc))
+        (when proc
+          (set-process-sentinel proc #'ignore)
+          (when (process-live-p proc)
+            (delete-process proc)))
         (when (and dir (file-directory-p dir))
           (ignore-errors (delete-directory dir t)))))))
 
@@ -339,41 +348,98 @@ When nil, uses `open' on macOS, `xdg-open' on Linux/BSD, or `start' on Windows."
 
 (defun omnidiff-image--flush-descriptors ()
   "Flush cached Emacs image descriptors registered by the current buffer."
-  (let ((descs omnidiff-image--descriptors))
-    (setq omnidiff-image--descriptors nil)
-    (when (and descs (fboundp 'image-flush))
-      (dolist (img descs)
-        (ignore-errors (image-flush img)))))
-  (when omnidiff-image--onion-descs
-    (maphash (lambda (_k img)
-               (when (and img (fboundp 'image-flush))
-                 (ignore-errors (image-flush img))))
-             omnidiff-image--onion-descs)
-    (clrhash omnidiff-image--onion-descs))
   (when omnidiff-image--img-cache
-    (clrhash omnidiff-image--img-cache)))
+    (when (fboundp 'image-flush)
+      (maphash (lambda (_k img)
+                 (when img
+                   (ignore-errors (image-flush img))))
+               omnidiff-image--img-cache))
+    (clrhash omnidiff-image--img-cache))
+  (when omnidiff-image--slot-descs
+    (when (fboundp 'image-flush)
+      (maphash (lambda (_k entry)
+                 (when-let* ((img (cdr entry)))
+                   (ignore-errors (image-flush img))))
+               omnidiff-image--slot-descs))
+    (clrhash omnidiff-image--slot-descs)))
 
-(defun omnidiff-image-cleanup (&optional keep-bytes-p keep-states-p)
+(defun omnidiff-image--cached-slot-desc (card-key slot desc-key make-fn)
+  "Return cached descriptor for `(CARD-KEY . SLOT)' matching DESC-KEY.
+When DESC-KEY changes, invokes MAKE-FN to build a fresh descriptor, caches
+`(DESC-KEY . IMG)', and flushes the replaced descriptor via `image-flush'
+only when no remaining cached slot or image descriptor is `equal' to it."
+  (omnidiff-image--ensure-caches)
+  (let* ((slot-key (cons card-key slot))
+         (entry (gethash slot-key omnidiff-image--slot-descs)))
+    (if (and entry (equal (car entry) desc-key) (cdr entry))
+        (cdr entry)
+      (let ((img (funcall make-fn))
+            (old-img (cdr entry)))
+        (when img
+          (puthash slot-key (cons desc-key img) omnidiff-image--slot-descs)
+          (when (and old-img
+                     (not (equal old-img img))
+                     (fboundp 'image-flush)
+                     (not (cl-block found
+                            (maphash (lambda (_k e)
+                                       (when (equal (cdr e) old-img)
+                                         (cl-return-from found t)))
+                                     omnidiff-image--slot-descs)
+                            (maphash (lambda (_k cached)
+                                       (when (equal cached old-img)
+                                         (cl-return-from found t)))
+                                     omnidiff-image--img-cache)
+                            nil)))
+            (ignore-errors (image-flush old-img))))
+        img))))
+
+(defun omnidiff-image--put-magick-cache (card-key diff-key value)
+  "Store VALUE for DIFF-KEY under bounded per-card ImageMagick cache CARD-KEY."
+  (omnidiff-image--ensure-caches)
+  (puthash diff-key value omnidiff-image--magick-cache)
+  (when card-key
+    (let* ((prev (delete diff-key (gethash card-key omnidiff-image--magick-card-keys)))
+           (updated (cons diff-key prev)))
+      (when (> (length updated) omnidiff-image--magick-cache-per-card-limit)
+        (let* ((tail-cell (nthcdr (1- omnidiff-image--magick-cache-per-card-limit)
+                                  updated))
+               (evict (cdr tail-cell)))
+          (setcdr tail-cell nil)
+          (dolist (old-key evict)
+            (remhash old-key omnidiff-image--magick-cache))))
+      (puthash card-key updated omnidiff-image--magick-card-keys)))
+  value)
+
+(defun omnidiff-image--clear-failed-magick-cache ()
+  "Drop transient `failed' markers from `omnidiff-image--magick-cache'."
+  (when omnidiff-image--magick-cache
+    (let ((failed nil))
+      (maphash (lambda (k v)
+                 (when (eq v 'failed) (push k failed)))
+               omnidiff-image--magick-cache)
+      (dolist (k failed)
+        (remhash k omnidiff-image--magick-cache)))))
+
+(defun omnidiff-image-cleanup (&optional preserve-states-p)
   "Release image workers, timers, descriptors, and caches for current buffer.
-When KEEP-BYTES-P is non-nil, keep decoded blob bytes and per-file states.
-When KEEP-STATES-P is non-nil, keep per-file interactive states while
+When PRESERVE-STATES-P is non-nil, keep per-file interactive states while
 flushing bytes, descriptors, and ImageMagick caches (used on refresh)."
   (omnidiff-image--cancel-workers)
   (omnidiff-image--cancel-resize-timer)
   (omnidiff-image--flush-descriptors)
-  (unless keep-bytes-p
-    (when omnidiff-image--bytes-cache (clrhash omnidiff-image--bytes-cache))
-    (when omnidiff-image--b64-cache (clrhash omnidiff-image--b64-cache))
-    (when omnidiff-image--magick-cache (clrhash omnidiff-image--magick-cache))
-    (unless keep-states-p
-      (when omnidiff-image--states (clrhash omnidiff-image--states)))))
+  (when omnidiff-image--bytes-cache (clrhash omnidiff-image--bytes-cache))
+  (when omnidiff-image--b64-cache (clrhash omnidiff-image--b64-cache))
+  (when omnidiff-image--magick-cache (clrhash omnidiff-image--magick-cache))
+  (when omnidiff-image--magick-card-keys (clrhash omnidiff-image--magick-card-keys))
+  (unless preserve-states-p
+    (when omnidiff-image--states (clrhash omnidiff-image--states))))
 
 (defun omnidiff-image-prune-states (files)
-  "Drop saved states for paths absent from `omnidiff-file' list FILES."
+  "Drop saved states for cards absent from `omnidiff-file' list FILES."
   (when omnidiff-image--states
     (let ((live (make-hash-table :test #'equal)))
       (dolist (f files)
-        (puthash (omnidiff-file-target-path f) t live))
+        (puthash (omnidiff-image--card-key f) t live))
       (let ((stale nil))
         (maphash (lambda (k _v)
                    (unless (gethash k live)
@@ -397,6 +463,7 @@ when FORCE-P is non-nil, resets every card."
 (defun omnidiff-image-begin-render ()
   "Reset per-render counters before rendering a buffer."
   (omnidiff-image--ensure-caches)
+  (omnidiff-image--cancel-resize-timer)
   (setq omnidiff-image--render-auto-count 0
         omnidiff-image--last-viewport-w (car (omnidiff-image--viewport-px))))
 
@@ -437,7 +504,7 @@ when FORCE-P is non-nil, resets every card."
 
 (defun omnidiff-image-file-picture (file)
   "Return `omnidiff-picture' for FILE, or synthetic SVG preview, or nil."
-  (or (omnidiff-file-picture file)
+  (or (omnidiff-engine-file-picture file)
       (when (and omnidiff-image-preview-svg
                  (or (omnidiff-image--svg-path-p (omnidiff-file-target-path file))
                      (omnidiff-image--svg-path-p (omnidiff-file-path file))))
@@ -449,18 +516,6 @@ when FORCE-P is non-nil, resets every card."
                     (make-omnidiff-picture-info :format "SVG"))
            :comparison (if (memq st '(added deleted)) 'one-sided 'svg)
            :svg-p t)))))
-
-(defun omnidiff-image-format-bytes (n)
-  "Format byte count N as a concise human-readable string."
-  (let ((abs-n (abs n))
-        (sign (if (< n 0) "-" "")))
-    (cond
-     ((>= abs-n (* 1024 1024))
-      (format "%s%.1f MB" sign (/ (float abs-n) (* 1024.0 1024.0))))
-     ((>= abs-n 1024)
-      (format "%s%.1f KB" sign (/ (float abs-n) 1024.0)))
-     (t
-      (format "%s%d B" sign abs-n)))))
 
 (defun omnidiff-image--format-int-grouped (n)
   "Format non-negative integer N with thousands separators."
@@ -482,15 +537,15 @@ when FORCE-P is non-nil, resets every card."
      ((> before-bytes 0)
       (format "%s%s, %+.1f%%"
               (if (> delta 0) "+" "")
-              (omnidiff-image-format-bytes delta)
+              (omnidiff-engine-format-bytes delta)
               (* 100.0 (/ (float delta) (float before-bytes)))))
      (t
-      (format "%s%s" (if (> delta 0) "+" "") (omnidiff-image-format-bytes delta))))))
+      (format "%s%s" (if (> delta 0) "+" "") (omnidiff-engine-format-bytes delta))))))
 
 (defun omnidiff-image-header-stats (file)
   "Return list of propertized stat fragments for FILE's header, or nil.
 Returns nil for SVG files that already display text line-diff counters."
-  (when-let* ((pic (omnidiff-file-picture file)))
+  (when-let* ((pic (omnidiff-engine-file-picture file)))
     (unless (omnidiff-picture-svg-p pic)
       (cl-flet ((fmt-side (info)
                   (let ((fmt (omnidiff-picture-info-format info))
@@ -577,93 +632,21 @@ Returns nil for SVG files that already display text line-diff counters."
                     (when (or (> b-sz 0) (> a-sz 0))
                       (let ((delta (- a-sz b-sz)))
                         (propertize (if (= delta 0)
-                                        (omnidiff-image-format-bytes a-sz)
+                                        (omnidiff-engine-format-bytes a-sz)
                                       (format "%s%s"
                                               (if (> delta 0) "+" "")
-                                              (omnidiff-image-format-bytes delta)))
+                                              (omnidiff-engine-format-bytes delta)))
                                     'face 'omnidiff-stat-index)))))
                  ((and a (> (omnidiff-picture-info-bytes a) 0))
-                  (propertize (omnidiff-image-format-bytes (omnidiff-picture-info-bytes a))
+                  (propertize (omnidiff-engine-format-bytes (omnidiff-picture-info-bytes a))
                               'face 'omnidiff-stat-added))
                  ((and b (> (omnidiff-picture-info-bytes b) 0))
-                  (propertize (omnidiff-image-format-bytes (omnidiff-picture-info-bytes b))
+                  (propertize (omnidiff-engine-format-bytes (omnidiff-picture-info-bytes b))
                               'face 'omnidiff-stat-removed)))))
           (delq nil
                 (list (when fmt-dim (propertize fmt-dim 'face 'omnidiff-stat-index))
                       delta-badge
                       size-badge)))))))
-
-(defun omnidiff-image-hunk-summary (pic)
-  "Build concise hunk header title and metadata text for `omnidiff-picture' PIC.
-Return `(RANGE-LABEL . META-TEXT)' for the hunk header strip."
-  (if (omnidiff-picture-svg-p pic)
-      (cons "SVG preview" nil)
-    (cl-flet ((fmt-one (info)
-                (let* ((fmt (omnidiff-picture-info-format info))
-                       (w (omnidiff-picture-info-width info))
-                       (h (omnidiff-picture-info-height info))
-                       (col (omnidiff-picture-info-color info))
-                       (sz (omnidiff-picture-info-bytes info))
-                       (head (string-join
-                              (delq nil
-                                    (list (unless (string-empty-p fmt) fmt)
-                                          (when (and (> w 0) (> h 0))
-                                            (format "%d×%d" w h))
-                                          (when (and (stringp col)
-                                                     (not (string-empty-p col)))
-                                            col)))
-                              " ")))
-                  (string-join
-                   (delq nil
-                         (list (unless (string-empty-p head) head)
-                               (when (> sz 0)
-                                 (omnidiff-image-format-bytes sz))))
-                   " · "))))
-      (let* ((b (omnidiff-picture-before pic))
-             (a (omnidiff-picture-after pic))
-             (comp (omnidiff-picture-comparison pic))
-             (pct (omnidiff-picture-changed-pct pic))
-             (regions (omnidiff-picture-region-count pic))
-             (label (cond
-                     ((and b a) "Image diff")
-                     (a "New image")
-                     (t "Deleted image")))
-             (parts
-              (delq nil
-                    (list
-                     (cond
-                      ((and b a)
-                       (when (or (> (omnidiff-picture-info-bytes b) 0)
-                                 (> (omnidiff-picture-info-bytes a) 0))
-                         (format "%s → %s (%s)"
-                                 (omnidiff-image-format-bytes (omnidiff-picture-info-bytes b))
-                                 (omnidiff-image-format-bytes (omnidiff-picture-info-bytes a))
-                                 (omnidiff-image--format-size-delta
-                                  (omnidiff-picture-info-bytes b)
-                                  (omnidiff-picture-info-bytes a)))))
-                      (a (let ((s (fmt-one a)))
-                           (unless (string-empty-p s) s)))
-                      (b (let ((s (fmt-one b)))
-                           (unless (string-empty-p s) s))))
-                     (pcase comp
-                       ('pixels
-                        (format "%.2f%% pixels changed (%s %s)"
-                                (or pct 0.0)
-                                (omnidiff-image--format-int-grouped regions)
-                                (if (= regions 1) "region" "regions")))
-                       ('identical "no pixel changed")
-                       ('resized "resized (different aspect ratio)")
-                       ('resized-scaled
-                        (format "resized (same aspect) · %.2f%% changed" (or pct 0.0)))
-                       ('unknown
-                        (let ((raw (omnidiff-picture-raw-comparison pic)))
-                          (if (and (stringp raw)
-                                   (not (string-empty-p raw))
-                                   (not (string= raw "unknown")))
-                              raw
-                            "pixel comparison unavailable")))
-                       (_ nil))))))
-        (cons label (when parts (string-join parts " · ")))))))
 
 ;;; Image type detection, alpha & SVG dimension parsing
 
@@ -671,6 +654,8 @@ Return `(RANGE-LABEL . META-TEXT)' for the hunk header strip."
   "Detect `(IMAGE-TYPE . MIME-STRING)' from unibyte BYTES and optional PATH."
   (when (and (stringp bytes) (> (length bytes) 0))
     (cond
+     ((omnidiff-image-lfs-pointer-p bytes)
+      '(lfs-pointer . nil))
      ((string-prefix-p omnidiff-image--png-magic bytes)
       '(png . "image/png"))
      ((and (>= (length bytes) 3)
@@ -746,12 +731,12 @@ KIND is `intrinsic' (explicit width/height) or `viewbox'."
         (let ((tag (match-string 0 head))
               (vw nil) (vh nil)
               (iw nil) (ih nil))
-          (when (string-match "\\bwidth=[\"']\\([0-9.]+\\)\\(?:px\\)?[\"']" tag)
+          (when (string-match "[ \t\n\r]width=[\"']\\([0-9.]+\\)\\(?:px\\)?[\"']" tag)
             (setq iw (string-to-number (match-string 1 tag))))
-          (when (string-match "\\bheight=[\"']\\([0-9.]+\\)\\(?:px\\)?[\"']" tag)
+          (when (string-match "[ \t\n\r]height=[\"']\\([0-9.]+\\)\\(?:px\\)?[\"']" tag)
             (setq ih (string-to-number (match-string 1 tag))))
           (when (string-match
-                 "viewBox=[\"'][ \t\n\r]*[-0-9.]+[ \t\n\r,]+[-0-9.]+[ \t\n\r,]+\\([0-9.]+\\)[ \t\n\r,]+\\([0-9.]+\\)"
+                 "[ \t\n\r]viewBox=[\"'][ \t\n\r]*[-0-9.]+[ \t\n\r,]+[-0-9.]+[ \t\n\r,]+\\([0-9.]+\\)[ \t\n\r,]+\\([0-9.]+\\)"
                  tag)
             (setq vw (string-to-number (match-string 1 tag))
                   vh (string-to-number (match-string 2 tag))))
@@ -762,132 +747,32 @@ KIND is `intrinsic' (explicit width/height) or `viewbox'."
             (list (float vw) (float vh) 'viewbox))
            (t nil)))))))
 
-(defun omnidiff-image--probe-bytes-dims (bytes type)
-  "Probe `(WIDTH . HEIGHT)' from header BYTES of image TYPE, or nil."
-  (when (and (stringp bytes) (> (length bytes) 0))
-    (let ((len (length bytes)))
-      (cl-flet ((u16be (i) (logior (ash (aref bytes i) 8) (aref bytes (1+ i))))
-                (u16le (i) (logior (aref bytes i) (ash (aref bytes (1+ i)) 8)))
-                (u32be (i) (logior (ash (aref bytes i) 24)
-                                   (ash (aref bytes (+ i 1)) 16)
-                                   (ash (aref bytes (+ i 2)) 8)
-                                   (aref bytes (+ i 3))))
-                (u32le (i) (logior (aref bytes i)
-                                   (ash (aref bytes (+ i 1)) 8)
-                                   (ash (aref bytes (+ i 2)) 16)
-                                   (ash (aref bytes (+ i 3)) 24))))
-        (pcase type
-          ('png
-           (when (and (>= len 24)
-                      (string-prefix-p omnidiff-image--png-magic bytes)
-                      (string= (substring bytes 12 16) "IHDR"))
-             (let ((w (u32be 16))
-                   (h (u32be 20)))
-               (when (and (> w 0) (> h 0))
-                 (cons w h)))))
-          ('gif
-           (when (and (>= len 10)
-                      (or (string-prefix-p "GIF87a" bytes)
-                          (string-prefix-p "GIF89a" bytes)))
-             (let ((w (u16le 6))
-                   (h (u16le 8)))
-               (when (and (> w 0) (> h 0))
-                 (cons w h)))))
-          ('bmp
-           (when (and (>= len 22) (string-prefix-p "BM" bytes))
-             (let ((dib (u32le 14)))
-               (cond
-                ((and (>= dib 40) (>= len 26))
-                 (let* ((rw (u32le 18))
-                        (rh (u32le 22))
-                        (w (abs (if (>= rw #x80000000) (- rw #x100000000) rw)))
-                        (h (abs (if (>= rh #x80000000) (- rh #x100000000) rh))))
-                   (when (and (> w 0) (> h 0))
-                     (cons w h))))
-                ((= dib 12)
-                 (let ((w (u16le 18))
-                       (h (u16le 20)))
-                   (when (and (> w 0) (> h 0))
-                     (cons w h))))))))
-          ('webp
-           (when (and (>= len 25)
-                      (string-prefix-p "RIFF" bytes)
-                      (string= (substring bytes 8 12) "WEBP"))
-             (let ((chunk (substring bytes 12 16)))
-               (cond
-                ((and (string= chunk "VP8X") (>= len 30))
-                 (let ((w (1+ (logior (aref bytes 24)
-                                      (ash (aref bytes 25) 8)
-                                      (ash (aref bytes 26) 16))))
-                       (h (1+ (logior (aref bytes 27)
-                                      (ash (aref bytes 28) 8)
-                                      (ash (aref bytes 29) 16)))))
-                   (when (and (> w 0) (> h 0))
-                     (cons w h))))
-                ((and (string= chunk "VP8 ") (>= len 30)
-                      (= (aref bytes 23) #x9d)
-                      (= (aref bytes 24) #x01)
-                      (= (aref bytes 25) #x2a))
-                 (let ((w (logand (u16le 26) #x3fff))
-                       (h (logand (u16le 28) #x3fff)))
-                   (when (and (> w 0) (> h 0))
-                     (cons w h))))
-                ((and (string= chunk "VP8L") (= (aref bytes 20) #x2f))
-                 (let* ((bits (u32le 21))
-                        (w (1+ (logand bits #x3fff)))
-                        (h (1+ (logand (ash bits -14) #x3fff))))
-                   (when (and (> w 0) (> h 0))
-                     (cons w h))))))))
-          ('jpeg
-           (when (and (>= len 4) (= (aref bytes 0) #xff) (= (aref bytes 1) #xd8))
-             (let ((pos 2)
-                   (found nil))
-               (while (and (< pos len) (not found))
-                 (while (and (< pos len) (/= (aref bytes pos) #xff))
-                   (setq pos (1+ pos)))
-                 (while (and (< pos len) (= (aref bytes pos) #xff))
-                   (setq pos (1+ pos)))
-                 (when (< pos len)
-                   (let ((m (aref bytes pos)))
-                     (setq pos (1+ pos))
-                     (cond
-                      ((or (= m #xd9) (= m #xda))
-                       (setq pos len))
-                      ((or (= m #x01) (and (>= m #xd0) (<= m #xd8)))
-                       nil)
-                      ((<= (+ pos 2) len)
-                       (let ((seg-len (u16be pos)))
-                         (if (and (memq m '(#xc0 #xc1 #xc2 #xc3 #xc5 #xc6 #xc7
-                                                 #xc9 #xca #xcb #xcd #xce #xcf))
-                                  (<= (+ pos 7) len))
-                             (let ((h (u16be (+ pos 3)))
-                                   (w (u16be (+ pos 5))))
-                               (when (and (> w 0) (> h 0))
-                                 (setq found (cons w h)))
-                               (setq pos len))
-                           (setq pos (if (>= seg-len 2) (+ pos seg-len) len)))))
-                      (t (setq pos len))))))
-               found)))
-          ('svg
-           (when-let* ((d (omnidiff-image--parse-svg-dimensions bytes)))
-             (cons (round (nth 0 d)) (round (nth 1 d)))))
-          (_ nil))))))
-
 (defun omnidiff-image--resolve-dims (info bytes type)
   "Resolve `(WIDTH HEIGHT KIND)' for one image side from INFO or BYTES.
 KIND is `pixels', `intrinsic', `viewbox', or `unknown'."
-  (cond
-   ((and info (> (omnidiff-picture-info-width info) 0)
-         (> (omnidiff-picture-info-height info) 0))
-    (list (omnidiff-picture-info-width info)
-          (omnidiff-picture-info-height info)
-          'pixels))
-   ((eq type 'svg)
-    (or (omnidiff-image--parse-svg-dimensions bytes)
-        '(400 300 unknown)))
-   ((when-let* ((dims (and bytes type (omnidiff-image--probe-bytes-dims bytes type))))
-      (list (car dims) (cdr dims) 'pixels)))
-   (t '(400 300 unknown))))
+  (or (when (and info (> (omnidiff-picture-info-width info) 0)
+                 (> (omnidiff-picture-info-height info) 0))
+        (list (omnidiff-picture-info-width info)
+              (omnidiff-picture-info-height info)
+              'pixels))
+      (when (eq type 'svg)
+        (omnidiff-image--parse-svg-dimensions bytes))
+      (when (and bytes type
+                 (omnidiff-image--display-graphic-p)
+                 (image-type-available-p type))
+        (let* ((win (or (get-buffer-window (current-buffer) t) (selected-window)))
+               (frame (if win (window-frame win) (selected-frame)))
+               (img (and (display-graphic-p frame)
+                         (ignore-errors (create-image bytes type t)))))
+          (when img
+            (unwind-protect
+                (let ((sz (and (fboundp 'image-size)
+                               (ignore-errors (image-size img t frame)))))
+                  (when (and (consp sz) (> (car sz) 0) (> (cdr sz) 0))
+                    (list (round (car sz)) (round (cdr sz)) 'pixels)))
+              (when (fboundp 'image-flush)
+                (ignore-errors (image-flush img)))))))
+      '(400 300 unknown)))
 
 (defun omnidiff-image--format-dim-label (w h kind disp-w)
   "Format dimension and scale percentage label for W×H (KIND) drawn at DISP-W."
@@ -903,12 +788,6 @@ KIND is `pixels', `intrinsic', `viewbox', or `unknown'."
 
 ;;; Blob loading & batch prefetch
 
-(defun omnidiff-image--expand-path (rel dir)
-  "Expand repo-relative REL under DIR without treating leading `~' as HOME."
-  (if (string-prefix-p "~" rel)
-      (expand-file-name (concat "./" rel) dir)
-    (expand-file-name rel dir)))
-
 (defun omnidiff-image--valid-disk-path (path)
   "Return PATH when it is a non-empty existing regular file (not `/dev/null')."
   (when (and (stringp path)
@@ -917,23 +796,12 @@ KIND is `pixels', `intrinsic', `viewbox', or `unknown'."
              (file-regular-p path))
     path))
 
-(defun omnidiff-image--temp-path-p (path)
-  "Return non-nil when PATH resides under `temporary-file-directory'."
-  (when (and (stringp path) (not (string-empty-p path)))
-    (let ((norm (file-truename (expand-file-name path)))
-          (tmp (file-name-as-directory
-                (file-truename (expand-file-name temporary-file-directory))))
-          (sys-tmp (when (file-directory-p "/tmp")
-                     (file-name-as-directory (file-truename "/tmp")))))
-      (or (string-prefix-p tmp norm)
-          (and sys-tmp (string-prefix-p sys-tmp norm))))))
-
-(defun omnidiff-image--lfs-pointer-p (raw)
-  "Return non-nil when unibyte string RAW looks like a Git LFS pointer."
-  (and (stringp raw)
-       (< (length raw) 512)
-       (or (string-prefix-p "version https://git-lfs.github.com/spec/v1\n" raw)
-           (string-prefix-p "version https://git-lfs.github.com/spec/v1\r\n" raw))))
+(defun omnidiff-image-lfs-pointer-p (bytes)
+  "Return non-nil when unibyte string BYTES looks like a Git LFS pointer."
+  (and (stringp bytes)
+       (< (length bytes) 512)
+       (or (string-prefix-p "version https://git-lfs.github.com/spec/v1\n" bytes)
+           (string-prefix-p "version https://git-lfs.github.com/spec/v1\r\n" bytes))))
 
 (defun omnidiff-image--lfs-pointer-declared-size (raw)
   "Return declared integer byte size from Git LFS pointer RAW, or nil."
@@ -951,35 +819,47 @@ KIND is `pixels', `intrinsic', `viewbox', or `unknown'."
                        (set-buffer-multibyte nil)
                        (insert-file-contents-literally path nil 0 512)
                        (buffer-string)))))
-      (omnidiff-image--lfs-pointer-p prefix))))
+      (omnidiff-image-lfs-pointer-p prefix))))
+
+(defun omnidiff-image--smudge-lfs (raw dir force-p run-fn)
+  "Smudge Git LFS pointer RAW in DIR via RUN-FN, returning bytes or status.
+RUN-FN runs in a unibyte temp buffer with `default-directory' set to DIR and
+returns zero on success.  Non-pointer RAW is returned unchanged."
+  (if (not (omnidiff-image-lfs-pointer-p raw))
+      raw
+    (let ((declared (omnidiff-image--lfs-pointer-declared-size raw)))
+      (cond
+       ((and (not force-p) declared (> omnidiff-image-max-bytes 0)
+             (> declared omnidiff-image-max-bytes))
+        'too-large)
+       ((and dir (file-directory-p dir) (executable-find "git"))
+        (let ((default-directory dir)
+              (coding-system-for-read 'no-conversion)
+              (coding-system-for-write 'no-conversion))
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (if (zerop (funcall run-fn))
+                (let ((smudged (buffer-string)))
+                  (cond
+                   ((or (string-empty-p smudged)
+                        (omnidiff-image-lfs-pointer-p smudged))
+                    'lfs-pointer)
+                   ((and (not force-p) (> omnidiff-image-max-bytes 0)
+                         (> (length smudged) omnidiff-image-max-bytes))
+                    'too-large)
+                   (t smudged)))
+              'lfs-pointer))))
+       (t 'lfs-pointer)))))
 
 (defun omnidiff-image--smudge-disk-lfs-if-needed (raw dir force-p)
   "Smudge RAW if it is a Git LFS pointer read from disk under DIR."
-  (if (omnidiff-image--lfs-pointer-p raw)
-      (let ((declared (omnidiff-image--lfs-pointer-declared-size raw)))
-        (cond
-         ((and (not force-p) declared (> omnidiff-image-max-bytes 0)
-               (> declared omnidiff-image-max-bytes))
-          'too-large)
-         ((and dir (file-directory-p dir) (executable-find "git"))
-          (let ((default-directory dir)
-                (coding-system-for-read 'no-conversion)
-                (coding-system-for-write 'no-conversion))
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (if (zerop (call-process-region raw nil "git" nil '(t nil) nil
-                                              "lfs" "smudge"))
-                  (let ((smudged (buffer-string)))
-                    (if (and (not force-p) (> omnidiff-image-max-bytes 0)
-                             (> (length smudged) omnidiff-image-max-bytes))
-                        'too-large
-                      smudged))
-                raw))))
-         (t raw)))
-    raw))
+  (omnidiff-image--smudge-lfs
+   raw dir force-p
+   (lambda () (call-process-region raw nil "git" nil '(t nil) nil "lfs" "smudge"))))
 
 (defun omnidiff-image--read-file-bytes (path force-p &optional lfs-dir)
-  "Read regular file PATH as a unibyte string, `too-large', or `missing'.
+  "Read regular file PATH, returning unibyte bytes or a status symbol.
+Returns a unibyte string, `too-large', `lfs-pointer', or `missing'.
 Respects `omnidiff-image-max-bytes' (unless FORCE-P) and smudges Git LFS
 pointers using LFS-DIR or PATH's parent directory when available."
   (if (not (omnidiff-image--valid-disk-path path))
@@ -1002,35 +882,22 @@ pointers using LFS-DIR or PATH's parent directory when available."
   "Return integer byte size of Git blob OID in REPO-DIR, or nil if unavailable."
   (let ((default-directory repo-dir))
     (with-temp-buffer
-      (when (zerop (call-process "git" nil t nil "cat-file" "-s" oid))
+      (when (zerop (call-process "git" nil '(t nil) nil "cat-file" "-s" oid))
         (let ((n (string-to-number (string-trim (buffer-string)))))
           (when (>= n 0) n))))))
 
 (defun omnidiff-image--smudge-lfs-if-needed (raw oid path repo-dir force-p)
   "Smudge RAW if it is a Git LFS pointer for OID/PATH in REPO-DIR."
-  (if (and (omnidiff-image--lfs-pointer-p raw) path)
-      (let ((declared (omnidiff-image--lfs-pointer-declared-size raw)))
-        (if (and (not force-p) declared (> omnidiff-image-max-bytes 0)
-                 (> declared omnidiff-image-max-bytes))
-            'too-large
-          (let ((default-directory repo-dir)
-                (coding-system-for-read 'no-conversion))
-            (with-temp-buffer
-              (set-buffer-multibyte nil)
-              (if (zerop (call-process "git" nil t nil
-                                       "cat-file" "--filters"
-                                       (concat "--path=" path) oid))
-                  (let ((smudged (buffer-string)))
-                    (if (and (not force-p) (> omnidiff-image-max-bytes 0)
-                             (> (length smudged) omnidiff-image-max-bytes))
-                        'too-large
-                      smudged))
-                raw)))))
-    raw))
+  (omnidiff-image--smudge-lfs
+   raw (and path repo-dir) force-p
+   (lambda ()
+     (call-process "git" nil '(t nil) nil
+                   "cat-file" "--filters" (concat "--path=" path) oid))))
 
 (defun omnidiff-image--read-git-blob (oid path repo-dir force-p &optional known-bytes)
-  "Read Git blob OID in REPO-DIR as a unibyte string, `too-large', or `missing'.
-Automatically smudges Git LFS pointers via `git cat-file --filters' when needed."
+  "Read Git blob OID in REPO-DIR, returning bytes or a status symbol.
+Returns a unibyte string, `too-large', `lfs-pointer', or `missing'.
+Smudges Git LFS pointers via `git cat-file --filters' when needed."
   (let ((sz (or (and (integerp known-bytes) (> known-bytes 0) known-bytes)
                 (omnidiff-image--git-blob-size oid repo-dir))))
     (if (and (not force-p) sz (> omnidiff-image-max-bytes 0)
@@ -1040,7 +907,7 @@ Automatically smudges Git LFS pointers via `git cat-file --filters' when needed.
             (coding-system-for-read 'no-conversion))
         (with-temp-buffer
           (set-buffer-multibyte nil)
-          (if (not (zerop (call-process "git" nil t nil "cat-file" "blob" oid)))
+          (if (not (zerop (call-process "git" nil '(t nil) nil "cat-file" "blob" oid)))
               'missing
             (omnidiff-image--smudge-lfs-if-needed
              (buffer-string) oid path repo-dir force-p)))))))
@@ -1048,72 +915,123 @@ Automatically smudges Git LFS pointers via `git cat-file --filters' when needed.
 (defun omnidiff-image-prefetch-blobs (files repo-dir)
   "Batch-prefetch uncached Git image blobs for FILES in REPO-DIR.
 Uses one `git cat-file --batch' invocation instead of per-side spawns for
-the first `omnidiff-image-auto-load-limit' GUI image cards."
+the first `omnidiff-image-auto-load-limit' GUI image cards.
+Pre-checks unknown-size blobs (such as `.svg') via `git cat-file --batch-check'
+so oversized blobs are never read into memory unless `force-load' is set."
   (when (and omnidiff-image-enabled repo-dir
              (omnidiff-image--display-graphic-p)
              (file-directory-p repo-dir))
     (omnidiff-image--ensure-caches)
-    (let ((oids nil)
+    (let ((all-oids nil)
+          (oid-seen (make-hash-table :test #'equal))
           (oid-paths (make-hash-table :test #'equal))
+          (oid-known-sz (make-hash-table :test #'equal))
+          (oid-force (make-hash-table :test #'equal))
           (count 0)
           (limit (if (> omnidiff-image-auto-load-limit 0)
                      omnidiff-image-auto-load-limit
                    most-positive-fixnum)))
       (dolist (f files)
         (when-let* ((pic (omnidiff-image-file-picture f)))
-          (when (and (omnidiff-image-should-render-preview-p pic)
-                     (or (< count limit)
-                         (omnidiff-image--state-force-load
-                          (omnidiff-image--state-for f))))
-            (setq count (1+ count))
-            (dolist (pair (list (list (omnidiff-file-old-oid f)
-                                      (omnidiff-file-path f)
-                                      (omnidiff-picture-before pic))
-                                (list (omnidiff-file-new-oid f)
-                                      (omnidiff-file-target-path f)
-                                      (omnidiff-picture-after pic))))
-              (pcase-let ((`(,oid ,rel ,info) pair))
-                (when (and oid
-                           (not (gethash (cons 'oid oid) omnidiff-image--bytes-cache))
-                           (not (gethash oid oid-paths))
-                           (or (<= omnidiff-image-max-bytes 0)
-                               (null info)
-                               (<= (omnidiff-picture-info-bytes info)
-                                   omnidiff-image-max-bytes)))
-                  (puthash oid rel oid-paths)
-                  (push oid oids)))))))
-      (when oids
-        (setq oids (nreverse oids))
+          (let ((forced (omnidiff-image--state-force-load
+                         (omnidiff-image--state-for f))))
+            (when (and (omnidiff-image-should-render-preview-p pic)
+                       (or (< count limit) forced))
+              (setq count (1+ count))
+              (dolist (pair (list (list (omnidiff-file-old-oid f)
+                                        (omnidiff-file-path f)
+                                        (omnidiff-picture-before pic))
+                                  (list (omnidiff-file-new-oid f)
+                                        (omnidiff-file-target-path f)
+                                        (omnidiff-picture-after pic))))
+                (pcase-let ((`(,oid ,rel ,info) pair))
+                  (when oid
+                    (let ((cached (gethash (cons 'oid oid) omnidiff-image--bytes-cache)))
+                      (when (or (null cached)
+                                (and forced (eq cached 'too-large)))
+                        (when forced
+                          (puthash oid t oid-force))
+                        (unless (gethash oid oid-paths)
+                          (puthash oid rel oid-paths))
+                        (when (and info (> (omnidiff-picture-info-bytes info) 0))
+                          (puthash oid (omnidiff-picture-info-bytes info) oid-known-sz))
+                        (unless (gethash oid oid-seen)
+                          (puthash oid t oid-seen)
+                          (push oid all-oids)))))))))))
+      (when all-oids
         (let ((default-directory repo-dir)
               (coding-system-for-read 'no-conversion)
               (coding-system-for-write 'no-conversion)
-              (cache omnidiff-image--bytes-cache))
-          (with-temp-buffer
-            (set-buffer-multibyte nil)
-            (let* ((in-str (concat (string-join oids "\n") "\n"))
-                   (rc (call-process-region
-                        in-str nil "git" nil t nil "cat-file" "--batch")))
-              (when (zerop rc)
-                (goto-char (point-min))
-                (dolist (oid oids)
-                  (when (< (point) (point-max))
-                    (let* ((eol (line-end-position))
-                           (hdr (split-string
-                                 (buffer-substring-no-properties (point) eol) " ")))
-                      (forward-line 1)
-                      (unless (equal (nth 1 hdr) "missing")
-                        (let* ((sz (string-to-number (or (nth 2 hdr) "0")))
-                               (start (point))
-                               (end (min (point-max) (+ start sz))))
-                          (if (and (> omnidiff-image-max-bytes 0)
-                                   (> sz omnidiff-image-max-bytes))
-                              (puthash (cons 'oid oid) 'too-large cache)
-                            (let* ((raw (buffer-substring-no-properties start end))
-                                   (data (omnidiff-image--smudge-lfs-if-needed
-                                          raw oid (gethash oid oid-paths)
-                                          repo-dir nil)))
-                              (puthash (cons 'oid oid) data cache)))
-                          (goto-char (min (point-max) (1+ end))))))))))))))))
+              (cache omnidiff-image--bytes-cache)
+              (unknown-oids nil)
+              (skip-oids (make-hash-table :test #'equal))
+              (oids nil))
+          (dolist (oid (nreverse all-oids))
+            (let ((forced (gethash oid oid-force))
+                  (known (gethash oid oid-known-sz)))
+              (cond
+               ((and (not forced) (> omnidiff-image-max-bytes 0)
+                     known (> known omnidiff-image-max-bytes))
+                (puthash (cons 'oid oid) 'too-large cache))
+               ((and (not forced) (> omnidiff-image-max-bytes 0) (null known))
+                (push oid unknown-oids)
+                (push oid oids))
+               (t
+                (push oid oids)))))
+          (when unknown-oids
+            (setq unknown-oids (nreverse unknown-oids))
+            (with-temp-buffer
+              (let* ((in-str (concat (string-join unknown-oids "\n") "\n"))
+                     (rc (call-process-region
+                          in-str nil "git" nil '(t nil) nil
+                          "cat-file" "--batch-check")))
+                (when (zerop rc)
+                  (goto-char (point-min))
+                  (dolist (oid unknown-oids)
+                    (when (< (point) (point-max))
+                      (let ((hdr (split-string
+                                  (buffer-substring-no-properties
+                                   (point) (line-end-position))
+                                  " ")))
+                        (forward-line 1)
+                        (cond
+                         ((equal (nth 1 hdr) "missing")
+                          (puthash oid t skip-oids))
+                         ((> (string-to-number (or (nth 2 hdr) "0"))
+                             omnidiff-image-max-bytes)
+                          (puthash (cons 'oid oid) 'too-large cache)
+                          (puthash oid t skip-oids))))))))))
+          (setq oids (cl-remove-if (lambda (oid) (gethash oid skip-oids))
+                                   (nreverse oids)))
+          (when oids
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (let* ((in-str (concat (string-join oids "\n") "\n"))
+                     (rc (call-process-region
+                          in-str nil "git" nil '(t nil) nil "cat-file" "--batch")))
+                (when (zerop rc)
+                  (goto-char (point-min))
+                  (dolist (oid oids)
+                    (when (< (point) (point-max))
+                      (let* ((eol (line-end-position))
+                             (hdr (split-string
+                                   (buffer-substring-no-properties (point) eol) " "))
+                             (forced (gethash oid oid-force)))
+                        (forward-line 1)
+                        (unless (equal (nth 1 hdr) "missing")
+                          (let* ((sz (string-to-number (or (nth 2 hdr) "0")))
+                                 (start (point))
+                                 (end (min (point-max) (+ start sz))))
+                            (if (and (not forced)
+                                     (> omnidiff-image-max-bytes 0)
+                                     (> sz omnidiff-image-max-bytes))
+                                (puthash (cons 'oid oid) 'too-large cache)
+                              (let* ((raw (buffer-substring-no-properties start end))
+                                     (data (omnidiff-image--smudge-lfs-if-needed
+                                            raw oid (gethash oid oid-paths)
+                                            repo-dir forced)))
+                                (puthash (cons 'oid oid) data cache)))
+                            (goto-char (min (point-max) (1+ end)))))))))))))))))
 
 (defun omnidiff-image--side-source-key (file side repo-dir)
   "Return stable cache key for SIDE (`before' or `after') of FILE in REPO-DIR."
@@ -1135,7 +1053,7 @@ the first `omnidiff-image-auto-load-limit' GUI image cards."
         (list 'file abs (and attrs (file-attribute-modification-time attrs))
               (and attrs (file-attribute-size attrs)))))
      ((and (eq side 'after) repo-dir rel (not (string-empty-p rel)))
-      (let* ((abs (omnidiff-image--expand-path rel repo-dir))
+      (let* ((abs (omnidiff-engine-expand-repo-path rel repo-dir))
              (attrs (file-attributes abs)))
         (list 'file abs (and attrs (file-attribute-modification-time attrs))
               (and attrs (file-attribute-size attrs)))))
@@ -1143,7 +1061,7 @@ the first `omnidiff-image-auto-load-limit' GUI image cards."
 
 (defun omnidiff-image--fetch-side-bytes (file pic side repo-dir force-p)
   "Load unibyte image bytes for SIDE (`before' or `after') of FILE.
-Returns a unibyte string, `too-large', `missing', or nil when side is absent."
+Returns a unibyte string, `too-large', `lfs-pointer', `missing', or nil."
   (let ((st (omnidiff-file-status file)))
     (unless (or (and (eq side 'before) (eq st 'added))
                 (and (eq side 'after) (eq st 'deleted)))
@@ -1159,7 +1077,7 @@ Returns a unibyte string, `too-large', `missing', or nil when side is absent."
                       (omnidiff-file-path file)
                     (omnidiff-file-target-path file)))
              (abs (when (and repo-dir rel (not (string-empty-p rel)))
-                    (omnidiff-image--expand-path rel repo-dir)))
+                    (omnidiff-engine-expand-repo-path rel repo-dir)))
              (info (when pic
                      (if (eq side 'before)
                          (omnidiff-picture-before pic)
@@ -1169,7 +1087,18 @@ Returns a unibyte string, `too-large', `missing', or nil when side is absent."
              (cached (and key (gethash key omnidiff-image--bytes-cache))))
         (cond
          ((and (stringp cached) (> (length cached) 0))
-          cached)
+          (if (omnidiff-image-lfs-pointer-p cached)
+              (let ((smudged (if (and oid repo-dir)
+                                 (omnidiff-image--smudge-lfs-if-needed
+                                  cached oid rel repo-dir force-p)
+                               (omnidiff-image--smudge-disk-lfs-if-needed
+                                cached repo-dir force-p))))
+                (when key
+                  (puthash key smudged omnidiff-image--bytes-cache))
+                smudged)
+            cached))
+         ((eq cached 'lfs-pointer)
+          'lfs-pointer)
          ((and (eq cached 'too-large) (not force-p))
           'too-large)
          (t
@@ -1280,7 +1209,7 @@ When ZOOM is a positive number, render at `SRC * ZOOM' (clamped to 4096 px)."
   "Return non-nil when the current frame uses a dark background."
   (let ((bg (omnidiff-theme-color-hex (face-background 'default nil t))))
     (if bg
-        (omnidiff-theme--dark-color-p bg)
+        (omnidiff-theme-dark-color-p bg)
       (eq (frame-parameter nil 'background-mode) 'dark))))
 
 (defun omnidiff-image--accent-hex ()
@@ -1332,12 +1261,6 @@ When ZOOM is a positive number, render at `SRC * ZOOM' (clamped to 4096 px)."
 (defun omnidiff-image--frame-face ()
   "Return subtle 1px frame face spec matching the active theme."
   (list :box (list :line-width '(1 . 1) :color (omnidiff-image--frame-hex))))
-
-(defun omnidiff-image--register-descriptor (img)
-  "Track IMG in `omnidiff-image--descriptors' and return IMG."
-  (when img
-    (push img omnidiff-image--descriptors))
-  img)
 
 (defun omnidiff-image--svg-embeddable-p (mime)
   "Return non-nil when Emacs supports SVG and MIME embeds in `librsvg'."
@@ -1396,15 +1319,17 @@ When ZOOM is a positive number, render at `SRC * ZOOM' (clamped to 4096 px)."
                              (create-image bytes type t
                                            :max-width max-w :max-height max-h
                                            :scale 1 :ascent asc))))
-            (omnidiff-image--register-descriptor img)
             (puthash key img omnidiff-image--img-cache))))))
 
 (defun omnidiff-image--make-view-image (cache-key bytes type mime
                                                   src-w src-h disp-w disp-h
                                                   &optional exact-size-p ascent
-                                                  backdrop regions active-ridx)
+                                                  backdrop regions active-ridx
+                                                  card-key slot reg-w reg-h)
   "Create a cached image descriptor with optional backdrop, regions, or pixelation.
-Falls back cleanly to native `create-image' when no SVG composition is needed."
+Falls back cleanly to native `create-image' when no SVG composition is needed.
+Optional CARD-KEY and SLOT bound SVG wrapper descriptors per card slot.
+Optional REG-W and REG-H override the coordinate reference for REGIONS."
   (let* ((pixelated-p (and (not (eq type 'svg))
                            (> src-w 0) (> disp-w src-w)))
          (need-svg (and (omnidiff-image--svg-embeddable-p mime)
@@ -1414,45 +1339,46 @@ Falls back cleanly to native `create-image' when no SVG composition is needed."
     (if (not need-svg)
         (omnidiff-image--make-native cache-key bytes type disp-w disp-h
                                      exact-size-p ascent)
-      (omnidiff-image--ensure-caches)
       (let* ((dark-p (omnidiff-image--dark-background-p))
              (asc (or ascent 'center))
              (hi (when regions (omnidiff-image--diff-highlight-hex)))
+             (rw (or reg-w src-w))
+             (rh (or reg-h src-h))
              (key (list 'svg-wrap cache-key mime disp-w disp-h asc
                         backdrop dark-p pixelated-p
-                        (and regions (length regions)) active-ridx hi)))
-        (or (gethash key omnidiff-image--img-cache)
-            (pcase-let* ((`(,defs-xml . ,fill-val)
-                          (omnidiff-image--backdrop-svg-defs backdrop dark-p))
-                         (b64 (omnidiff-image--base64 cache-key bytes))
-                         (bg-rect (if (and backdrop (not (eq backdrop 'none)))
-                                      (format "<rect width=\"%d\" height=\"%d\" fill=\"%s\"/>"
-                                              disp-w disp-h fill-val)
-                                    ""))
-                         (render-attr (if pixelated-p
-                                          " style=\"image-rendering: pixelated\""
-                                        ""))
-                         (boxes (or (omnidiff-image--region-boxes-svg
-                                     regions (or active-ridx 0)
-                                     src-w src-h disp-w disp-h)
-                                    ""))
-                         (svg (format
-                               (concat
-                                "<svg xmlns=\"http://www.w3.org/2000/svg\" "
-                                "width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">"
-                                "%s%s"
-                                "<image href=\"data:%s;base64,%s\" "
-                                "width=\"%d\" height=\"%d\" preserveAspectRatio=\"none\"%s/>"
-                                "%s</svg>")
-                               disp-w disp-h disp-w disp-h
-                               (if (string-empty-p defs-xml) "" (concat "<defs>" defs-xml "</defs>"))
-                               bg-rect
-                               mime b64 disp-w disp-h render-attr
-                               boxes))
-                         (img (create-image svg 'svg t :scale 1 :ascent asc)))
-              (when img
-                (omnidiff-image--register-descriptor img)
-                (puthash key img omnidiff-image--img-cache))))))))
+                        (and regions (length regions)) active-ridx hi
+                        (when regions rw) (when regions rh))))
+        (omnidiff-image--cached-slot-desc
+         (or card-key cache-key) (or slot 'view) key
+         (lambda ()
+           (pcase-let* ((`(,defs-xml . ,fill-val)
+                         (omnidiff-image--backdrop-svg-defs backdrop dark-p))
+                        (b64 (omnidiff-image--base64 cache-key bytes))
+                        (bg-rect (if (and backdrop (not (eq backdrop 'none)))
+                                     (format "<rect width=\"%d\" height=\"%d\" fill=\"%s\"/>"
+                                             disp-w disp-h fill-val)
+                                   ""))
+                        (render-attr (if pixelated-p
+                                         " style=\"image-rendering: pixelated\""
+                                       ""))
+                        (boxes (or (omnidiff-image--region-boxes-svg
+                                    regions (or active-ridx 0)
+                                    rw rh disp-w disp-h)
+                                   ""))
+                        (svg (format
+                              (concat
+                               "<svg xmlns=\"http://www.w3.org/2000/svg\" "
+                               "width=\"%d\" height=\"%d\" viewBox=\"0 0 %d %d\">"
+                               "%s%s"
+                               "<image href=\"data:%s;base64,%s\" "
+                               "width=\"%d\" height=\"%d\" preserveAspectRatio=\"none\"%s/>"
+                               "%s</svg>")
+                              disp-w disp-h disp-w disp-h
+                              (if (string-empty-p defs-xml) "" (concat "<defs>" defs-xml "</defs>"))
+                              bg-rect
+                              mime b64 disp-w disp-h render-attr
+                              boxes)))
+             (create-image svg 'svg t :scale 1 :ascent asc))))))))
 
 (defun omnidiff-image--make-swipe-handle (height-px width-px)
   "Return a dual-contrast vertical divider SVG image of WIDTH-PX × HEIGHT-PX."
@@ -1482,7 +1408,6 @@ Falls back cleanly to native `create-image' when no SVG composition is needed."
                          height-px height-px color)))
                  (img (create-image svg 'svg t :scale 1 :ascent 'center)))
             (when img
-              (omnidiff-image--register-descriptor img)
               (puthash key img omnidiff-image--img-cache)))))))
 
 (defun omnidiff-image--make-pane-divider (height-px)
@@ -1498,7 +1423,6 @@ Falls back cleanly to native `create-image' when no SVG composition is needed."
                        h h color))
                  (img (create-image svg 'svg t :scale 1 :ascent 0)))
             (when img
-              (omnidiff-image--register-descriptor img)
               (puthash key img omnidiff-image--img-cache)))))))
 
 ;;; SVG compositing (Alpha-correct Onion Skin & Neutral-gray Difference Blend)
@@ -1589,28 +1513,37 @@ changes produce bright signals instead of zeroing out."
 
 ;;; Optional asynchronous ImageMagick `compare' backend
 
+(defvar omnidiff-image--magick-bin-cache nil
+  "Memoized `(EXEC-PATH-COPY . (COMPARE-ARGV . CONVERT-ARGV))' for ImageMagick.")
+
+(defun omnidiff-image--resolve-magick-bins ()
+  "Return cached `(COMPARE-ARGV . CONVERT-ARGV)' for the current `exec-path'."
+  (if (and omnidiff-image--magick-bin-cache
+           (equal (car omnidiff-image--magick-bin-cache) exec-path))
+      (cdr omnidiff-image--magick-bin-cache)
+    (let* ((magick (executable-find "magick"))
+           (compare-cmd (or (when magick (list magick "compare"))
+                            (when-let* ((bin (executable-find "compare")))
+                              (list bin))))
+           (convert-cmd (or (when magick (list magick))
+                            (when-let* ((bin (executable-find "convert")))
+                              (list bin))))
+           (pair (cons compare-cmd convert-cmd)))
+      (setq omnidiff-image--magick-bin-cache
+            (cons (copy-sequence exec-path) pair))
+      pair)))
+
 (defun omnidiff-image--magick-command ()
   "Return base argv list for ImageMagick `compare', or nil if unavailable."
-  (cond
-   ((executable-find "magick")
-    (list (executable-find "magick") "compare"))
-   ((executable-find "compare")
-    (list (executable-find "compare")))
-   (t nil)))
+  (car (omnidiff-image--resolve-magick-bins)))
 
 (defun omnidiff-image--magick-convert-command ()
   "Return base argv list for ImageMagick `magick'/`convert', or nil."
-  (cond
-   ((executable-find "magick")
-    (list (executable-find "magick")))
-   ((executable-find "convert")
-    (list (executable-find "convert")))
-   (t nil)))
+  (cdr (omnidiff-image--resolve-magick-bins)))
 
 (defun omnidiff-image--magick-eligible-p (pic b-type a-type bw bh aw ah)
   "Return non-nil when ImageMagick should be used for pixel diff modes."
-  (and (memq omnidiff-image-diff-backend '(auto magick))
-       (not (omnidiff-picture-svg-p pic))
+  (and (not (omnidiff-picture-svg-p pic))
        (not (eq b-type 'svg))
        (not (eq a-type 'svg))
        (> bw 0) (> bh 0) (= bw aw) (= bh ah)
@@ -1632,10 +1565,9 @@ changes produce bright signals instead of zeroing out."
   (let ((avail (omnidiff-image--available-diff-styles magick-p))
         (pref (or (and state (omnidiff-image--state-diff-style state))
                   omnidiff-image-diff-style)))
-    (cond
-     ((eq omnidiff-image-diff-backend 'svg) 'delta)
-     ((memq pref avail) pref)
-     (t (or (car avail) 'delta)))))
+    (if (memq pref avail)
+        pref
+      (or (car avail) 'delta))))
 
 (defun omnidiff-image--type-extension (type)
   "Return filename extension for Emacs image symbol TYPE."
@@ -1659,181 +1591,180 @@ changes produce bright signals instead of zeroing out."
     (write-region bytes nil path nil 'silent)
     path))
 
-(defun omnidiff-image--start-magick-diff (diff-key b-bytes b-type a-bytes a-type
+(defun omnidiff-image--spawn-magick-worker (proc-name tmp-prefix card-key diff-key
+                                                      expected-style expected-fuzz
+                                                      b-bytes b-type a-bytes a-type
+                                                      card-ov build-cmd-fn read-result-fn)
+  "Spawn an async ImageMagick worker for DIFF-KEY and refresh CARD-OV when done.
+BUILD-CMD-FN receives `(TMPDIR F-BEFORE F-AFTER)' and returns an argv list.
+READ-RESULT-FN receives `(EXIT-STATUS TMPDIR)' and returns cached PNG bytes
+\(or cons of bytes) on success, or nil on failure."
+  (let* ((buf (current-buffer))
+         (tmpdir (make-temp-file tmp-prefix t))
+         (f-before (expand-file-name
+                    (concat "before" (omnidiff-image--type-extension b-type)) tmpdir))
+         (f-after (expand-file-name
+                   (concat "after" (omnidiff-image--type-extension a-type)) tmpdir))
+         (cmd (funcall build-cmd-fn tmpdir f-before f-after))
+         (entry (cons nil tmpdir)))
+    (puthash diff-key 'pending omnidiff-image--magick-cache)
+    (push entry omnidiff-image--workers)
+    (condition-case nil
+        (progn
+          (omnidiff-image--write-binary-temp f-before b-bytes)
+          (omnidiff-image--write-binary-temp f-after a-bytes)
+          (let ((proc
+                 (make-process
+                  :name proc-name
+                  :buffer nil
+                  :command cmd
+                  :connection-type 'pipe
+                  :noquery t
+                  :filter #'ignore
+                  :sentinel
+                  (lambda (p _ev)
+                    (when (memq (process-status p) '(exit signal))
+                      (unwind-protect
+                          (when (buffer-live-p buf)
+                            (with-current-buffer buf
+                              (let ((active-p (memq entry omnidiff-image--workers)))
+                                (setq omnidiff-image--workers
+                                      (delq entry omnidiff-image--workers))
+                                (when active-p
+                                  (if (eq (process-status p) 'exit)
+                                      (let ((result (funcall read-result-fn
+                                                             (process-exit-status p)
+                                                             tmpdir)))
+                                        (when omnidiff-image--magick-cache
+                                          (if result
+                                              (omnidiff-image--put-magick-cache
+                                               card-key diff-key result)
+                                            (puthash diff-key 'failed
+                                                     omnidiff-image--magick-cache)))
+                                        (when (and card-ov (overlay-buffer card-ov))
+                                          (let* ((f (overlay-get card-ov 'omnidiff-image-file))
+                                                 (st (and f (omnidiff-image--state-for f))))
+                                            (when (and st
+                                                       (eq (omnidiff-image--effective-mode st t)
+                                                           'diff)
+                                                       (eq (omnidiff-image--effective-diff-style st t)
+                                                           expected-style)
+                                                       (eql (or (omnidiff-image--state-diff-fuzz st)
+                                                                omnidiff-image-diff-fuzz)
+                                                            expected-fuzz))
+                                              ;; Background completion: never unfold a user-folded hunk.
+                                              (omnidiff-image--rerender-card card-ov nil)))))
+                                    (when (and omnidiff-image--magick-cache
+                                               (eq (gethash diff-key omnidiff-image--magick-cache)
+                                                   'pending))
+                                      (remhash diff-key omnidiff-image--magick-cache)))))))
+                        (when (file-directory-p tmpdir)
+                          (ignore-errors (delete-directory tmpdir t)))))))))
+            (setcar entry proc)))
+      (error
+       (setq omnidiff-image--workers (delq entry omnidiff-image--workers))
+       (puthash diff-key 'failed omnidiff-image--magick-cache)
+       (when (file-directory-p tmpdir)
+         (ignore-errors (delete-directory tmpdir t)))))))
+
+(defun omnidiff-image--start-magick-diff (card-key diff-key b-bytes b-type a-bytes a-type
                                                    highlight fuzz card-ov)
   "Launch async ImageMagick `compare' for DIFF-KEY and refresh CARD-OV when done."
   (when-let* ((base-cmd (omnidiff-image--magick-command)))
-    (let* ((buf (current-buffer))
-           (tmpdir (make-temp-file "omnidiff-magick-" t))
-           (f-before (expand-file-name (concat "before" (omnidiff-image--type-extension b-type)) tmpdir))
-           (f-after (expand-file-name (concat "after" (omnidiff-image--type-extension a-type)) tmpdir))
-           (f-out (expand-file-name "diff.png" tmpdir))
-           (lowlight (if (omnidiff-image--dark-background-p)
-                         "rgba(20,22,30,0.65)"
-                       "rgba(246,247,250,0.72)"))
-           (fuzz-args (when (and (integerp fuzz) (> fuzz 0))
-                        (list "-fuzz" (format "%d%%" fuzz))))
-           (cmd (append base-cmd
-                        fuzz-args
-                        (list "-highlight-color" highlight
-                              "-lowlight-color" lowlight
-                              f-before f-after f-out)))
-           (entry nil)
-           (proc nil))
-      (puthash diff-key 'pending omnidiff-image--magick-cache)
-      (condition-case nil
-          (progn
-            (omnidiff-image--write-binary-temp f-before b-bytes)
-            (omnidiff-image--write-binary-temp f-after a-bytes)
-            (setq proc
-                  (make-process
-                   :name "omnidiff-magick"
-                   :buffer nil
-                   :command cmd
-                   :connection-type 'pipe
-                   :noquery t
-                   :filter #'ignore
-                   :sentinel
-                   (lambda (p _ev)
-                     (when (memq (process-status p) '(exit signal))
-                       (unwind-protect
-                           (when (buffer-live-p buf)
-                             (with-current-buffer buf
-                               (setq omnidiff-image--workers
-                                     (delq entry omnidiff-image--workers))
-                               (let ((result 'failed))
-                                 (when (and (eq (process-status p) 'exit)
-                                            (memq (process-exit-status p) '(0 1))
-                                            (file-exists-p f-out))
-                                   (let ((bytes (omnidiff-image--read-file-bytes f-out t)))
-                                     (when (and (stringp bytes)
-                                                (string-prefix-p omnidiff-image--png-magic bytes))
-                                       (setq result bytes))))
-                                 (when omnidiff-image--magick-cache
-                                   (puthash diff-key result omnidiff-image--magick-cache))
-                                 (when (and card-ov (overlay-buffer card-ov))
-                                   (let* ((f (overlay-get card-ov 'omnidiff-image-file))
-                                          (st (and f (omnidiff-image--state-for f))))
-                                     (when (and st (eq (omnidiff-image--effective-mode st t) 'diff))
-                                       ;; Background completion: never unfold a user-folded hunk.
-                                       (omnidiff-image--rerender-card card-ov nil)))))))
-                         (when (file-directory-p tmpdir)
-                           (ignore-errors (delete-directory tmpdir t))))))))
-            (setq entry (cons proc tmpdir))
-            (push entry omnidiff-image--workers))
-        (error
-         (puthash diff-key 'failed omnidiff-image--magick-cache)
-         (when (file-directory-p tmpdir)
-           (ignore-errors (delete-directory tmpdir t))))))))
+    (let ((lowlight (if (omnidiff-image--dark-background-p)
+                        "rgba(20,22,30,0.65)"
+                      "rgba(246,247,250,0.72)"))
+          (fuzz-args (when (and (integerp fuzz) (> fuzz 0))
+                       (list "-fuzz" (format "%d%%" fuzz)))))
+      (omnidiff-image--spawn-magick-worker
+       "omnidiff-magick" "omnidiff-magick-" card-key diff-key 'mask fuzz
+       b-bytes b-type a-bytes a-type card-ov
+       (lambda (tmpdir f-before f-after)
+         (append base-cmd fuzz-args
+                 (list "-highlight-color" highlight
+                       "-lowlight-color" lowlight
+                       f-before f-after (expand-file-name "diff.png" tmpdir))))
+       (lambda (exit-status tmpdir)
+         (let ((f-out (expand-file-name "diff.png" tmpdir)))
+           (when (and (memq exit-status '(0 1)) (file-exists-p f-out))
+             (let ((bytes (omnidiff-image--read-file-bytes f-out t)))
+               (when (and (stringp bytes)
+                          (string-prefix-p omnidiff-image--png-magic bytes))
+                 bytes)))))))))
 
 (defun omnidiff-image--spotlight-side-args (reg ctx-mul ctx-add tint tint-pct contour contour-alpha)
   "Build ImageMagick argv fragment producing one spotlight side from register REG.
 Unchanged pixels are desaturated and attenuated by CTX-MUL/CTX-ADD; changed
-pixels retain full readability with TINT at TINT-PCT plus a 1px CONTOUR
-outer rim at CONTOUR-ALPHA."
-  (list reg "-channel" "RGB" "-colorspace" "Gray" "-colorspace" "sRGB"
+pixels retain full readability with TINT at TINT-PCT while preserving REG's
+original alpha channel, plus a 1px CONTOUR outer rim at fractional opacity
+CONTOUR-ALPHA."
+  (list reg "-alpha" "off" "-colorspace" "Gray" "-colorspace" "sRGB"
         "-evaluate" "multiply" ctx-mul "-evaluate" "add" ctx-add
-        "+channel" "-type" "TrueColorAlpha"
-        "(" reg "-channel" "RGB" "-fill" tint "-colorize" tint-pct "+channel" ")"
+        "(" reg "-alpha" "off" "-fill" tint "-colorize" tint-pct ")"
         "mpr:mask" "-compose" "Over" "-composite"
+        "(" reg "-alpha" "extract" ")"
+        "-compose" "CopyOpacity" "-composite" "-type" "TrueColorAlpha"
         "(" reg "-alpha" "opaque" "-fill" contour "-colorize" "100%"
-        "-channel" "A" "-evaluate" "set" contour-alpha "+channel" ")"
-        "mpr:edge" "-compose" "Over" "-composite"))
+        "(" "mpr:edge" "-evaluate" "multiply" contour-alpha ")"
+        "-compose" "CopyOpacity" "-composite" ")"
+        "-compose" "Over" "-composite"))
 
-(defun omnidiff-image--start-magick-spotlight (diff-key b-bytes b-type a-bytes a-type
+(defun omnidiff-image--start-magick-spotlight (card-key diff-key b-bytes b-type a-bytes a-type
                                                         style dark-p fuzz card-ov)
   "Launch async ImageMagick spotlight diff for DIFF-KEY and refresh CARD-OV.
 When STYLE is `spotlight-sbs', caches `(BEFORE-PNG . AFTER-PNG)'; when
 `spotlight', caches `AFTER-PNG'."
   (when-let* ((base-cmd (omnidiff-image--magick-convert-command)))
-    (let* ((buf (current-buffer))
-           (sbs-p (eq style 'spotlight-sbs))
-           (tmpdir (make-temp-file "omnidiff-spot-" t))
-           (f-before (expand-file-name
-                      (concat "before" (omnidiff-image--type-extension b-type)) tmpdir))
-           (f-after (expand-file-name
-                     (concat "after" (omnidiff-image--type-extension a-type)) tmpdir))
-           (f-out-b (expand-file-name "spot-before.png" tmpdir))
-           (f-out-a (expand-file-name "spot-after.png" tmpdir))
+    (let* ((sbs-p (eq style 'spotlight-sbs))
            (thr (if (and (integerp fuzz) (> fuzz 0)) (format "%d%%" fuzz) "0.2%"))
            (ctx-mul (if dark-p "0.68" "0.62"))
            (ctx-add (if dark-p "3%" "34%"))
            (tint (if dark-p "#f0a848" "#d97706"))
            (tint-pct (if sbs-p "18%" (if dark-p "24%" "22%")))
            (contour (if dark-p "#f5be6b" "#b45309"))
-           (contour-alpha (if dark-p "35%" "40%"))
-           (cmd (append
-                 base-cmd
-                 (list f-before "-alpha" "set" "-colorspace" "sRGB" "-write" "mpr:b" "+delete"
-                       f-after "-alpha" "set" "-colorspace" "sRGB" "-write" "mpr:a" "+delete"
-                       "mpr:b" "mpr:a" "-compose" "Difference" "-composite"
-                       "-channel" "RGBA" "-separate" "+channel"
-                       "-evaluate-sequence" "max" "-threshold" thr
-                       "-write" "mpr:mask" "+delete"
-                       "mpr:mask" "(" "+clone" "-morphology" "Dilate" "Octagon:1" ")"
-                       "+swap" "-compose" "MinusSrc" "-composite"
-                       "-write" "mpr:edge" "+delete")
-                 (when sbs-p
-                   (append
-                    (omnidiff-image--spotlight-side-args
-                     "mpr:b" ctx-mul ctx-add tint tint-pct contour contour-alpha)
-                    (list "-write" (concat "PNG32:" f-out-b) "+delete")))
-                 (omnidiff-image--spotlight-side-args
-                  "mpr:a" ctx-mul ctx-add tint tint-pct contour contour-alpha)
-                 (list (concat "PNG32:" f-out-a))))
-           (entry nil)
-           (proc nil))
-      (puthash diff-key 'pending omnidiff-image--magick-cache)
-      (condition-case nil
-          (progn
-            (omnidiff-image--write-binary-temp f-before b-bytes)
-            (omnidiff-image--write-binary-temp f-after a-bytes)
-            (setq proc
-                  (make-process
-                   :name "omnidiff-magick-spot"
-                   :buffer nil
-                   :command cmd
-                   :connection-type 'pipe
-                   :noquery t
-                   :filter #'ignore
-                   :sentinel
-                   (lambda (p _ev)
-                     (when (memq (process-status p) '(exit signal))
-                       (unwind-protect
-                           (when (buffer-live-p buf)
-                             (with-current-buffer buf
-                               (setq omnidiff-image--workers
-                                     (delq entry omnidiff-image--workers))
-                               (let ((result 'failed))
-                                 (when (and (eq (process-status p) 'exit)
-                                            (zerop (process-exit-status p))
-                                            (file-exists-p f-out-a)
-                                            (or (not sbs-p) (file-exists-p f-out-b)))
-                                   (let ((ab (omnidiff-image--read-file-bytes f-out-a t))
-                                         (bb (when sbs-p
-                                               (omnidiff-image--read-file-bytes f-out-b t))))
-                                     (when (and (stringp ab)
-                                                (string-prefix-p omnidiff-image--png-magic ab)
-                                                (or (not sbs-p)
-                                                    (and (stringp bb)
-                                                         (string-prefix-p
-                                                          omnidiff-image--png-magic bb))))
-                                       (setq result (if sbs-p (cons bb ab) ab)))))
-                                 (when omnidiff-image--magick-cache
-                                   (puthash diff-key result omnidiff-image--magick-cache))
-                                 (when (and card-ov (overlay-buffer card-ov))
-                                   (let* ((f (overlay-get card-ov 'omnidiff-image-file))
-                                          (st (and f (omnidiff-image--state-for f))))
-                                     (when (and st (eq (omnidiff-image--effective-mode st t) 'diff))
-                                       (omnidiff-image--rerender-card card-ov nil)))))))
-                         (when (file-directory-p tmpdir)
-                           (ignore-errors (delete-directory tmpdir t))))))))
-            (setq entry (cons proc tmpdir))
-            (push entry omnidiff-image--workers))
-        (error
-         (puthash diff-key 'failed omnidiff-image--magick-cache)
-         (when (file-directory-p tmpdir)
-           (ignore-errors (delete-directory tmpdir t))))))))
+           (contour-alpha (if dark-p "0.35" "0.40")))
+      (omnidiff-image--spawn-magick-worker
+       "omnidiff-magick-spot" "omnidiff-spot-" card-key diff-key style fuzz
+       b-bytes b-type a-bytes a-type card-ov
+       (lambda (tmpdir f-before f-after)
+         (let ((f-out-b (expand-file-name "spot-before.png" tmpdir))
+               (f-out-a (expand-file-name "spot-after.png" tmpdir)))
+           (append
+            base-cmd
+            (list f-before "-alpha" "set" "-colorspace" "sRGB" "-write" "mpr:b" "+delete"
+                  f-after "-alpha" "set" "-colorspace" "sRGB" "-write" "mpr:a" "+delete"
+                  "(" "mpr:b" "mpr:a" "-alpha" "off"
+                  "-compose" "Difference" "-composite"
+                  "-channel" "RGB" "-separate" "+channel" ")"
+                  "(" "(" "mpr:b" "-alpha" "extract" ")" "(" "mpr:a" "-alpha" "extract" ")"
+                  "-compose" "Difference" "-composite" ")"
+                  "-evaluate-sequence" "max" "-threshold" thr
+                  "-write" "mpr:mask" "+delete"
+                  "mpr:mask" "(" "+clone" "-morphology" "Dilate" "Octagon:1" ")"
+                  "+swap" "-compose" "MinusSrc" "-composite"
+                  "-write" "mpr:edge" "+delete")
+            (when sbs-p
+              (append
+               (omnidiff-image--spotlight-side-args
+                "mpr:b" ctx-mul ctx-add tint tint-pct contour contour-alpha)
+               (list "-write" (concat "PNG32:" f-out-b) "+delete")))
+            (omnidiff-image--spotlight-side-args
+             "mpr:a" ctx-mul ctx-add tint tint-pct contour contour-alpha)
+            (list (concat "PNG32:" f-out-a)))))
+       (lambda (exit-status tmpdir)
+         (let ((f-out-b (expand-file-name "spot-before.png" tmpdir))
+               (f-out-a (expand-file-name "spot-after.png" tmpdir)))
+           (when (and (zerop exit-status)
+                      (file-exists-p f-out-a)
+                      (or (not sbs-p) (file-exists-p f-out-b)))
+             (let ((ab (omnidiff-image--read-file-bytes f-out-a t))
+                   (bb (when sbs-p (omnidiff-image--read-file-bytes f-out-b t))))
+               (when (and (stringp ab)
+                          (string-prefix-p omnidiff-image--png-magic ab)
+                          (or (not sbs-p)
+                              (and (stringp bb)
+                                   (string-prefix-p omnidiff-image--png-magic bb))))
+                 (if sbs-p (cons bb ab) ab))))))))))
 
 ;;; Mode resolution, compact toolbar & changed-region 1:1 crop loupe
 
@@ -1861,6 +1792,18 @@ When STYLE is `spotlight-sbs', caches `(BEFORE-PNG . AFTER-PNG)'; when
               (when (and compatible-overlay-p (or svg-embed-p magick-p)) 'diff)
               (when (and compatible-overlay-p svg-embed-p) 'onion)
               'blink)))
+
+(defun omnidiff-image--region-grid-dims (pic bw bh aw ah)
+  "Return `(REG-W . REG-H)' coordinate space for PIC's changed regions.
+For `resized-scaled', `omnidiff' downscales the larger side to
+`(min BW AW) × (min BH AH)' before computing `scaled.regions'; otherwise
+regions live in `(max BW AW) × (max BH AH)'."
+  (if (and pic (eq (omnidiff-picture-comparison pic) 'resized-scaled)
+           (> bw 0) (> bh 0) (> aw 0) (> ah 0))
+      (cons (max 1 (round (min bw aw)))
+            (max 1 (round (min bh ah))))
+    (cons (max 1 (round (max bw aw)))
+          (max 1 (round (max bh ah))))))
 
 (defun omnidiff-image--default-swipe (pic img-w)
   "Compute smart initial swipe split ratio for PIC of pixel width IMG-W.
@@ -1907,23 +1850,28 @@ stay compact and readable inside 80-column splits."
               "6:blink"))
     (_ (symbol-name mode))))
 
-(defun omnidiff-image--make-mode-chip (mode active-p state &optional pic img-w)
-  "Return a clickable propertized toolbar pill for MODE."
-  (let ((label (concat " " (omnidiff-image--mode-label mode active-p state pic img-w) " "))
-        (map (make-sparse-keymap)))
+(defun omnidiff-image--click-map (fn)
+  "Return a keymap inheriting `omnidiff-image-card-map' that invokes FN on click."
+  (let ((map (make-sparse-keymap)))
     (set-keymap-parent map omnidiff-image-card-map)
     (define-key map [mouse-1]
       (lambda (ev)
         (interactive "e")
         (mouse-set-point ev)
-        (omnidiff-image-set-mode mode)))
+        (funcall fn)))
+    map))
+
+(defun omnidiff-image--make-mode-chip (mode active-p state &optional pic img-w)
+  "Return a clickable propertized toolbar pill for MODE."
+  (let ((label (concat " " (omnidiff-image--mode-label mode active-p state pic img-w) " ")))
     (propertize label
                 'face (if active-p
                           'omnidiff-image-mode-active
                         'omnidiff-image-mode-inactive)
                 'mouse-face 'highlight
                 'help-echo (format "Switch image diff view to %s" mode)
-                'keymap map)))
+                'keymap (omnidiff-image--click-map
+                         (lambda () (omnidiff-image-set-mode mode))))))
 
 (defun omnidiff-image--insert-toolbar (active-mode available state
                                                    &optional status-fragments pic img-w)
@@ -1976,47 +1924,45 @@ stay compact and readable inside 80-column splits."
   "Insert subtle vertical breathing room (~6px) above/below an image canvas."
   (insert (propertize "\n" 'line-height 0.35 'cursor-intangible t)))
 
-(defun omnidiff-image--make-region-crop-svg (cache-key bytes mime src-w src-h
+(defun omnidiff-image--make-region-crop-svg (card-key slot cache-key bytes mime src-w src-h
                                                        region backdrop dark-p
                                                        crop-x crop-y crop-w crop-h
                                                        tile-w tile-h)
   "Build cached SVG loupe tile cropping CROP-X..H into TILE-W × TILE-H."
   (when (omnidiff-image--svg-embeddable-p mime)
-    (omnidiff-image--ensure-caches)
     (let* ((hi (omnidiff-image--diff-highlight-hex))
            (rx (omnidiff-picture-region-x region))
            (ry (omnidiff-picture-region-y region))
            (rw (omnidiff-picture-region-width region))
            (rh (omnidiff-picture-region-height region))
-           (key (list 'rcrop cache-key mime crop-x crop-y crop-w crop-h
+           (key (list 'rcrop cache-key mime src-w src-h crop-x crop-y crop-w crop-h
                       tile-w tile-h rx ry rw rh backdrop dark-p hi)))
-      (or (gethash key omnidiff-image--img-cache)
-          (pcase-let* ((`(,defs-xml . ,fill-val)
-                        (omnidiff-image--backdrop-svg-defs backdrop dark-p))
-                       (b64 (omnidiff-image--base64 cache-key bytes))
-                       (defs (if (string-empty-p defs-xml) "" (concat "<defs>" defs-xml "</defs>")))
-                       (bg-rect (format "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"%s\"/>"
-                                        crop-x crop-y crop-w crop-h fill-val))
-                       (stroke-w (max 0.5 (/ (float crop-w) (float (max 1 tile-w)))))
-                       (svg (format
-                             (concat
-                              "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" "
-                              "viewBox=\"%d %d %d %d\">%s%s"
-                              "<image href=\"data:%s;base64,%s\" width=\"%d\" height=\"%d\" "
-                              "preserveAspectRatio=\"none\" style=\"image-rendering: pixelated\"/>"
-                              "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
-                              "fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" stroke-dasharray=\"%.2f %.2f\"/>"
-                              "</svg>")
-                             tile-w tile-h crop-x crop-y crop-w crop-h
-                             defs bg-rect
-                             mime b64 src-w src-h
-                             rx ry rw rh hi stroke-w (* 3.0 stroke-w) (* 2.0 stroke-w)))
-                       (img (create-image svg 'svg t :scale 1 :ascent 0)))
-            (when img
-              (omnidiff-image--register-descriptor img)
-              (puthash key img omnidiff-image--img-cache)))))))
+      (omnidiff-image--cached-slot-desc
+       (or card-key cache-key) (or slot 'loupe) key
+       (lambda ()
+         (pcase-let* ((`(,defs-xml . ,fill-val)
+                       (omnidiff-image--backdrop-svg-defs backdrop dark-p))
+                      (b64 (omnidiff-image--base64 cache-key bytes))
+                      (defs (if (string-empty-p defs-xml) "" (concat "<defs>" defs-xml "</defs>")))
+                      (bg-rect (format "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" fill=\"%s\"/>"
+                                       crop-x crop-y crop-w crop-h fill-val))
+                      (stroke-w (max 0.5 (/ (float crop-w) (float (max 1 tile-w)))))
+                      (svg (format
+                            (concat
+                             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\" "
+                             "viewBox=\"%d %d %d %d\">%s%s"
+                             "<image href=\"data:%s;base64,%s\" width=\"%d\" height=\"%d\" "
+                             "preserveAspectRatio=\"none\" style=\"image-rendering: pixelated\"/>"
+                             "<rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" "
+                             "fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" stroke-dasharray=\"%.2f %.2f\"/>"
+                             "</svg>")
+                            tile-w tile-h crop-x crop-y crop-w crop-h
+                            defs bg-rect
+                            mime b64 src-w src-h
+                            rx ry rw rh hi stroke-w (* 3.0 stroke-w) (* 2.0 stroke-w))))
+           (create-image svg 'svg t :scale 1 :ascent 0)))))))
 
-(defun omnidiff-image--insert-region-loupe (pic state b-key b-bytes b-mime
+(defun omnidiff-image--insert-region-loupe (card-key pic state b-key b-bytes b-mime
                                                 a-key a-bytes a-mime
                                                 src-w src-h backdrop avail-w)
   "Insert 1:1 / pixelated BEFORE | AFTER local crop tiles for active region."
@@ -2048,11 +1994,11 @@ stay compact and readable inside 80-column splits."
              (tile-w (max 1 (round (* cw zoom))))
              (tile-h (max 1 (round (* ch zoom))))
              (b-tile (omnidiff-image--make-region-crop-svg
-                      b-key b-bytes b-mime src-w src-h r backdrop dark-p
-                      cx cy cw ch tile-w tile-h))
+                      card-key 'loupe-before b-key b-bytes b-mime src-w src-h
+                      r backdrop dark-p cx cy cw ch tile-w tile-h))
              (a-tile (omnidiff-image--make-region-crop-svg
-                      a-key a-bytes a-mime src-w src-h r backdrop dark-p
-                      cx cy cw ch tile-w tile-h))
+                      card-key 'loupe-after a-key a-bytes a-mime src-w src-h
+                      r backdrop dark-p cx cy cw ch tile-w tile-h))
              (frame-face (omnidiff-image--frame-face)))
         (when (and b-tile a-tile)
           (insert (propertize
@@ -2075,7 +2021,6 @@ stay compact and readable inside 80-column splits."
 (defun omnidiff-image--insert-regions (pic indent &optional active-idx clickable-p)
   "Insert structured changed-regions list for `omnidiff-picture' PIC with INDENT."
   (let ((regions (omnidiff-picture-regions pic))
-        (more (omnidiff-picture-more-regions pic))
         (total (omnidiff-picture-region-count pic)))
     (when (or regions (> total 0))
       (insert (propertize
@@ -2096,25 +2041,14 @@ stay compact and readable inside 80-column splits."
                                (omnidiff-picture-region-y r)))
                  (target-idx idx))
             (if clickable-p
-                (let ((map (make-sparse-keymap)))
-                  (set-keymap-parent map omnidiff-image-card-map)
-                  (define-key map [mouse-1]
-                    (lambda (ev)
-                      (interactive "e")
-                      (mouse-set-point ev)
-                      (omnidiff-image-select-region target-idx)))
-                  (insert (propertize line
-                                      'face (if sel-p 'omnidiff-image-mode-active
-                                              'omnidiff-image-meta)
-                                      'mouse-face 'highlight
-                                      'keymap map)))
+                (insert (propertize line
+                                    'face (if sel-p 'omnidiff-image-mode-active
+                                            'omnidiff-image-meta)
+                                    'mouse-face 'highlight
+                                    'keymap (omnidiff-image--click-map
+                                             (lambda () (omnidiff-image-select-region target-idx)))))
               (insert (propertize line 'face 'omnidiff-image-meta))))
-          (setq idx (1+ idx))))
-      (when (> more 0)
-        (insert (propertize
-                 (format "%s  … %s more regions (not returned by omnidiff)\n"
-                         indent (omnidiff-image--format-int-grouped more))
-                 'face 'omnidiff-image-meta))))))
+          (setq idx (1+ idx)))))))
 
 ;;; TTY summary (sub-character bar & toggleable regions)
 
@@ -2140,44 +2074,29 @@ Optional REASON explains why inline visual display was skipped."
         (pct (omnidiff-picture-changed-pct pic))
         (chg (omnidiff-picture-changed-pixels pic))
         (tot (omnidiff-picture-total-pixels pic)))
-    (when b
-      (insert (propertize "  " 'face 'default)
-              (propertize " BEFORE " 'face 'omnidiff-side-before)
-              (propertize (concat "  "
-                                  (string-join
-                                   (delq nil
-                                         (list (omnidiff-picture-info-format b)
-                                               (when (and (> (omnidiff-picture-info-width b) 0)
-                                                          (> (omnidiff-picture-info-height b) 0))
-                                                 (format "%d×%d"
-                                                         (omnidiff-picture-info-width b)
-                                                         (omnidiff-picture-info-height b)))
-                                               (omnidiff-picture-info-color b)
-                                               (when (> (omnidiff-picture-info-bytes b) 0)
-                                                 (concat "· " (omnidiff-image-format-bytes
-                                                               (omnidiff-picture-info-bytes b))))))
-                                   " ")
-                                  "\n")
-                          'face 'omnidiff-image-meta)))
-    (when a
-      (insert (propertize "  " 'face 'default)
-              (propertize " AFTER  " 'face 'omnidiff-side-after)
-              (propertize (concat "  "
-                                  (string-join
-                                   (delq nil
-                                         (list (omnidiff-picture-info-format a)
-                                               (when (and (> (omnidiff-picture-info-width a) 0)
-                                                          (> (omnidiff-picture-info-height a) 0))
-                                                 (format "%d×%d"
-                                                         (omnidiff-picture-info-width a)
-                                                         (omnidiff-picture-info-height a)))
-                                               (omnidiff-picture-info-color a)
-                                               (when (> (omnidiff-picture-info-bytes a) 0)
-                                                 (concat "· " (omnidiff-image-format-bytes
-                                                               (omnidiff-picture-info-bytes a))))))
-                                   " ")
-                                  "\n")
-                          'face 'omnidiff-image-meta)))
+    (cl-flet ((insert-side (label face info)
+                (when info
+                  (let ((w (omnidiff-picture-info-width info))
+                        (h (omnidiff-picture-info-height info))
+                        (sz (omnidiff-picture-info-bytes info)))
+                    (insert (propertize "  " 'face 'default)
+                            (propertize label 'face face)
+                            (propertize
+                             (concat "  "
+                                     (string-join
+                                      (delq nil
+                                            (list (omnidiff-picture-info-format info)
+                                                  (when (and (> w 0) (> h 0))
+                                                    (format "%d×%d" w h))
+                                                  (omnidiff-picture-info-color info)
+                                                  (when (> sz 0)
+                                                    (concat "· "
+                                                            (omnidiff-engine-format-bytes sz)))))
+                                      " ")
+                                     "\n")
+                             'face 'omnidiff-image-meta))))))
+      (insert-side " BEFORE " 'omnidiff-side-before b)
+      (insert-side " AFTER  " 'omnidiff-side-after a))
     (pcase comp
       ('pixels
        (let ((bar (omnidiff-image--format-tty-bar pct 20)))
@@ -2214,34 +2133,29 @@ Optional REASON explains why inline visual display was skipped."
       (omnidiff-image--insert-regions pic "  "))
     (when reason
       (if clickable-load-p
-          (let ((map (make-sparse-keymap)))
-            (set-keymap-parent map omnidiff-image-card-map)
-            (define-key map [mouse-1]
-              (lambda (ev)
-                (interactive "e")
-                (mouse-set-point ev)
-                (omnidiff-image-force-load)))
-            (insert (propertize (format "  %s\n" reason)
-                                'face 'omnidiff-gap
-                                'mouse-face 'highlight
-                                'help-echo "Click or press L to load preview"
-                                'keymap map)))
+          (insert (propertize (format "  %s\n" reason)
+                              'face 'omnidiff-gap
+                              'mouse-face 'highlight
+                              'help-echo "Click or press L to load preview"
+                              'keymap (omnidiff-image--click-map #'omnidiff-image-force-load)))
         (insert (propertize (format "  %s\n" reason) 'face 'omnidiff-gap))))))
 
 ;;; Visual mode renderers
 
-(defun omnidiff-image--insert-side-by-side (b-key b-bytes b-type b-mime
+(defun omnidiff-image--insert-side-by-side (card-key b-key b-bytes b-type b-mime
                                                   a-key a-bytes a-type a-mime
                                                   bw bh b-kind aw ah a-kind
                                                   avail-w max-h state svg-p
-                                                  backdrop regions active-ridx)
+                                                  backdrop regions active-ridx
+                                                  &optional reg-w reg-h)
   "Insert two-up BEFORE | AFTER view with full-height divider and top alignment."
-  (let* ((gui-px (and (omnidiff-image--display-graphic-p)
-                      (fboundp 'string-pixel-width)))
+  (let* ((gui-px (omnidiff-image--display-graphic-p))
          (indent-px (if gui-px (string-pixel-width "  ") 16))
          (div-px 16)
          (pane-w (/ (- avail-w div-px 16) 2))
          (zoom (omnidiff-image--state-zoom state))
+         (reg-w (or reg-w (max bw aw)))
+         (reg-h (or reg-h (max bh ah)))
          ;; Share scale factor for moderate size differences so resolution changes stay visible.
          (shared-scale
           (when (and (null zoom) (not svg-p)
@@ -2261,17 +2175,19 @@ Optional REASON explains why inline visual display was skipped."
                   (omnidiff-image--fit-size aw ah pane-w max-h svg-p zoom)))
          (b-img (omnidiff-image--make-view-image
                  b-key b-bytes b-type b-mime bw bh (car b-fit) (cdr b-fit)
-                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx))
+                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx
+                 card-key 'view-before reg-w reg-h))
          (a-img (omnidiff-image--make-view-image
                  a-key a-bytes a-type a-mime aw ah (car a-fit) (cdr a-fit)
-                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx))
+                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx
+                 card-key 'view-after reg-w reg-h))
          (b-dim-lbl (omnidiff-image--format-dim-label bw bh b-kind (car b-fit)))
          (a-dim-lbl (omnidiff-image--format-dim-label aw ah a-kind (car a-fit)))
          (b-hdr-str (concat (propertize " BEFORE " 'face 'omnidiff-side-before)
                             (propertize (concat " " b-dim-lbl) 'face 'omnidiff-side-bar)))
          (b-hdr-px (if gui-px (string-pixel-width b-hdr-str) (* (length b-hdr-str) 8)))
          ;; Tighten gap for small/portrait images to avoid 600px saccades.
-         (left-col-w (min pane-w (max (car b-fit) b-hdr-px 120)))
+         (left-col-w (max (car b-fit) (min pane-w (max b-hdr-px 120))))
          (center-px (+ indent-px left-col-w 12))
          (div-h (max (cdr b-fit) (cdr a-fit)))
          (div-img (omnidiff-image--make-pane-divider div-h))
@@ -2302,22 +2218,27 @@ Optional REASON explains why inline visual display was skipped."
     (insert "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-stacked (b-key b-bytes b-type b-mime
+(defun omnidiff-image--insert-stacked (card-key b-key b-bytes b-type b-mime
                                              a-key a-bytes a-type a-mime
                                              bw bh b-kind aw ah a-kind
                                              avail-w max-h state svg-p
-                                             backdrop regions active-ridx)
+                                             backdrop regions active-ridx
+                                             &optional reg-w reg-h)
   "Insert stacked BEFORE-then-AFTER image view."
   (let* ((zoom (omnidiff-image--state-zoom state))
          (pane-h (max 220 (round (* 0.65 max-h))))
+         (reg-w (or reg-w (max bw aw)))
+         (reg-h (or reg-h (max bh ah)))
          (b-fit (omnidiff-image--fit-size bw bh avail-w pane-h svg-p zoom))
          (a-fit (omnidiff-image--fit-size aw ah avail-w pane-h svg-p zoom))
          (b-img (omnidiff-image--make-view-image
                  b-key b-bytes b-type b-mime bw bh (car b-fit) (cdr b-fit)
-                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx))
+                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx
+                 card-key 'view-before reg-w reg-h))
          (a-img (omnidiff-image--make-view-image
                  a-key a-bytes a-type a-mime aw ah (car a-fit) (cdr a-fit)
-                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx))
+                 (or svg-p (and zoom t)) 0 backdrop regions active-ridx
+                 card-key 'view-after reg-w reg-h))
          (frame-face (omnidiff-image--frame-face)))
     (insert (propertize "  " 'face 'omnidiff-side-bar)
             (propertize " BEFORE " 'face 'omnidiff-side-before)
@@ -2346,40 +2267,43 @@ Optional REASON explains why inline visual display was skipped."
             "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-blink (b-key b-bytes b-type b-mime
-                                           a-key a-bytes a-type a-mime
-                                           bw bh b-kind aw ah a-kind
-                                           avail-w max-h state svg-p compat
-                                           backdrop regions active-ridx)
-  "Insert uniform-canvas in-place BEFORE/AFTER toggle image view."
-  (let* ((before-p (eq (omnidiff-image--state-blink-side state) 'before))
-         (key (if before-p b-key a-key))
-         (bytes (if before-p b-bytes a-bytes))
-         (type (if before-p b-type a-type))
-         (mime (if before-p b-mime a-mime))
-         (w (if before-p bw aw))
-         (h (if before-p bh ah))
-         (kind (if before-p b-kind a-kind))
-         (zoom (omnidiff-image--state-zoom state))
-         ;; Register both sides onto one shared canvas when aspect-compatible so flipping never jumps.
-         (ref-w (if compat (max bw aw) w))
-         (ref-h (if compat (max bh ah) h))
-         (fit (omnidiff-image--fit-size ref-w ref-h avail-w max-h svg-p zoom))
-         (img (omnidiff-image--make-view-image
-               key bytes type mime w h (car fit) (cdr fit)
-               (or compat svg-p (and zoom t)) 'center backdrop regions active-ridx))
-         (frame-face (omnidiff-image--frame-face))
-         (click-map (let ((m (make-sparse-keymap)))
-                      (set-keymap-parent m omnidiff-image-card-map)
-                      (define-key m [mouse-1]
-                        (lambda (ev)
-                          (interactive "e")
-                          (let ((ov (omnidiff-image--card-ov-at (posn-point (event-start ev)))))
-                            (when ov
-                              (goto-char (overlay-start ov))
-                              (omnidiff-image-toggle-side)))))
-                      m)))
-    (ignore kind)
+(defun omnidiff-image--insert-blink (ctx avail-w max-h regions active-ridx)
+  "Insert uniform-canvas in-place BEFORE/AFTER toggle image view for CTX."
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop compat
+                           b-key b-bytes b-type b-mime
+                           a-key a-bytes a-type a-mime
+                           bw bh aw ah)
+                ctx)
+               (before-p (eq (omnidiff-image--state-blink-side state) 'before))
+               (key (if before-p b-key a-key))
+               (bytes (if before-p b-bytes a-bytes))
+               (type (if before-p b-type a-type))
+               (mime (if before-p b-mime a-mime))
+               (w (if before-p bw aw))
+               (h (if before-p bh ah))
+               (zoom (omnidiff-image--state-zoom state))
+               ;; Register both sides onto one shared canvas when aspect-compatible so flipping never jumps.
+               (ref-w (if compat (max bw aw) w))
+               (ref-h (if compat (max bh ah) h))
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah))
+               (fit (omnidiff-image--fit-size ref-w ref-h avail-w max-h svg-p zoom))
+               (img (omnidiff-image--make-view-image
+                     key bytes type mime w h (car fit) (cdr fit)
+                     (or compat svg-p (and zoom t)) 'center backdrop regions active-ridx
+                     card-key (if before-p 'view-before 'view-after) reg-w reg-h))
+               (frame-face (omnidiff-image--frame-face))
+               (click-map (let ((m (make-sparse-keymap)))
+                            (set-keymap-parent m omnidiff-image-card-map)
+                            (define-key m [mouse-1]
+                              (lambda (ev)
+                                (interactive "e")
+                                (let ((ov (omnidiff-image-card-ov-at
+                                           (posn-point (event-start ev)))))
+                                  (when ov
+                                    (goto-char (overlay-start ov))
+                                    (omnidiff-image-toggle-side)))))
+                            m)))
     (omnidiff-image--insert-spacer)
     (insert (propertize "  " 'cursor-intangible t)
             (if img
@@ -2392,31 +2316,37 @@ Optional REASON explains why inline visual display was skipped."
             "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-swipe (pic b-key b-bytes b-type b-mime
-                                         a-key a-bytes a-type a-mime
-                                         bw bh aw ah avail-w max-h state svg-p
-                                         backdrop regions active-ridx)
+(defun omnidiff-image--insert-swipe (ctx avail-w max-h regions active-ridx)
   "Insert zero-Vernier-offset native `(slice ...)' split-curtain comparison."
-  (let* ((src-w (max bw aw))
-         (src-h (max bh ah))
-         (split (omnidiff-image--effective-swipe state pic src-w))
-         (zoom (omnidiff-image--state-zoom state))
-         (fit (omnidiff-image--fit-size src-w src-h (- avail-w 6) max-h svg-p zoom))
-         (disp-w (car fit))
-         (disp-h (cdr fit))
-         (b-img (omnidiff-image--make-view-image
-                 b-key b-bytes b-type b-mime bw bh disp-w disp-h
-                 t 'center backdrop regions active-ridx))
-         (a-img (omnidiff-image--make-view-image
-                 a-key a-bytes a-type a-mime aw ah disp-w disp-h
-                 t 'center backdrop regions active-ridx))
-         (handle-w (if (< disp-w 48) 1 3))
-         (handle (omnidiff-image--make-swipe-handle disp-h handle-w))
-         (frame-face (omnidiff-image--frame-face))
-         (drag-map (let ((m (make-sparse-keymap)))
-                     (set-keymap-parent m omnidiff-image-card-map)
-                     (define-key m [down-mouse-1] #'omnidiff-image-swipe-mouse-drag)
-                     m)))
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop
+                           b-key b-bytes b-type b-mime
+                           a-key a-bytes a-type a-mime
+                           bw bh aw ah)
+                ctx)
+               (src-w (max bw aw))
+               (src-h (max bh ah))
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah))
+               (split (omnidiff-image--effective-swipe state pic reg-w))
+               (zoom (omnidiff-image--state-zoom state))
+               (fit (omnidiff-image--fit-size src-w src-h (- avail-w 6) max-h svg-p zoom))
+               (disp-w (car fit))
+               (disp-h (cdr fit))
+               (b-img (omnidiff-image--make-view-image
+                       b-key b-bytes b-type b-mime bw bh disp-w disp-h
+                       t 'center backdrop regions active-ridx
+                       card-key 'view-before reg-w reg-h))
+               (a-img (omnidiff-image--make-view-image
+                       a-key a-bytes a-type a-mime aw ah disp-w disp-h
+                       t 'center backdrop regions active-ridx
+                       card-key 'view-after reg-w reg-h))
+               (handle-w (if (< disp-w 48) 1 3))
+               (handle (omnidiff-image--make-swipe-handle disp-h handle-w))
+               (frame-face (omnidiff-image--frame-face))
+               (drag-map (let ((m (make-sparse-keymap)))
+                           (set-keymap-parent m omnidiff-image-card-map)
+                           (define-key m [down-mouse-1] #'omnidiff-image-swipe-mouse-drag)
+                           m)))
     (omnidiff-image--insert-spacer)
     (insert (propertize "  " 'cursor-intangible t))
     (let ((img-start (point)))
@@ -2462,30 +2392,36 @@ Optional REASON explains why inline visual display was skipped."
     (insert "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-onion (file b-key b-bytes b-mime a-key a-bytes a-mime
-                                          bw bh aw ah avail-w max-h state svg-p
-                                          backdrop regions active-ridx)
+(defun omnidiff-image--insert-onion (ctx avail-w max-h regions active-ridx)
   "Insert alpha-correct `librsvg' onion-skin overlay with bounded descriptor cache."
-  (let* ((opacity (max 0.0 (min 1.0 (omnidiff-image--state-opacity state))))
-         (src-w (max 1 (round (max bw aw))))
-         (src-h (max 1 (round (max bh ah))))
-         (zoom (omnidiff-image--state-zoom state))
-         (fit (omnidiff-image--fit-size src-w src-h avail-w max-h svg-p zoom))
-         (disp-w (car fit))
-         (disp-h (cdr fit))
-         (dark-p (omnidiff-image--dark-background-p))
-         (fkey (omnidiff-file-target-path file))
-         (svg (omnidiff-image--build-svg-onion
-               b-key b-bytes b-mime a-key a-bytes a-mime
-               disp-w disp-h opacity backdrop dark-p
-               regions active-ridx src-w src-h))
-         (prev (gethash fkey omnidiff-image--onion-descs))
-         (img (create-image svg 'svg t :scale 1 :ascent 'center))
-         (frame-face (omnidiff-image--frame-face)))
-    (when (and prev (not (eq prev img)) (fboundp 'image-flush))
-      (ignore-errors (image-flush prev)))
-    (when img
-      (puthash fkey img omnidiff-image--onion-descs))
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop
+                           b-key b-bytes b-mime
+                           a-key a-bytes a-mime
+                           bw bh aw ah)
+                ctx)
+               (opacity (max 0.0 (min 1.0 (omnidiff-image--state-opacity state))))
+               (src-w (max 1 (round (max bw aw))))
+               (src-h (max 1 (round (max bh ah))))
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah))
+               (zoom (omnidiff-image--state-zoom state))
+               (fit (omnidiff-image--fit-size src-w src-h avail-w max-h svg-p zoom))
+               (disp-w (car fit))
+               (disp-h (cdr fit))
+               (dark-p (omnidiff-image--dark-background-p))
+               (hi (when regions (omnidiff-image--diff-highlight-hex)))
+               (desc-key (list 'onion b-key a-key disp-w disp-h opacity backdrop dark-p
+                               (and regions (length regions)) active-ridx hi
+                               (when regions reg-w) (when regions reg-h)))
+               (img (omnidiff-image--cached-slot-desc
+                     card-key 'onion desc-key
+                     (lambda ()
+                       (let ((svg (omnidiff-image--build-svg-onion
+                                   b-key b-bytes b-mime a-key a-bytes a-mime
+                                   disp-w disp-h opacity backdrop dark-p
+                                   regions active-ridx reg-w reg-h)))
+                         (create-image svg 'svg t :scale 1 :ascent 'center)))))
+               (frame-face (omnidiff-image--frame-face)))
     (omnidiff-image--insert-spacer)
     (insert (propertize "  " 'cursor-intangible t)
             (if img
@@ -2500,154 +2436,131 @@ Optional REASON explains why inline visual display was skipped."
 When CAN-CYCLE-P is non-nil, clicking it cycles diff styles."
   (if (not can-cycle-p)
       (propertize legend 'face 'omnidiff-image-bar)
-    (let ((map (make-sparse-keymap)))
-      (set-keymap-parent map omnidiff-image-card-map)
-      (define-key map [mouse-1]
-        (lambda (ev)
-          (interactive "e")
-          (mouse-set-point ev)
-          (omnidiff-image-cycle-diff-style)))
-      (propertize legend
-                  'face 'omnidiff-image-bar
-                  'mouse-face 'highlight
-                  'help-echo "Click or press `s' to cycle diff style (spotlight 2-up / spotlight / mask / delta)"
-                  'keymap map))))
+    (propertize legend
+                'face 'omnidiff-image-bar
+                'mouse-face 'highlight
+                'help-echo "Click or press `s' to cycle diff style (spotlight 2-up / spotlight / mask / delta)"
+                'keymap (omnidiff-image--click-map #'omnidiff-image-cycle-diff-style))))
 
-(defun omnidiff-image--build-svg-delta-desc (b-key b-bytes b-mime a-key a-bytes a-mime
+(defun omnidiff-image--build-svg-delta-desc (card-key b-key b-bytes b-mime a-key a-bytes a-mime
                                                    disp-w disp-h gain regions active-ridx
                                                    src-w src-h highlight)
   "Return cached built-in SVG RGB+alpha difference descriptor, or nil."
   (when (and (omnidiff-image--svg-embeddable-p b-mime)
              (omnidiff-image--svg-embeddable-p a-mime))
-    (let* ((svg (omnidiff-image--build-svg-diff
-                 b-key b-bytes b-mime a-key a-bytes a-mime
-                 disp-w disp-h gain regions active-ridx src-w src-h))
-           (svg-key (list 'svg-diff b-key a-key disp-w disp-h gain
-                          (and regions (length regions)) active-ridx
-                          (when regions highlight))))
-      (or (gethash svg-key omnidiff-image--img-cache)
-          (when-let* ((d (create-image svg 'svg t :scale 1 :ascent 'center)))
-            (omnidiff-image--register-descriptor d)
-            (puthash svg-key d omnidiff-image--img-cache))))))
+    (let ((svg-key (list 'svg-diff b-key a-key disp-w disp-h gain
+                         (and regions (length regions)) active-ridx
+                         (when regions highlight)
+                         (when regions src-w) (when regions src-h))))
+      (omnidiff-image--cached-slot-desc
+       (or card-key b-key) 'svg-diff svg-key
+       (lambda ()
+         (let ((svg (omnidiff-image--build-svg-diff
+                     b-key b-bytes b-mime a-key a-bytes a-mime
+                     disp-w disp-h gain regions active-ridx src-w src-h)))
+           (create-image svg 'svg t :scale 1 :ascent 'center)))))))
 
-(defun omnidiff-image--diff-render-plan (pic b-key b-bytes b-type b-mime
-                                             a-key a-bytes a-type a-mime
-                                             bw bh aw ah avail-w max-h
-                                             state card-ov svg-p backdrop
-                                             regions active-ridx)
-  "Compute render plan plist for `4:diff' mode.
+(defun omnidiff-image--diff-render-plan (ctx avail-w max-h card-ov regions active-ridx)
+  "Compute render plan plist for `4:diff' mode from dual CTX.
 Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
 `:can-cycle', and either `:b-bytes'/`:a-bytes'/`:diff-key' or `:img'."
-  (let* ((src-w (max 1 (round (max bw aw))))
-         (src-h (max 1 (round (max bh ah))))
-         (zoom (omnidiff-image--state-zoom state))
-         (fit (omnidiff-image--fit-size src-w src-h avail-w max-h svg-p zoom))
-         (disp-w (car fit))
-         (disp-h (cdr fit))
-         (dark-p (omnidiff-image--dark-background-p))
-         (highlight (omnidiff-image--diff-highlight-hex))
-         (fuzz (or (omnidiff-image--state-diff-fuzz state) omnidiff-image-diff-fuzz))
-         (gain (or (omnidiff-image--state-diff-gain state) omnidiff-image-diff-gain))
-         (magick-ok (omnidiff-image--magick-eligible-p pic b-type a-type bw bh aw ah))
-         (avail-styles (omnidiff-image--available-diff-styles magick-ok))
-         (can-cycle (> (length avail-styles) 1))
-         (style (omnidiff-image--effective-diff-style state magick-ok))
-         (fuzz-tag (if (> fuzz 0) (format " · fuzz %d%%" fuzz) ""))
-         (scaled-tag (if (eq (omnidiff-picture-comparison pic) 'resized-scaled) " · scaled" ""))
-         (style-hint (if can-cycle " (s)" "")))
-    (pcase style
-      ('spotlight-sbs
-       (let* ((diff-key (list 'spotlight-sbs b-key a-key dark-p fuzz))
-              (cached (gethash diff-key omnidiff-image--magick-cache)))
-         (if (and (consp cached)
-                  (stringp (car cached)) (> (length (car cached)) 0)
-                  (stringp (cdr cached)) (> (length (cdr cached)) 0))
-             (list :kind 'spotlight-sbs
-                   :diff-key diff-key
-                   :b-bytes (car cached)
-                   :a-bytes (cdr cached)
-                   :can-cycle can-cycle
-                   :legend (format "spotlight 2-up%s%s" fuzz-tag style-hint))
-           (when (and (null cached) card-ov)
-             (omnidiff-image--start-magick-spotlight
-              diff-key b-bytes b-type a-bytes a-type style dark-p fuzz card-ov)
-             (setq cached (gethash diff-key omnidiff-image--magick-cache)))
-           (let ((img (omnidiff-image--build-svg-delta-desc
-                       b-key b-bytes b-mime a-key a-bytes a-mime
-                       disp-w disp-h gain regions active-ridx src-w src-h highlight)))
-             (list :kind 'single
-                   :img img
-                   :can-cycle can-cycle
-                   :legend (if (eq cached 'pending)
-                               "spotlight 2-up · computing…"
-                             (format "delta ×%.1f (RGB+α%s)%s" gain scaled-tag style-hint)))))))
-      ('spotlight
-       (let* ((diff-key (list 'spotlight b-key a-key dark-p fuzz))
-              (cached (gethash diff-key omnidiff-image--magick-cache)))
-         (if (and (stringp cached) (> (length cached) 0))
-             (list :kind 'single
-                   :img (omnidiff-image--make-view-image
-                         diff-key cached 'png "image/png" src-w src-h disp-w disp-h
-                         (and zoom t) 'center backdrop regions active-ridx)
-                   :can-cycle can-cycle
-                   :legend (format "spotlight%s%s" fuzz-tag style-hint))
-           (when (and (null cached) card-ov)
-             (omnidiff-image--start-magick-spotlight
-              diff-key b-bytes b-type a-bytes a-type style dark-p fuzz card-ov)
-             (setq cached (gethash diff-key omnidiff-image--magick-cache)))
-           (let ((img (omnidiff-image--build-svg-delta-desc
-                       b-key b-bytes b-mime a-key a-bytes a-mime
-                       disp-w disp-h gain regions active-ridx src-w src-h highlight)))
-             (list :kind 'single
-                   :img img
-                   :can-cycle can-cycle
-                   :legend (if (eq cached 'pending)
-                               "spotlight · computing…"
-                             (format "delta ×%.1f (RGB+α%s)%s" gain scaled-tag style-hint)))))))
-      ('mask
-       (let* ((diff-key (list 'magick b-key a-key dark-p highlight fuzz))
-              (cached (gethash diff-key omnidiff-image--magick-cache)))
-         (if (and (stringp cached) (> (length cached) 0))
-             (list :kind 'single
-                   :img (omnidiff-image--make-view-image
-                         diff-key cached 'png "image/png" src-w src-h disp-w disp-h
-                         (and zoom t) 'center 'none regions active-ridx)
-                   :can-cycle can-cycle
-                   :legend (format "mask (magick%s)%s" fuzz-tag style-hint))
-           (when (and (null cached) card-ov)
-             (omnidiff-image--start-magick-diff
-              diff-key b-bytes b-type a-bytes a-type highlight fuzz card-ov)
-             (setq cached (gethash diff-key omnidiff-image--magick-cache)))
-           (let ((img (omnidiff-image--build-svg-delta-desc
-                       b-key b-bytes b-mime a-key a-bytes a-mime
-                       disp-w disp-h gain regions active-ridx src-w src-h highlight)))
-             (list :kind 'single
-                   :img img
-                   :can-cycle can-cycle
-                   :legend (if (eq cached 'pending)
-                               (format "delta ×%.1f · loading pixel mask…" gain)
-                             (format "delta ×%.1f (RGB+α%s)%s" gain scaled-tag style-hint)))))))
-      (_
-       (let ((img (omnidiff-image--build-svg-delta-desc
-                   b-key b-bytes b-mime a-key a-bytes a-mime
-                   disp-w disp-h gain regions active-ridx src-w src-h highlight)))
-         (list :kind 'single
-               :img img
-               :can-cycle can-cycle
-               :legend (if img
-                           (format "delta ×%.1f (RGB+α%s)%s" gain scaled-tag style-hint)
-                         "unavailable")))))))
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop
+                           b-key b-bytes b-type b-mime
+                           a-key a-bytes a-type a-mime
+                           bw bh aw ah magick-p)
+                ctx)
+               (src-w (max 1 (round (max bw aw))))
+               (src-h (max 1 (round (max bh ah))))
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah))
+               (zoom (omnidiff-image--state-zoom state))
+               (fit (omnidiff-image--fit-size src-w src-h avail-w max-h svg-p zoom))
+               (disp-w (car fit))
+               (disp-h (cdr fit))
+               (dark-p (omnidiff-image--dark-background-p))
+               (highlight (omnidiff-image--diff-highlight-hex))
+               (fuzz (or (omnidiff-image--state-diff-fuzz state) omnidiff-image-diff-fuzz))
+               (gain (or (omnidiff-image--state-diff-gain state) omnidiff-image-diff-gain))
+               (avail-styles (omnidiff-image--available-diff-styles magick-p))
+               (can-cycle (> (length avail-styles) 1))
+               (style (omnidiff-image--effective-diff-style state magick-p))
+               (fuzz-tag (if (> fuzz 0) (format " · fuzz %d%%" fuzz) ""))
+               (scaled-tag (if (eq (omnidiff-picture-comparison pic) 'resized-scaled) " · scaled" ""))
+               (style-hint (if can-cycle " (s)" "")))
+    (cl-flet ((delta-fallback (pending-legend)
+                (let ((img (omnidiff-image--build-svg-delta-desc
+                            card-key b-key b-bytes b-mime a-key a-bytes a-mime
+                            disp-w disp-h gain regions active-ridx reg-w reg-h highlight)))
+                  (list :kind 'single
+                        :img img
+                        :can-cycle can-cycle
+                        :legend (cond
+                                 (pending-legend pending-legend)
+                                 (img (format "delta ×%.1f (RGB+α%s)%s"
+                                              gain scaled-tag style-hint))
+                                 (t "unavailable"))))))
+      (if (eq style 'delta)
+          (delta-fallback nil)
+        (let* ((diff-key (pcase style
+                           ('spotlight-sbs (list 'spotlight-sbs b-key a-key dark-p fuzz))
+                           ('spotlight (list 'spotlight b-key a-key dark-p fuzz))
+                           (_ (list 'magick b-key a-key dark-p highlight fuzz))))
+               (cached (gethash diff-key omnidiff-image--magick-cache))
+               (ready-p (if (eq style 'spotlight-sbs)
+                            (and (consp cached)
+                                 (stringp (car cached)) (> (length (car cached)) 0)
+                                 (stringp (cdr cached)) (> (length (cdr cached)) 0))
+                          (and (stringp cached) (> (length cached) 0)))))
+          (if ready-p
+              (pcase style
+                ('spotlight-sbs
+                 (list :kind 'spotlight-sbs
+                       :diff-key diff-key
+                       :b-bytes (car cached)
+                       :a-bytes (cdr cached)
+                       :can-cycle can-cycle
+                       :legend (format "spotlight 2-up%s%s" fuzz-tag style-hint)))
+                ('spotlight
+                 (list :kind 'single
+                       :img (omnidiff-image--make-view-image
+                             diff-key cached 'png "image/png" src-w src-h disp-w disp-h
+                             (and zoom t) 'center backdrop regions active-ridx
+                             card-key 'view-diff reg-w reg-h)
+                       :can-cycle can-cycle
+                       :legend (format "spotlight%s%s" fuzz-tag style-hint)))
+                (_
+                 (list :kind 'single
+                       :img (omnidiff-image--make-view-image
+                             diff-key cached 'png "image/png" src-w src-h disp-w disp-h
+                             (and zoom t) 'center 'none regions active-ridx
+                             card-key 'view-diff reg-w reg-h)
+                       :can-cycle can-cycle
+                       :legend (format "mask (magick%s)%s" fuzz-tag style-hint))))
+            (when (and (null cached) card-ov)
+              (if (eq style 'mask)
+                  (omnidiff-image--start-magick-diff
+                   card-key diff-key b-bytes b-type a-bytes a-type highlight fuzz card-ov)
+                (omnidiff-image--start-magick-spotlight
+                 card-key diff-key b-bytes b-type a-bytes a-type style dark-p fuzz card-ov))
+              (setq cached (gethash diff-key omnidiff-image--magick-cache)))
+            (delta-fallback
+             (when (eq cached 'pending)
+               (pcase style
+                 ('spotlight-sbs "spotlight 2-up · computing…")
+                 ('spotlight "spotlight · computing…")
+                 (_ (format "delta ×%.1f · loading pixel mask…" gain)))))))))))
 
-(defun omnidiff-image--insert-single-side (side key bytes type mime info
+(defun omnidiff-image--insert-single-side (card-key side key bytes type mime info
                                                 avail-w max-h state svg-p
-                                                backdrop &optional warning)
+                                                backdrop &optional warning dims)
   "Insert single-side preview for added, deleted, or partially-readable image."
-  (pcase-let* ((`(,w ,h ,kind) (omnidiff-image--resolve-dims info bytes type))
+  (pcase-let* ((`(,w ,h ,kind) (or dims (omnidiff-image--resolve-dims info bytes type)))
                (zoom (omnidiff-image--state-zoom state))
                (`(,disp-w . ,disp-h) (omnidiff-image--fit-size w h avail-w max-h svg-p zoom))
                (img (omnidiff-image--make-view-image
                      key bytes type mime w h disp-w disp-h
-                     (or svg-p (and zoom t)) 'center backdrop nil nil))
+                     (or svg-p (and zoom t)) 'center backdrop nil nil
+                     card-key (if (eq side 'before) 'view-before 'view-after)))
                (frame-face (omnidiff-image--frame-face)))
     (insert (propertize "  " 'face 'omnidiff-image-bar)
             (if (eq side 'before)
@@ -2668,33 +2581,28 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
             "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-identical-compact (pic a-key a-bytes a-type a-mime
-                                                     aw ah a-kind avail-w max-h
-                                                     state svg-p backdrop)
-  "Insert sleek single-image view for pixel-identical files with `i' expand button."
-  (let* ((b-info (omnidiff-picture-before pic))
-         (a-info (omnidiff-picture-after pic))
-         (zoom (omnidiff-image--state-zoom state))
-         (fit (omnidiff-image--fit-size aw ah avail-w max-h svg-p zoom))
-         (img (omnidiff-image--make-view-image
-               a-key a-bytes a-type a-mime aw ah (car fit) (cdr fit)
-               (or svg-p (and zoom t)) 'center backdrop nil nil))
-         (size-note (when (and b-info a-info)
-                      (format "%s → %s (%s)"
-                              (omnidiff-image-format-bytes (omnidiff-picture-info-bytes b-info))
-                              (omnidiff-image-format-bytes (omnidiff-picture-info-bytes a-info))
-                              (omnidiff-image--format-size-delta
-                               (omnidiff-picture-info-bytes b-info)
-                               (omnidiff-picture-info-bytes a-info)))))
-         (expand-map (let ((m (make-sparse-keymap)))
-                       (set-keymap-parent m omnidiff-image-card-map)
-                       (define-key m [mouse-1]
-                         (lambda (ev)
-                           (interactive "e")
-                           (mouse-set-point ev)
-                           (omnidiff-image-cycle-mode)))
-                       m))
-         (frame-face (omnidiff-image--frame-face)))
+(defun omnidiff-image--insert-identical-compact (ctx avail-w max-h)
+  "Insert sleek single-image view for pixel-identical CTX with `i' expand button."
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop
+                           a-key a-bytes a-type a-mime aw ah a-kind)
+                ctx)
+               (b-info (omnidiff-picture-before pic))
+               (a-info (omnidiff-picture-after pic))
+               (zoom (omnidiff-image--state-zoom state))
+               (fit (omnidiff-image--fit-size aw ah avail-w max-h svg-p zoom))
+               (img (omnidiff-image--make-view-image
+                     a-key a-bytes a-type a-mime aw ah (car fit) (cdr fit)
+                     (or svg-p (and zoom t)) 'center backdrop nil nil
+                     card-key 'view-after))
+               (size-note (when (and b-info a-info)
+                            (format "%s → %s (%s)"
+                                    (omnidiff-engine-format-bytes (omnidiff-picture-info-bytes b-info))
+                                    (omnidiff-engine-format-bytes (omnidiff-picture-info-bytes a-info))
+                                    (omnidiff-image--format-size-delta
+                                     (omnidiff-picture-info-bytes b-info)
+                                     (omnidiff-picture-info-bytes a-info)))))
+               (frame-face (omnidiff-image--frame-face)))
     (insert (propertize "  " 'face 'omnidiff-image-bar)
             (propertize " IDENTICAL " 'face 'omnidiff-image-mode-active)
             (propertize (concat "  no pixel changed"
@@ -2703,7 +2611,8 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
                                 "  ·  ")
                         'face 'omnidiff-image-bar)
             (propertize " i:compare " 'face 'omnidiff-image-mode-inactive
-                        'mouse-face 'highlight 'keymap expand-map
+                        'mouse-face 'highlight
+                        'keymap (omnidiff-image--click-map #'omnidiff-image-cycle-mode)
                         'help-echo "Expand full comparison modes")
             (propertize "\n" 'face 'omnidiff-image-bar))
     (omnidiff-image--insert-spacer)
@@ -2715,10 +2624,13 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
             "\n")
     (omnidiff-image--insert-spacer)))
 
-(defun omnidiff-image--insert-card-content (file pic state card-ov &optional initial-render-p)
-  "Insert interactive image diff content for FILE and PIC into current buffer."
+(defun omnidiff-image--resolve-card-context (file pic state &optional initial-render-p)
+  "Resolve `omnidiff-image--ctx' for FILE, PIC, and STATE without mutating state.
+Checks GUI availability, auto-load deferral, size limits, LFS pointers,
+and Emacs image format support before reporting capabilities."
   (let* ((repo-dir (or (and (boundp 'omnidiff--repo-dir) omnidiff--repo-dir)
                        default-directory))
+         (card-key (omnidiff-image--card-key file))
          (svg-p (omnidiff-picture-svg-p pic))
          (gui-p (and omnidiff-image-enabled (omnidiff-image--display-graphic-p)))
          (force-p (omnidiff-image--state-force-load state))
@@ -2731,16 +2643,14 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
                             (omnidiff-image--state-deferred state)))))
     (cond
      ((not gui-p)
-      (omnidiff-image--insert-tty-summary pic nil state nil))
+      (make-omnidiff-image--ctx :status 'tty :file file :pic pic :state state
+                                :card-key card-key :repo-dir repo-dir :svg-p svg-p
+                                :force-p force-p))
      (over-limit
-      (setf (omnidiff-image--state-deferred state) t)
-      (omnidiff-image--insert-tty-summary
-       pic
-       (format "Preview deferred (> %d auto-loaded images) — click or press L to load (C-u L all)"
-               omnidiff-image-auto-load-limit)
-       state t))
+      (make-omnidiff-image--ctx :status 'deferred :file file :pic pic :state state
+                                :card-key card-key :repo-dir repo-dir :svg-p svg-p
+                                :force-p force-p))
      (t
-      (setf (omnidiff-image--state-deferred state) nil)
       (let* ((b-bytes (omnidiff-image--fetch-side-bytes file pic 'before repo-dir force-p))
              (a-bytes (omnidiff-image--fetch-side-bytes file pic 'after repo-dir force-p))
              (b-key (omnidiff-image--side-source-key file 'before repo-dir))
@@ -2754,8 +2664,10 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
              (b-mime (cdr b-tm))
              (a-type (car a-tm))
              (a-mime (cdr a-tm))
-             (b-avail (and b-type (image-type-available-p b-type)))
-             (a-avail (and a-type (image-type-available-p a-type)))
+             (b-lfs (or (eq b-bytes 'lfs-pointer) (eq b-type 'lfs-pointer)))
+             (a-lfs (or (eq a-bytes 'lfs-pointer) (eq a-type 'lfs-pointer)))
+             (b-avail (and b-type (not b-lfs) (image-type-available-p b-type)))
+             (a-avail (and a-type (not a-lfs) (image-type-available-p a-type)))
              (has-alpha (omnidiff-image--has-alpha-p pic b-bytes b-type a-bytes a-type))
              (backdrop (omnidiff-image--effective-backdrop state has-alpha))
              (dual-expected (and (not (memq (omnidiff-file-status file) '(added deleted)))
@@ -2764,200 +2676,276 @@ Returns a plist with `:kind' (`spotlight-sbs' or `single'), `:legend',
                                      (omnidiff-file-before-disk-path file))
                                  (or (omnidiff-picture-after pic)
                                      (omnidiff-file-new-oid file)
-                                     (omnidiff-file-after-disk-path file)))))
-        ;; Only count toward auto-load budget when at least one side actually renders.
-        (when (and initial-render-p (not force-p) (not too-large) (or b-avail a-avail))
-          (setq omnidiff-image--render-auto-count (1+ omnidiff-image--render-auto-count)))
-        (pcase-let ((`(,avail-w . ,max-h) (omnidiff-image--viewport-px)))
-          (cond
-           (too-large
-            (omnidiff-image--insert-tty-summary
-             pic
-             (format "Image exceeds %s auto-load limit — click or press L to load"
-                     (omnidiff-image-format-bytes omnidiff-image-max-bytes))
-             state t))
-           ((and b-avail a-avail)
-            (pcase-let* ((`(,bw ,bh ,b-kind) (omnidiff-image--resolve-dims
-                                              (omnidiff-picture-before pic) b-bytes b-type))
-                         (`(,aw ,ah ,a-kind) (omnidiff-image--resolve-dims
-                                              (omnidiff-picture-after pic) a-bytes a-type))
-                         (compat (omnidiff-image--compatible-overlay-p pic bw bh aw ah))
-                         (svg-embed-p (and (omnidiff-image--svg-embeddable-p b-mime)
-                                           (omnidiff-image--svg-embeddable-p a-mime)))
-                         (magick-p (and (omnidiff-image--magick-eligible-p
-                                         pic b-type a-type bw bh aw ah)
-                                        t))
-                         (avail-modes (omnidiff-image--available-modes compat svg-embed-p magick-p))
-                         (compact-ident (and (eq (omnidiff-picture-comparison pic) 'identical)
-                                             (not (omnidiff-image--state-expand-identical state))
-                                             (null (omnidiff-image--state-mode state))))
-                         (show-r (omnidiff-image--state-show-regions state))
-                         (regions (when (and show-r compat
-                                             (not (eq (omnidiff-picture-comparison pic) 'resized)))
-                                    (omnidiff-picture-regions pic)))
-                         (active-ridx (if regions
-                                          (mod (max 0 (omnidiff-image--state-region-idx state))
-                                               (length regions))
-                                        0)))
-              (if compact-ident
-                  (omnidiff-image--insert-identical-compact
-                   pic a-key a-bytes a-type a-mime aw ah a-kind avail-w max-h state svg-p backdrop)
-                (let* ((req-mode (omnidiff-image--effective-mode state compat))
-                       (pane-w (/ (- avail-w 32) 2))
-                       (narrow-fallback (and (eq req-mode 'side-by-side) (< pane-w 160)))
-                       (mode (if narrow-fallback 'stacked req-mode))
-                       (extras (omnidiff-image--toolbar-extras state backdrop pic)))
-                  (unless (memq mode avail-modes)
-                    (setq mode (car avail-modes)))
-                  (pcase mode
-                    ('side-by-side
-                     (omnidiff-image--insert-toolbar mode avail-modes state extras pic (max bw aw))
-                     (omnidiff-image--insert-side-by-side
-                      b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
-                      bw bh b-kind aw ah a-kind avail-w max-h state svg-p
-                      backdrop regions active-ridx))
-                    ('stacked
-                     (omnidiff-image--insert-toolbar
-                      mode avail-modes state
-                      (append (when narrow-fallback
-                                (list (propertize "narrow window" 'face 'omnidiff-image-bar)))
-                              extras)
-                      pic (max bw aw))
-                     (omnidiff-image--insert-stacked
-                      b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
-                      bw bh b-kind aw ah a-kind avail-w max-h state svg-p
-                      backdrop regions active-ridx))
-                    ('blink
-                     (let* ((before-p (eq (omnidiff-image--state-blink-side state) 'before))
-                            (w (if before-p bw aw))
-                            (h (if before-p bh ah))
-                            (k (if before-p b-kind a-kind))
-                            (ref-w (if compat (max bw aw) w))
-                            (ref-h (if compat (max bh ah) h))
-                            (fit (omnidiff-image--fit-size
-                                  ref-w ref-h avail-w max-h svg-p
-                                  (omnidiff-image--state-zoom state)))
-                            (side-pill (if before-p
-                                           (propertize " BEFORE " 'face 'omnidiff-side-before)
-                                         (propertize " AFTER  " 'face 'omnidiff-side-after)))
-                            (dim-str (propertize
-                                      (omnidiff-image--format-dim-label w h k (car fit))
-                                      'face 'omnidiff-image-bar))
-                            (back-hint (when (omnidiff-image--state-prev-mode state)
-                                         (propertize "DEL back" 'face 'omnidiff-image-bar))))
-                       (omnidiff-image--insert-toolbar
-                        mode avail-modes state
-                        (append (list side-pill dim-str back-hint) extras)
-                        pic (max bw aw))
-                       (omnidiff-image--insert-blink
-                        b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
-                        bw bh b-kind aw ah a-kind avail-w max-h state svg-p compat
-                        backdrop regions active-ridx)))
-                    ('swipe
-                     (let* ((src-w (max bw aw))
-                            (fit (omnidiff-image--fit-size
-                                  src-w (max bh ah) (- avail-w 6) max-h svg-p
-                                  (omnidiff-image--state-zoom state)))
-                            (dim-str (omnidiff-image--format-dim-label
-                                      src-w (max bh ah) a-kind (car fit))))
-                       (omnidiff-image--insert-toolbar
-                        mode avail-modes state
-                        (append (list (concat (propertize " BEFORE " 'face 'omnidiff-side-before)
-                                              (propertize " ◀┃▶ " 'face 'omnidiff-image-bar)
-                                              (propertize " AFTER  " 'face 'omnidiff-side-after))
-                                      (propertize dim-str 'face 'omnidiff-image-bar))
-                                extras)
-                        pic src-w)
-                       (omnidiff-image--insert-swipe
-                        pic b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
-                        bw bh aw ah avail-w max-h state svg-p
-                        backdrop regions active-ridx)))
-                    ('onion
-                     (omnidiff-image--insert-toolbar
-                      mode avail-modes state
-                      (append (list (propertize "BEFORE ◀ AFTER ▶" 'face 'omnidiff-image-bar))
-                              extras)
-                      pic (max bw aw))
-                     (omnidiff-image--insert-onion
-                      file b-key b-bytes b-mime a-key a-bytes a-mime
-                      bw bh aw ah avail-w max-h state svg-p
-                      backdrop regions active-ridx))
-                    ('diff
-                     (let* ((plan (omnidiff-image--diff-render-plan
-                                   pic b-key b-bytes b-type b-mime
-                                   a-key a-bytes a-type a-mime
-                                   bw bh aw ah avail-w max-h
-                                   state card-ov svg-p backdrop regions active-ridx))
-                            (chip (omnidiff-image--make-diff-style-chip
-                                   (plist-get plan :legend)
-                                   (plist-get plan :can-cycle))))
-                       (if (eq (plist-get plan :kind) 'spotlight-sbs)
-                           (let* ((diff-key (plist-get plan :diff-key))
-                                  (sb-bytes (plist-get plan :b-bytes))
-                                  (sa-bytes (plist-get plan :a-bytes))
-                                  (sbs-narrow (< pane-w 160)))
-                             (omnidiff-image--insert-toolbar
-                              mode avail-modes state
-                              (append (list chip)
-                                      (when sbs-narrow
-                                        (list (propertize "narrow window" 'face 'omnidiff-image-bar)))
-                                      extras)
-                              pic (max bw aw))
-                             (if sbs-narrow
-                                 (omnidiff-image--insert-stacked
-                                  (cons 'spot-b diff-key) sb-bytes 'png "image/png"
-                                  (cons 'spot-a diff-key) sa-bytes 'png "image/png"
-                                  bw bh b-kind aw ah a-kind avail-w max-h state nil
-                                  backdrop regions active-ridx)
-                               (omnidiff-image--insert-side-by-side
-                                (cons 'spot-b diff-key) sb-bytes 'png "image/png"
-                                (cons 'spot-a diff-key) sa-bytes 'png "image/png"
-                                bw bh b-kind aw ah a-kind avail-w max-h state nil
-                                backdrop regions active-ridx)))
-                         (let ((img (plist-get plan :img)))
-                           (omnidiff-image--insert-toolbar
-                            mode avail-modes state
-                            (append (list chip) extras)
-                            pic (max bw aw))
-                           (omnidiff-image--insert-spacer)
-                           (insert (propertize "  " 'cursor-intangible t)
-                                   (if img
-                                       (propertize " " 'display img
-                                                   'face (omnidiff-image--frame-face)
-                                                   'rear-nonsticky '(display face)
-                                                   'cursor-intangible t)
-                                     (propertize "[pixel diff unavailable for this format]"
-                                                 'face 'omnidiff-gap))
-                                   "\n")
-                           (omnidiff-image--insert-spacer))))))))
-              (when show-r
-                (when (and regions (= bw aw) (= bh ah))
-                  (omnidiff-image--insert-region-loupe
-                   pic state b-key b-bytes b-mime a-key a-bytes a-mime
-                   bw bh backdrop avail-w))
-                (omnidiff-image--insert-regions pic "  " active-ridx t))))
-           (a-avail
-            (omnidiff-image--insert-single-side
-             'after a-key a-bytes a-type a-mime (omnidiff-picture-after pic)
-             avail-w max-h state svg-p backdrop
-             (when dual-expected "BEFORE unavailable — showing AFTER only")))
-           (b-avail
-            (omnidiff-image--insert-single-side
-             'before b-key b-bytes b-type b-mime (omnidiff-picture-before pic)
-             avail-w max-h state svg-p backdrop
-             (when dual-expected "AFTER unavailable — showing BEFORE only")))
-           (t
-            (omnidiff-image--insert-tty-summary
-             pic
-             (cond
-              ((or b-ok a-ok)
-               "Emacs build does not support rendering this image format (press x for external viewer)")
-              (t "Image blob unavailable"))
-             state nil)))))))))
+                                     (omnidiff-file-after-disk-path file))))
+             (status (cond
+                      (too-large 'too-large)
+                      ((and b-avail a-avail) 'dual)
+                      (a-avail 'after-only)
+                      (b-avail 'before-only)
+                      ((or b-lfs a-lfs) 'lfs-pointer)
+                      ((or b-ok a-ok) 'unsupported)
+                      (t 'missing)))
+             (dual-p (eq status 'dual))
+             (b-dims (when (memq status '(dual before-only))
+                       (omnidiff-image--resolve-dims
+                        (omnidiff-picture-before pic) b-bytes b-type)))
+             (a-dims (when (memq status '(dual after-only))
+                       (omnidiff-image--resolve-dims
+                        (omnidiff-picture-after pic) a-bytes a-type)))
+             (bw (nth 0 b-dims)) (bh (nth 1 b-dims)) (b-kind (nth 2 b-dims))
+             (aw (nth 0 a-dims)) (ah (nth 1 a-dims)) (a-kind (nth 2 a-dims))
+             (compat (and dual-p (omnidiff-image--compatible-overlay-p pic bw bh aw ah)))
+             (svg-embed-p (and dual-p
+                               (omnidiff-image--svg-embeddable-p b-mime)
+                               (omnidiff-image--svg-embeddable-p a-mime)))
+             (magick-p (and dual-p
+                            (omnidiff-image--magick-eligible-p
+                             pic b-type a-type bw bh aw ah)
+                            t)))
+        (make-omnidiff-image--ctx
+         :status status :file file :pic pic :state state
+         :card-key card-key :repo-dir repo-dir :svg-p svg-p :force-p force-p
+         :b-bytes b-bytes :b-key b-key :b-type b-type :b-mime b-mime
+         :b-lfs b-lfs :b-avail b-avail
+         :a-bytes a-bytes :a-key a-key :a-type a-type :a-mime a-mime
+         :a-lfs a-lfs :a-avail a-avail
+         :has-alpha has-alpha :backdrop backdrop :dual-expected dual-expected
+         :bw bw :bh bh :b-kind b-kind :aw aw :ah ah :a-kind a-kind
+         :compat compat :svg-embed-p svg-embed-p :magick-p magick-p
+         :avail-modes (when dual-p
+                        (omnidiff-image--available-modes compat svg-embed-p magick-p))))))))
+
+(defun omnidiff-image--insert-diff-card (ctx avail-w max-h pane-w mode avail-modes
+                                             extras regions active-ridx card-ov)
+  "Insert `4:diff' mode toolbar and pixel diff content for dual CTX."
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key backdrop
+                           bw bh b-kind aw ah a-kind)
+                ctx)
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah))
+               (plan (omnidiff-image--diff-render-plan
+                      ctx avail-w max-h card-ov regions active-ridx))
+               (chip (omnidiff-image--make-diff-style-chip
+                      (plist-get plan :legend)
+                      (plist-get plan :can-cycle))))
+    (if (eq (plist-get plan :kind) 'spotlight-sbs)
+        (let* ((diff-key (plist-get plan :diff-key))
+               (sb-bytes (plist-get plan :b-bytes))
+               (sa-bytes (plist-get plan :a-bytes))
+               (sbs-narrow (< pane-w 160)))
+          (omnidiff-image--insert-toolbar
+           mode avail-modes state
+           (append (list chip)
+                   (when sbs-narrow
+                     (list (propertize "narrow window" 'face 'omnidiff-image-bar)))
+                   extras)
+           pic reg-w)
+          (if sbs-narrow
+              (omnidiff-image--insert-stacked
+               card-key (cons 'spot-b diff-key) sb-bytes 'png "image/png"
+               (cons 'spot-a diff-key) sa-bytes 'png "image/png"
+               bw bh b-kind aw ah a-kind avail-w max-h state nil
+               backdrop regions active-ridx reg-w reg-h)
+            (omnidiff-image--insert-side-by-side
+             card-key (cons 'spot-b diff-key) sb-bytes 'png "image/png"
+             (cons 'spot-a diff-key) sa-bytes 'png "image/png"
+             bw bh b-kind aw ah a-kind avail-w max-h state nil
+             backdrop regions active-ridx reg-w reg-h)))
+      (let ((img (plist-get plan :img)))
+        (omnidiff-image--insert-toolbar
+         mode avail-modes state
+         (append (list chip) extras)
+         pic reg-w)
+        (omnidiff-image--insert-spacer)
+        (insert (propertize "  " 'cursor-intangible t)
+                (if img
+                    (propertize " " 'display img
+                                'face (omnidiff-image--frame-face)
+                                'rear-nonsticky '(display face)
+                                'cursor-intangible t)
+                  (propertize "[pixel diff unavailable for this format]"
+                              'face 'omnidiff-gap))
+                "\n")
+        (omnidiff-image--insert-spacer)))))
+
+(defun omnidiff-image--insert-dual-card (ctx avail-w max-h card-ov)
+  "Insert dual-sided visual comparison card for resolved CTX."
+  (pcase-let* (((cl-struct omnidiff-image--ctx
+                           pic state card-key svg-p backdrop
+                           b-key b-bytes b-type b-mime
+                           a-key a-bytes a-type a-mime
+                           bw bh b-kind aw ah a-kind
+                           compat avail-modes)
+                ctx)
+               (compact-ident (and (eq (omnidiff-picture-comparison pic) 'identical)
+                                   (not (omnidiff-image--state-expand-identical state))
+                                   (null (omnidiff-image--state-mode state))))
+               (show-r (omnidiff-image--state-show-regions state))
+               (regions (when (and show-r compat
+                                   (not (eq (omnidiff-picture-comparison pic) 'resized)))
+                          (omnidiff-picture-regions pic)))
+               (active-ridx (if regions
+                                (mod (max 0 (omnidiff-image--state-region-idx state))
+                                     (length regions))
+                              0))
+               (`(,reg-w . ,reg-h) (omnidiff-image--region-grid-dims pic bw bh aw ah)))
+    (if compact-ident
+        (omnidiff-image--insert-identical-compact ctx avail-w max-h)
+      (let* ((req-mode (omnidiff-image--effective-mode state compat))
+             (pane-w (/ (- avail-w 32) 2))
+             (narrow-fallback (and (eq req-mode 'side-by-side) (< pane-w 160)))
+             (mode (if narrow-fallback 'stacked req-mode))
+             (extras (omnidiff-image--toolbar-extras state backdrop pic)))
+        (unless (memq mode avail-modes)
+          (setq mode (car avail-modes)))
+        (pcase mode
+          ('side-by-side
+           (omnidiff-image--insert-toolbar mode avail-modes state extras pic reg-w)
+           (omnidiff-image--insert-side-by-side
+            card-key b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
+            bw bh b-kind aw ah a-kind avail-w max-h state svg-p
+            backdrop regions active-ridx reg-w reg-h))
+          ('stacked
+           (omnidiff-image--insert-toolbar
+            mode avail-modes state
+            (append (when narrow-fallback
+                      (list (propertize "narrow window" 'face 'omnidiff-image-bar)))
+                    extras)
+            pic reg-w)
+           (omnidiff-image--insert-stacked
+            card-key b-key b-bytes b-type b-mime a-key a-bytes a-type a-mime
+            bw bh b-kind aw ah a-kind avail-w max-h state svg-p
+            backdrop regions active-ridx reg-w reg-h))
+          ('blink
+           (let* ((before-p (eq (omnidiff-image--state-blink-side state) 'before))
+                  (w (if before-p bw aw))
+                  (h (if before-p bh ah))
+                  (k (if before-p b-kind a-kind))
+                  (ref-w (if compat (max bw aw) w))
+                  (ref-h (if compat (max bh ah) h))
+                  (fit (omnidiff-image--fit-size
+                        ref-w ref-h avail-w max-h svg-p
+                        (omnidiff-image--state-zoom state)))
+                  (side-pill (if before-p
+                                 (propertize " BEFORE " 'face 'omnidiff-side-before)
+                               (propertize " AFTER  " 'face 'omnidiff-side-after)))
+                  (dim-str (propertize
+                            (omnidiff-image--format-dim-label w h k (car fit))
+                            'face 'omnidiff-image-bar))
+                  (back-hint (when (omnidiff-image--state-prev-mode state)
+                               (propertize "DEL back" 'face 'omnidiff-image-bar))))
+             (omnidiff-image--insert-toolbar
+              mode avail-modes state
+              (append (list side-pill dim-str back-hint) extras)
+              pic reg-w)
+             (omnidiff-image--insert-blink ctx avail-w max-h regions active-ridx)))
+          ('swipe
+           (let* ((src-w (max bw aw))
+                  (fit (omnidiff-image--fit-size
+                        src-w (max bh ah) (- avail-w 6) max-h svg-p
+                        (omnidiff-image--state-zoom state)))
+                  (dim-str (omnidiff-image--format-dim-label
+                            src-w (max bh ah) a-kind (car fit))))
+             (omnidiff-image--insert-toolbar
+              mode avail-modes state
+              (append (list (concat (propertize " BEFORE " 'face 'omnidiff-side-before)
+                                    (propertize " ◀┃▶ " 'face 'omnidiff-image-bar)
+                                    (propertize " AFTER  " 'face 'omnidiff-side-after))
+                            (propertize dim-str 'face 'omnidiff-image-bar))
+                      extras)
+              pic reg-w)
+             (omnidiff-image--insert-swipe ctx avail-w max-h regions active-ridx)))
+          ('onion
+           (omnidiff-image--insert-toolbar
+            mode avail-modes state
+            (append (list (propertize "BEFORE ◀ AFTER ▶" 'face 'omnidiff-image-bar))
+                    extras)
+            pic reg-w)
+           (omnidiff-image--insert-onion ctx avail-w max-h regions active-ridx))
+          ('diff
+           (omnidiff-image--insert-diff-card
+            ctx avail-w max-h pane-w mode avail-modes extras
+            regions active-ridx card-ov)))))
+    (when show-r
+      (when regions
+        (omnidiff-image--insert-region-loupe
+         card-key pic state b-key b-bytes b-mime a-key a-bytes a-mime
+         reg-w reg-h backdrop avail-w))
+      (omnidiff-image--insert-regions pic "  " active-ridx t))))
+
+(defun omnidiff-image--insert-card-content (file pic state card-ov &optional initial-render-p)
+  "Insert interactive image diff content for FILE and PIC into current buffer."
+  (pcase-let* ((ctx (omnidiff-image--resolve-card-context file pic state initial-render-p))
+               ((cl-struct omnidiff-image--ctx
+                           status card-key svg-p force-p backdrop dual-expected
+                           b-key b-bytes b-type b-mime b-lfs
+                           a-key a-bytes a-type a-mime a-lfs
+                           bw bh b-kind aw ah a-kind)
+                ctx)
+               (`(,avail-w . ,max-h) (omnidiff-image--viewport-px)))
+    (when card-ov
+      (overlay-put card-ov 'omnidiff-image-rendered-width avail-w)
+      (overlay-put card-ov 'omnidiff-image-theme-rev (omnidiff-theme-revision)))
+    (when (eq status 'deferred)
+      (setf (omnidiff-image--state-deferred state) t))
+    (unless (memq status '(tty deferred))
+      (setf (omnidiff-image--state-deferred state) nil))
+    ;; Only count toward auto-load budget when at least one side actually renders.
+    (when (and initial-render-p (not force-p)
+               (memq status '(dual after-only before-only)))
+      (setq omnidiff-image--render-auto-count
+            (1+ omnidiff-image--render-auto-count)))
+    (pcase status
+      ('tty
+       (omnidiff-image--insert-tty-summary pic nil state nil))
+      ('deferred
+       (omnidiff-image--insert-tty-summary
+        pic
+        (format "Preview deferred (> %d auto-loaded images) — click or press L to load (C-u L all)"
+                omnidiff-image-auto-load-limit)
+        state t))
+      ('too-large
+       (omnidiff-image--insert-tty-summary
+        pic
+        (format "Image exceeds %s auto-load limit — click or press L to load"
+                (omnidiff-engine-format-bytes omnidiff-image-max-bytes))
+        state t))
+      ('dual
+       (omnidiff-image--insert-dual-card ctx avail-w max-h card-ov))
+      ('after-only
+       (omnidiff-image--insert-single-side
+        card-key 'after a-key a-bytes a-type a-mime
+        (omnidiff-picture-after pic) avail-w max-h state svg-p backdrop
+        (when dual-expected
+          (if b-lfs
+              "BEFORE is an unsmudged Git LFS pointer — showing AFTER only"
+            "BEFORE unavailable — showing AFTER only"))
+        (when (and aw ah) (list aw ah a-kind))))
+      ('before-only
+       (omnidiff-image--insert-single-side
+        card-key 'before b-key b-bytes b-type b-mime
+        (omnidiff-picture-before pic) avail-w max-h state svg-p backdrop
+        (when dual-expected
+          (if a-lfs
+              "AFTER is an unsmudged Git LFS pointer — showing BEFORE only"
+            "AFTER unavailable — showing BEFORE only"))
+        (when (and bw bh) (list bw bh b-kind))))
+      ('lfs-pointer
+       (omnidiff-image--insert-tty-summary
+        pic
+        "Git LFS image object is not materialized locally (run `git lfs pull')"
+        state nil))
+      ('unsupported
+       (omnidiff-image--insert-tty-summary
+        pic
+        "Emacs build does not support rendering this image format (press x for external viewer)"
+        state nil))
+      (_
+       (omnidiff-image--insert-tty-summary pic "Image blob unavailable" state nil)))))
 
 ;;; In-place card re-rendering, resize reflow & theme sync
 
-(defun omnidiff-image--card-ov-at (&optional pos)
+(defun omnidiff-image-card-ov-at (&optional pos)
   "Return the `omnidiff-image-ov' overlay enclosing POS (default point), or nil."
   (let ((p (or pos (point))))
     (or (get-text-property p 'omnidiff-image-ov)
@@ -3031,15 +3019,13 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
             (when file-ov
               (move-overlay file-ov (min (overlay-start file-ov) old-start)
                             (max (overlay-end file-ov) new-end)))
-            ;; Unfold a collapsed body ONLY on explicit user commands.
-            (when (and user-action-p
-                       (or (and hunk-ov (overlay-get hunk-ov 'invisible)
-                                (not (and file-ov (overlay-get file-ov 'invisible))))
-                           (and (null hunk-ov) file-ov (overlay-get file-ov 'invisible))))
-              (let ((target-ov (or hunk-ov file-ov)))
-                (overlay-put target-ov 'invisible nil)
-                (when-let* ((fold-ov (overlay-get target-ov 'omnidiff-fold-ov)))
-                  (overlay-put fold-ov 'display nil))))
+            ;; Unfold collapsed enclosing body/hunk overlays ONLY on explicit user commands.
+            (when user-action-p
+              (dolist (ov (list file-ov hunk-ov))
+                (when (and ov (overlay-get ov 'invisible))
+                  (overlay-put ov 'invisible nil)
+                  (when-let* ((fold-ov (overlay-get ov 'omnidiff-fold-ov)))
+                    (overlay-put fold-ov 'display nil)))))
             (delete-region old-start old-end)))
         (run-hook-with-args 'after-change-functions
                             (overlay-start card-ov) (overlay-end card-ov) old-len)
@@ -3055,48 +3041,73 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
         (when (and win orig-wstart)
           (set-window-start win orig-wstart t))))))
 
-(defun omnidiff-image--reflow-visible-cards (buf)
-  "Re-render visible image cards in BUF after a window resize or theme change."
+(defun omnidiff-image--sbs-reflow-pending-p ()
+  "Return non-nil when `omnidiff-mode' already scheduled a full SBS reflow."
+  (and (eq (or (and (boundp 'omnidiff--layout) omnidiff--layout)
+               (and (boundp 'omnidiff-default-layout) omnidiff-default-layout))
+           'side-by-side)
+       (boundp 'omnidiff--sbs-resize-timer)
+       (timerp omnidiff--sbs-resize-timer)))
+
+(defun omnidiff-image--reflow-cards (buf &optional theme-change-p)
+  "Re-render all non-deferred image cards in BUF after resize or theme change.
+When THEME-CHANGE-P is non-nil, reflows even when BUF is not displayed in
+a window so background buffers never retain stale theme colors."
   (when (buffer-live-p buf)
     (with-current-buffer buf
-      (setq omnidiff-image--resize-timer nil)
+      (unless theme-change-p
+        (setq omnidiff-image--resize-timer nil))
       (let* ((wins (get-buffer-window-list buf nil t))
-             (cur-w (car (omnidiff-image--viewport-px))))
-        (when (and wins (omnidiff-image--display-graphic-p))
-          (setq omnidiff-image--last-viewport-w cur-w)
+             (cur-w (car (omnidiff-image--viewport-px)))
+             (theme-rev (omnidiff-theme-revision)))
+        (when (and omnidiff-image-enabled
+                   (omnidiff-image--display-graphic-p)
+                   (or theme-change-p
+                       (and wins (not (omnidiff-image--sbs-reflow-pending-p)))))
+          (when wins
+            (setq omnidiff-image--last-viewport-w cur-w))
           (let ((cards nil))
-            (dolist (w wins)
-              (let ((beg (max (point-min) (- (window-start w) 200)))
-                    (end (min (point-max) (+ (window-end w t) 200))))
-                (dolist (ov (overlays-in beg end))
-                  (when (and (overlay-get ov 'omnidiff-image-ov)
-                             (not (memq ov cards)))
-                    (push ov cards)))))
-            (dolist (ov cards)
+            (save-restriction
+              (widen)
+              (dolist (ov (overlays-in (point-min) (point-max)))
+                (when (overlay-get ov 'omnidiff-image-ov)
+                  (push ov cards))))
+            (dolist (ov (nreverse cards))
               (when (overlay-buffer ov)
-                (omnidiff-image--rerender-card ov nil)))))))))
+                (let* ((file (overlay-get ov 'omnidiff-image-file))
+                       (state (and file (omnidiff-image--state-for file))))
+                  (when (and state
+                             (not (omnidiff-image--state-deferred state))
+                             (or theme-change-p
+                                 (not (eql (overlay-get ov 'omnidiff-image-theme-rev)
+                                           theme-rev))
+                                 (not (eql (overlay-get ov 'omnidiff-image-rendered-width)
+                                           cur-w))))
+                    (omnidiff-image--rerender-card ov nil)))))))))))
 
 (defun omnidiff-image-on-window-resize (&optional _frame-or-win)
-  "Debounced `window-size-change-functions' handler reflowing visible image cards."
+  "Debounced `window-size-change-functions' handler reflowing image cards."
   (when (and (derived-mode-p 'omnidiff-mode)
              omnidiff-image-enabled
              (omnidiff-image--display-graphic-p))
-    (let ((cur-w (car (omnidiff-image--viewport-px))))
-      (when (or (null omnidiff-image--last-viewport-w)
-                (> (abs (- cur-w omnidiff-image--last-viewport-w)) 24))
+    (if (omnidiff-image--sbs-reflow-pending-p)
         (omnidiff-image--cancel-resize-timer)
-        (setq omnidiff-image--resize-timer
-              (run-with-idle-timer 0.15 nil #'omnidiff-image--reflow-visible-cards
-                                   (current-buffer)))))))
+      (let ((cur-w (car (omnidiff-image--viewport-px))))
+        (when (or (null omnidiff-image--last-viewport-w)
+                  (> (abs (- cur-w omnidiff-image--last-viewport-w)) 24))
+          (omnidiff-image--cancel-resize-timer)
+          (setq omnidiff-image--resize-timer
+                (run-with-idle-timer 0.15 nil #'omnidiff-image--reflow-cards
+                                     (current-buffer))))))))
 
 (defun omnidiff-image-on-theme-change ()
-  "Invalidate theme-sensitive image caches and refresh visible image cards."
+  "Invalidate theme-sensitive image caches and refresh all image cards."
   (dolist (buf (buffer-list))
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (when (and (derived-mode-p 'omnidiff-mode) omnidiff-image--img-cache)
           (omnidiff-image--flush-descriptors)
-          (omnidiff-image--reflow-visible-cards buf))))))
+          (omnidiff-image--reflow-cards buf t))))))
 
 (add-hook 'omnidiff-theme-after-apply-hook #'omnidiff-image-on-theme-change)
 
@@ -3104,7 +3115,7 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
 
 (defun omnidiff-image--require-card ()
   "Return active image card overlay at point or signal `user-error'."
-  (or (omnidiff-image--card-ov-at)
+  (or (omnidiff-image-card-ov-at)
       (user-error "Point is not on an image diff card")))
 
 (defun omnidiff-image--card-capabilities (card-ov)
@@ -3112,44 +3123,51 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
   (let* ((file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (repo-dir (or (and (boundp 'omnidiff--repo-dir) omnidiff--repo-dir)
-                       default-directory))
-         (force-p (omnidiff-image--state-force-load state))
-         (b-bytes (omnidiff-image--fetch-side-bytes file pic 'before repo-dir force-p))
-         (a-bytes (omnidiff-image--fetch-side-bytes file pic 'after repo-dir force-p))
-         (b-ok (and (stringp b-bytes) (> (length b-bytes) 0)))
-         (a-ok (and (stringp a-bytes) (> (length a-bytes) 0))))
-    (if (and b-ok a-ok)
-        (let* ((b-tm (omnidiff-image--detect-type b-bytes (omnidiff-file-path file)))
-               (a-tm (omnidiff-image--detect-type a-bytes (omnidiff-file-target-path file)))
-               (b-type (car b-tm)) (b-mime (cdr b-tm))
-               (a-type (car a-tm)) (a-mime (cdr a-tm)))
-          (pcase-let* ((`(,bw ,bh ,_) (omnidiff-image--resolve-dims
-                                       (omnidiff-picture-before pic) b-bytes b-type))
-                       (`(,aw ,ah ,_) (omnidiff-image--resolve-dims
-                                       (omnidiff-picture-after pic) a-bytes a-type))
-                       (compat (omnidiff-image--compatible-overlay-p pic bw bh aw ah))
-                       (svg-embed-p (and (omnidiff-image--svg-embeddable-p b-mime)
-                                         (omnidiff-image--svg-embeddable-p a-mime)))
-                       (magick-p (and (omnidiff-image--magick-eligible-p
-                                       pic b-type a-type bw bh aw ah)
-                                      t)))
-            (list :dual t :compat compat :magick magick-p
-                  :bw bw :bh bh :aw aw :ah ah
-                  :modes (omnidiff-image--available-modes compat svg-embed-p magick-p))))
-      (list :dual nil :compat nil :magick nil :modes nil))))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (list :status (omnidiff-image--ctx-status ctx)
+          :dual (eq (omnidiff-image--ctx-status ctx) 'dual)
+          :compat (omnidiff-image--ctx-compat ctx)
+          :magick (omnidiff-image--ctx-magick-p ctx)
+          :bw (omnidiff-image--ctx-bw ctx)
+          :bh (omnidiff-image--ctx-bh ctx)
+          :aw (omnidiff-image--ctx-aw ctx)
+          :ah (omnidiff-image--ctx-ah ctx)
+          :modes (omnidiff-image--ctx-avail-modes ctx))))
+
+(defun omnidiff-image--status-message (status &optional need-dual-p dual-msg)
+  "Return user-facing message when card STATUS blocks a visual command, or nil."
+  (pcase status
+    ('tty "Visual image commands require a graphical display")
+    ('deferred "Preview deferred; press L to load")
+    ('too-large (format "Image exceeds %s limit; press L to force load"
+                        (omnidiff-engine-format-bytes omnidiff-image-max-bytes)))
+    ('lfs-pointer "Git LFS image object is not materialized locally")
+    ('unsupported "Emacs build does not support rendering this image format")
+    ('missing "Image blob unavailable")
+    ('dual nil)
+    (_
+     (when need-dual-p
+       (or dual-msg "Comparison modes require both BEFORE and AFTER images")))))
+
+(defun omnidiff-image--guard-status (ctx &optional need-dual-p dual-error)
+  "Signal a clear `user-error' when CTX cannot handle a visual image command."
+  (when-let* ((msg (omnidiff-image--status-message
+                    (omnidiff-image--ctx-status ctx) need-dual-p dual-error)))
+    (user-error "%s" msg)))
 
 (defun omnidiff-image-set-mode (mode)
   "Switch the image diff card at point to MODE."
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov))
-         (avail (plist-get caps :modes)))
-    (unless (plist-get caps :dual)
-      (user-error "Comparison modes require both BEFORE and AFTER images"))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil))
+         (avail (omnidiff-image--ctx-avail-modes ctx)))
+    (omnidiff-image--guard-status ctx t)
     (unless (memq mode avail)
       (user-error "Image diff mode `%s' is unavailable for this image pair" mode))
+    (when (eq mode 'diff)
+      (omnidiff-image--clear-failed-magick-cache))
     (setf (omnidiff-image--state-mode state) mode
           (omnidiff-image--state-mode-pinned state) t
           (omnidiff-image--state-prev-mode state) nil
@@ -3164,10 +3182,10 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
          (file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov))
-         (avail (plist-get caps :modes)))
-    (unless (plist-get caps :dual)
-      (user-error "Comparison modes require both BEFORE and AFTER images"))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil))
+         (avail (omnidiff-image--ctx-avail-modes ctx))
+         (compat (omnidiff-image--ctx-compat ctx)))
+    (omnidiff-image--guard-status ctx t)
     (if (and (eq (omnidiff-picture-comparison pic) 'identical)
              (not (omnidiff-image--state-expand-identical state))
              (null (omnidiff-image--state-mode state)))
@@ -3175,10 +3193,12 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
           (setf (omnidiff-image--state-expand-identical state) t)
           (omnidiff-image--rerender-card card-ov t)
           (message "Omnidiff image mode: %s"
-                   (omnidiff-image--effective-mode state (plist-get caps :compat))))
-      (let* ((cur (omnidiff-image--effective-mode state (plist-get caps :compat)))
+                   (omnidiff-image--effective-mode state compat)))
+      (let* ((cur (omnidiff-image--effective-mode state compat))
              (tail (cdr (memq cur avail)))
              (next (or (car tail) (car avail))))
+        (when (eq next 'diff)
+          (omnidiff-image--clear-failed-magick-cache))
         (setf (omnidiff-image--state-mode state) next
               (omnidiff-image--state-mode-pinned state) t
               (omnidiff-image--state-prev-mode state) nil
@@ -3221,16 +3241,21 @@ When USER-ACTION-P is non-nil, unfolds a collapsed enclosing hunk body."
   (interactive)
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov))
-         (avail-modes (plist-get caps :modes))
-         (avail-styles (omnidiff-image--available-diff-styles (plist-get caps :magick))))
-    (unless (plist-get caps :dual)
-      (user-error "Pixel diff styles require both BEFORE and AFTER images"))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil))
+         (avail-modes (omnidiff-image--ctx-avail-modes ctx))
+         (magick-p (omnidiff-image--ctx-magick-p ctx))
+         (avail-styles (omnidiff-image--available-diff-styles magick-p)))
+    (omnidiff-image--guard-status
+     ctx t "Pixel diff styles require both BEFORE and AFTER images")
     (unless (memq 'diff avail-modes)
       (user-error "Pixel diff mode is unavailable for this image pair"))
-    (let* ((in-diff (eq (omnidiff-image--effective-mode state (plist-get caps :compat)) 'diff))
-           (cur (omnidiff-image--effective-diff-style state (plist-get caps :magick)))
+    (omnidiff-image--clear-failed-magick-cache)
+    (let* ((in-diff (eq (omnidiff-image--effective-mode
+                         state (omnidiff-image--ctx-compat ctx))
+                        'diff))
+           (cur (omnidiff-image--effective-diff-style state magick-p))
            (pos (cl-position cur avail-styles))
            (next (if (and in-diff pos (> (length avail-styles) 1))
                      (nth (mod (1+ pos) (length avail-styles)) avail-styles)
@@ -3255,11 +3280,13 @@ When invoked from another mode, remembers it so `DEL' returns cleanly."
   (interactive)
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov)))
-    (unless (plist-get caps :dual)
-      (user-error "Cannot flip sides on a single-sided image"))
-    (let ((cur (omnidiff-image--effective-mode state (plist-get caps :compat))))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status
+     ctx t "Cannot flip sides on a single-sided image")
+    (let ((cur (omnidiff-image--effective-mode
+                state (omnidiff-image--ctx-compat ctx))))
       (unless (eq cur 'blink)
         (setf (omnidiff-image--state-prev-mode state) cur))
       (setf (omnidiff-image--state-mode state) 'blink
@@ -3277,7 +3304,7 @@ When invoked from another mode, remembers it so `DEL' returns cleanly."
 (defun omnidiff-image-return-from-peek ()
   "Return from temporary `b' blink peek, or scroll down like `special-mode'."
   (interactive)
-  (let* ((card-ov (omnidiff-image--card-ov-at))
+  (let* ((card-ov (omnidiff-image-card-ov-at))
          (file (and card-ov (overlay-get card-ov 'omnidiff-image-file)))
          (state (and file (omnidiff-image--state-for file)))
          (prev (and state (omnidiff-image--state-prev-mode state))))
@@ -3300,50 +3327,73 @@ When invoked from another mode, remembers it so `DEL' returns cleanly."
 (defun omnidiff-image--adjust (delta-sign &optional fine-p)
   "Adjust active mode parameter (swipe, onion, or diff gain/fuzz) by DELTA-SIGN.
 When FINE-P is non-nil, uses finer step increments."
-  (let* ((card-ov (omnidiff-image--require-card))
+  (let* ((arrow-p (memq (event-basic-type last-command-event) '(left right)))
+         (card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov))
-         (avail (plist-get caps :modes))
-         (cur (omnidiff-image--effective-mode state (plist-get caps :compat))))
-    (unless (plist-get caps :dual)
-      (user-error "Adjustment requires both BEFORE and AFTER images"))
-    (pcase cur
-      ('onion
-       (let* ((step (if fine-p (/ omnidiff-image-onion-step 2.0) omnidiff-image-onion-step))
-              (raw (+ (omnidiff-image--state-opacity state) (* delta-sign step)))
-              (val (max 0.0 (min 1.0 (/ (round (* raw 100.0)) 100.0)))))
-         (setf (omnidiff-image--state-opacity state) val)
-         (omnidiff-image--rerender-card card-ov t)
-         (message "Omnidiff onion opacity: %d%%" (round (* 100.0 val)))))
-      ('swipe
-       (let* ((src-w (max (or (plist-get caps :bw) 0) (or (plist-get caps :aw) 0)))
-              (step (if fine-p 0.01 omnidiff-image-swipe-step))
-              (cur-s (omnidiff-image--effective-swipe state pic src-w))
-              (raw (+ cur-s (* delta-sign step)))
-              (val (max 0.0 (min 1.0 (/ (round (* raw 100.0)) 100.0)))))
-         (setf (omnidiff-image--state-swipe state) val)
-         (omnidiff-image--rerender-card card-ov t)
-         (message "Omnidiff swipe split: %d%%" (round (* 100.0 val)))))
-      ('diff
-       (if (not (eq (omnidiff-image--effective-diff-style state (plist-get caps :magick)) 'delta))
-           (let* ((cur-f (or (omnidiff-image--state-diff-fuzz state) omnidiff-image-diff-fuzz))
-                  (next-f (omnidiff-image--step-in-list cur-f omnidiff-image--fuzz-steps delta-sign)))
-             (setf (omnidiff-image--state-diff-fuzz state) next-f)
-             (omnidiff-image--rerender-card card-ov t)
-             (message "Omnidiff diff fuzz: %d%%" next-f))
-         (let* ((cur-g (or (omnidiff-image--state-diff-gain state) omnidiff-image-diff-gain))
-                (next-g (omnidiff-image--step-in-list cur-g omnidiff-image--gain-steps delta-sign)))
-           (setf (omnidiff-image--state-diff-gain state) next-g)
-           (omnidiff-image--rerender-card card-ov t)
-           (message "Omnidiff SVG delta gain: ×%.1f" next-g))))
-      (_
-       (ignore avail)
-       (if (memq (event-basic-type last-command-event) '(left right))
-           (if (< delta-sign 0) (backward-char 1) (forward-char 1))
-         (message "Mode `%s' has no adjustable parameter (3:swipe, 5:onion, 4:diff)"
-                  cur))))))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil))
+         (status (omnidiff-image--ctx-status ctx)))
+    (cl-flet ((fallback-or-msg (msg &optional error-p)
+                (cond
+                 (arrow-p
+                  (if (< delta-sign 0) (backward-char 1) (forward-char 1)))
+                 (error-p (user-error "%s" msg))
+                 (t (message "%s" msg)))))
+      (if-let* ((block-msg (omnidiff-image--status-message
+                            status t "Adjustment requires both BEFORE and AFTER images")))
+          (fallback-or-msg block-msg (memq status '(after-only before-only)))
+        (if (and (eq (omnidiff-picture-comparison pic) 'identical)
+                 (not (omnidiff-image--state-expand-identical state))
+                 (null (omnidiff-image--state-mode state)))
+            (fallback-or-msg "Identical image preview; press i to expand comparison modes")
+          (let ((cur (omnidiff-image--effective-mode state (omnidiff-image--ctx-compat ctx))))
+          (pcase cur
+            ('onion
+             (let* ((step (if fine-p (/ omnidiff-image--onion-step 2.0)
+                            omnidiff-image--onion-step))
+                    (raw (+ (omnidiff-image--state-opacity state) (* delta-sign step)))
+                    (val (max 0.0 (min 1.0 (/ (round (* raw 100.0)) 100.0)))))
+               (setf (omnidiff-image--state-opacity state) val)
+               (omnidiff-image--rerender-card card-ov t)
+               (message "Omnidiff onion opacity: %d%%" (round (* 100.0 val)))))
+            ('swipe
+             (let* ((reg-w (car (omnidiff-image--region-grid-dims
+                                 pic
+                                 (or (omnidiff-image--ctx-bw ctx) 0)
+                                 (or (omnidiff-image--ctx-bh ctx) 0)
+                                 (or (omnidiff-image--ctx-aw ctx) 0)
+                                 (or (omnidiff-image--ctx-ah ctx) 0))))
+                    (step (if fine-p 0.01 omnidiff-image--swipe-step))
+                    (cur-s (omnidiff-image--effective-swipe state pic reg-w))
+                    (raw (+ cur-s (* delta-sign step)))
+                    (val (max 0.0 (min 1.0 (/ (round (* raw 100.0)) 100.0)))))
+               (setf (omnidiff-image--state-swipe state) val)
+               (omnidiff-image--rerender-card card-ov t)
+               (message "Omnidiff swipe split: %d%%" (round (* 100.0 val)))))
+            ('diff
+             (if (not (eq (omnidiff-image--effective-diff-style
+                           state (omnidiff-image--ctx-magick-p ctx))
+                          'delta))
+                 (let* ((cur-f (or (omnidiff-image--state-diff-fuzz state)
+                                   omnidiff-image-diff-fuzz))
+                        (next-f (omnidiff-image--step-in-list
+                                 cur-f omnidiff-image--fuzz-steps delta-sign)))
+                   (omnidiff-image--clear-failed-magick-cache)
+                   (setf (omnidiff-image--state-diff-fuzz state) next-f)
+                   (omnidiff-image--rerender-card card-ov t)
+                   (message "Omnidiff diff fuzz: %d%%" next-f))
+               (let* ((cur-g (or (omnidiff-image--state-diff-gain state)
+                                 omnidiff-image-diff-gain))
+                      (next-g (omnidiff-image--step-in-list
+                               cur-g omnidiff-image--gain-steps delta-sign)))
+                 (setf (omnidiff-image--state-diff-gain state) next-g)
+                 (omnidiff-image--rerender-card card-ov t)
+                 (message "Omnidiff SVG delta gain: ×%.1f" next-g))))
+            (_
+             (fallback-or-msg
+              (format "Mode `%s' has no adjustable parameter (3:swipe, 5:onion, 4:diff)"
+                      cur))))))))))
 
 (defun omnidiff-image-adjust-decrease (&optional arg)
   "Decrease swipe split, onion opacity, or diff gain/fuzz.
@@ -3372,27 +3422,58 @@ With prefix ARG, use fine increments."
   (interactive)
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (caps (omnidiff-image--card-capabilities card-ov))
-         (cur (omnidiff-image--effective-mode state (plist-get caps :compat))))
-    (unless (plist-get caps :dual)
-      (user-error "No adjustable parameter on a single-sided image"))
-    (pcase cur
-      ('onion
-       (setf (omnidiff-image--state-opacity state) 0.5)
-       (omnidiff-image--rerender-card card-ov t)
-       (message "Omnidiff onion opacity: 50%%"))
-      ('swipe
-       (setf (omnidiff-image--state-swipe state) 0.5)
-       (omnidiff-image--rerender-card card-ov t)
-       (message "Omnidiff swipe split: 50%%"))
-      ('diff
-       (setf (omnidiff-image--state-diff-gain state) nil
-             (omnidiff-image--state-diff-fuzz state) nil)
-       (omnidiff-image--rerender-card card-ov t)
-       (message "Omnidiff diff parameters reset to default"))
-      (_
-       (user-error "No adjustable parameter in `%s' mode" cur)))))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status
+     ctx t "No adjustable parameter on a single-sided image")
+    (when (and (eq (omnidiff-picture-comparison pic) 'identical)
+               (not (omnidiff-image--state-expand-identical state))
+               (null (omnidiff-image--state-mode state)))
+      (user-error "Identical image preview; press i to expand comparison modes"))
+    (let ((cur (omnidiff-image--effective-mode
+                state (omnidiff-image--ctx-compat ctx))))
+      (pcase cur
+        ('onion
+         (setf (omnidiff-image--state-opacity state) 0.5)
+         (omnidiff-image--rerender-card card-ov t)
+         (message "Omnidiff onion opacity: 50%%"))
+        ('swipe
+         (setf (omnidiff-image--state-swipe state) 0.5)
+         (omnidiff-image--rerender-card card-ov t)
+         (message "Omnidiff swipe split: 50%%"))
+        ('diff
+         (omnidiff-image--clear-failed-magick-cache)
+         (setf (omnidiff-image--state-diff-gain state) nil
+               (omnidiff-image--state-diff-fuzz state) nil)
+         (omnidiff-image--rerender-card card-ov t)
+         (message "Omnidiff diff parameters reset to default"))
+        (_
+         (user-error "No adjustable parameter in `%s' mode" cur))))))
+
+(defun omnidiff-image--posn-frame-x (posn ref-win)
+  "Return frame-absolute pixel X coordinate for POSN on REF-WIN's frame, or nil."
+  (when posn
+    (let ((w (posn-window posn))
+          (xy (posn-x-y posn))
+          (ref-frame (window-frame ref-win)))
+      (when (consp xy)
+        (cond
+         ((and (windowp w) (eq (window-frame w) ref-frame))
+          (let ((area (posn-area posn)))
+            (cond
+             ((null area)
+              (+ (car (window-inside-pixel-edges w)) (car xy)))
+             ((let ((mp (mouse-pixel-position)))
+                (and (eq (car mp) ref-frame) (numberp (cadr mp))))
+              (cadr (mouse-pixel-position)))
+             ((memq area '(right-fringe right-margin vertical-scroll-bar vertical-line))
+              (+ (nth 2 (window-inside-pixel-edges w)) (car xy)))
+             (t
+              (+ (car (window-pixel-edges w)) (car xy))))))
+         ((eq w ref-frame)
+          (car xy))
+         (t nil))))))
 
 (defun omnidiff-image-swipe-mouse-drag (event)
   "Click or drag on a swipe image to position the BEFORE/AFTER curtain."
@@ -3403,7 +3484,7 @@ With prefix ARG, use fine increments."
          (buf (and win (window-buffer win))))
     (when (and buf (integerp pt))
       (with-current-buffer buf
-        (when-let* ((card-ov (omnidiff-image--card-ov-at pt))
+        (when-let* ((card-ov (omnidiff-image-card-ov-at pt))
                     (geom (get-text-property pt 'omnidiff-swipe-geometry))
                     (img-start (car geom))
                     (disp-w (cdr geom)))
@@ -3411,7 +3492,7 @@ With prefix ARG, use fine increments."
             (let* ((file (overlay-get card-ov 'omnidiff-image-file))
                    (state (omnidiff-image--state-for file))
                    (origin-posn (posn-at-point img-start win))
-                   (left-x (and origin-posn (car (posn-x-y origin-posn)))))
+                   (left-x (omnidiff-image--posn-frame-x origin-posn win)))
               (when (numberp left-x)
                 (cl-flet ((apply-x (mx)
                             (let* ((frac (max 0.0 (min 1.0 (/ (float (- mx left-x))
@@ -3421,33 +3502,48 @@ With prefix ARG, use fine increments."
                                 (setf (omnidiff-image--state-swipe state) quant)
                                 (omnidiff-image--rerender-card card-ov t)))))
                   (goto-char (overlay-start card-ov))
-                  (when-let* ((mx (car (posn-x-y start))))
+                  (when-let* ((mx (omnidiff-image--posn-frame-x start win)))
                     (apply-x mx))
                   (track-mouse
                     (let ((ev (read-event)))
                       (while (mouse-movement-p ev)
-                        (when-let* ((mx (car (posn-x-y (event-start ev)))))
+                        ;; Coalesce queued consecutive mouse-movement events.
+                        (while (and (input-pending-p)
+                                    (let ((next (read-event nil nil 0)))
+                                      (cond
+                                       ((mouse-movement-p next)
+                                        (setq ev next)
+                                        t)
+                                       (next
+                                        (push next unread-command-events)
+                                        nil)
+                                       (t nil)))))
+                        (when-let* ((mx (omnidiff-image--posn-frame-x
+                                         (event-start ev) win)))
                           (apply-x mx))
-                        (setq ev (read-event))))))))))))))
+                        (setq ev (read-event)))
+                      (when (and ev (not (memq (event-basic-type ev)
+                                               '(mouse-1 drag-mouse-1))))
+                        (push ev unread-command-events)))))))))))))
 
 ;;; Zoom & backdrop controls
 
-(defun omnidiff-image--current-effective-zoom (card-ov)
-  "Return current display/source zoom ratio for CARD-OV."
+(defun omnidiff-image--current-effective-zoom (card-ov &optional ctx)
+  "Return current display/source zoom ratio for CARD-OV (reusing optional CTX)."
   (let* ((file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file)))
     (or (omnidiff-image--state-zoom state)
-        (let* ((caps (omnidiff-image--card-capabilities card-ov))
+        (let* ((resolved (or ctx (omnidiff-image--resolve-card-context file pic state nil)))
                (b-info (omnidiff-picture-before pic))
                (a-info (omnidiff-picture-after pic))
-               (w (max (or (plist-get caps :bw) 0)
-                       (or (plist-get caps :aw) 0)
+               (w (max (or (omnidiff-image--ctx-bw resolved) 0)
+                       (or (omnidiff-image--ctx-aw resolved) 0)
                        (if a-info (omnidiff-picture-info-width a-info) 0)
                        (if b-info (omnidiff-picture-info-width b-info) 0)
                        1))
-               (h (max (or (plist-get caps :bh) 0)
-                       (or (plist-get caps :ah) 0)
+               (h (max (or (omnidiff-image--ctx-bh resolved) 0)
+                       (or (omnidiff-image--ctx-ah resolved) 0)
                        (if a-info (omnidiff-picture-info-height a-info) 0)
                        (if b-info (omnidiff-picture-info-height b-info) 0)
                        1))
@@ -3460,8 +3556,11 @@ With prefix ARG, use fine increments."
   "Step magnification by DELTA-SIGN (-1 out, +1 in) on the current image card."
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (cur (omnidiff-image--current-effective-zoom card-ov))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status ctx nil)
+    (let* ((cur (omnidiff-image--current-effective-zoom card-ov ctx))
          (next (if (> delta-sign 0)
                    (or (cl-find-if (lambda (z) (> z (+ cur 0.04)))
                                    omnidiff-image--zoom-steps)
@@ -3469,9 +3568,9 @@ With prefix ARG, use fine increments."
                  (or (cl-find-if (lambda (z) (< z (- cur 0.04)))
                                  (reverse omnidiff-image--zoom-steps))
                      (car omnidiff-image--zoom-steps)))))
-    (setf (omnidiff-image--state-zoom state) next)
-    (omnidiff-image--rerender-card card-ov t)
-    (message "Omnidiff image zoom: %d%% (0 to fit)" (round (* 100.0 next)))))
+      (setf (omnidiff-image--state-zoom state) next)
+      (omnidiff-image--rerender-card card-ov t)
+      (message "Omnidiff image zoom: %d%% (0 to fit)" (round (* 100.0 next))))))
 
 (defun omnidiff-image-zoom-in ()
   "Zoom in on the image diff card at point."
@@ -3488,7 +3587,10 @@ With prefix ARG, use fine increments."
   (interactive)
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
-         (state (omnidiff-image--state-for file)))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
+         (state (omnidiff-image--state-for file))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status ctx nil)
     (setf (omnidiff-image--state-zoom state) nil)
     (omnidiff-image--rerender-card card-ov t)
     (message "Omnidiff image zoom: fit")))
@@ -3498,17 +3600,20 @@ With prefix ARG, use fine increments."
   (interactive)
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
+         (pic (overlay-get card-ov 'omnidiff-image-picture))
          (state (omnidiff-image--state-for file))
-         (cur (or (omnidiff-image--state-backdrop state) 'auto))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status ctx nil)
+    (let* ((cur (or (omnidiff-image--state-backdrop state) omnidiff-image-backdrop))
          (next (pcase cur
                  ('auto 'checker)
                  ('checker 'light)
                  ('light 'dark)
                  ('dark 'none)
                  (_ 'auto))))
-    (setf (omnidiff-image--state-backdrop state) next)
-    (omnidiff-image--rerender-card card-ov t)
-    (message "Omnidiff image backdrop: %s" next)))
+      (setf (omnidiff-image--state-backdrop state) next)
+      (omnidiff-image--rerender-card card-ov t)
+      (message "Omnidiff image backdrop: %s" next))))
 
 ;;; Changed-region navigation
 
@@ -3518,10 +3623,11 @@ With prefix ARG, use fine increments."
   (let* ((card-ov (omnidiff-image--require-card))
          (file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
-         (state (omnidiff-image--state-for file)))
+         (state (omnidiff-image--state-for file))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
     (unless (or (omnidiff-picture-regions pic) (> (omnidiff-picture-region-count pic) 0))
       (user-error "No changed pixel regions recorded for this image"))
-    (if (and omnidiff-image-enabled (omnidiff-image--display-graphic-p))
+    (if (eq (omnidiff-image--ctx-status ctx) 'dual)
         (setf (omnidiff-image--state-show-regions state)
               (not (omnidiff-image--state-show-regions state))
               (omnidiff-image--state-expand-identical state) t)
@@ -3535,7 +3641,10 @@ With prefix ARG, use fine increments."
          (file (overlay-get card-ov 'omnidiff-image-file))
          (pic (overlay-get card-ov 'omnidiff-image-picture))
          (regions (omnidiff-picture-regions pic))
-         (state (omnidiff-image--state-for file)))
+         (state (omnidiff-image--state-for file))
+         (ctx (omnidiff-image--resolve-card-context file pic state nil)))
+    (omnidiff-image--guard-status
+     ctx t "Region loupe requires both BEFORE and AFTER images")
     (unless regions
       (user-error "No listed changed regions for this image"))
     (let ((clamped (mod idx (length regions))))
@@ -3589,26 +3698,6 @@ With prefix argument ALL-P, load all deferred image cards in the buffer."
             (omnidiff-image--state-deferred state) nil)
       (omnidiff-image--rerender-card card-ov t))))
 
-(defun omnidiff-image--unstaged-worktree-diff-p ()
-  "Return non-nil when the current buffer displays an unstaged working-tree diff."
-  (let ((cmd (and (boundp 'omnidiff--command) omnidiff--command)))
-    (and (consp cmd)
-         (proper-list-p cmd)
-         (equal (nth 0 cmd) "git")
-         (equal (nth 2 cmd) "diff")
-         (let ((tail (nthcdr 4 cmd))
-               (non-worktree nil))
-           (while (and tail (not non-worktree))
-             (let ((arg (pop tail)))
-               (cond
-                ((not (stringp arg)) (setq non-worktree t))
-                ((string= arg "--") (setq tail nil))
-                ((or (member arg '("--cached" "--staged"))
-                     (string-search ".." arg)
-                     (not (string-prefix-p "-" arg)))
-                 (setq non-worktree t)))))
-           (not non-worktree)))))
-
 (defun omnidiff-image--open-disk-path-other-window (path side &optional file repo-dir)
   "Open existing regular disk file PATH for SIDE in another window.
 For temporary paths or Git LFS pointer files, opens the copied/smudged
@@ -3617,7 +3706,8 @@ ephemeral temp files are never visited directly and LFS images open decoded.
 Otherwise opens `before' read-only and real `after' files directly."
   (when-let* ((valid (omnidiff-image--valid-disk-path path)))
     (cond
-     ((or (omnidiff-image--temp-path-p valid)
+     ((or (file-in-directory-p valid temporary-file-directory)
+          (and (file-directory-p "/tmp") (file-in-directory-p valid "/tmp"))
           (omnidiff-image--disk-file-lfs-pointer-p valid))
       (when file
         (omnidiff-image-open-blob-other-window file side repo-dir)))
@@ -3690,7 +3780,7 @@ Otherwise opens `before' read-only and real `after' files directly."
 (defun omnidiff-image-jump-at-point ()
   "Handle `RET' on an image diff card, opening the exact compared version.
 Returns non-nil if handled."
-  (when-let* ((card-ov (omnidiff-image--card-ov-at)))
+  (when-let* ((card-ov (omnidiff-image-card-ov-at)))
     (let* ((file (overlay-get card-ov 'omnidiff-image-file))
            (pic (overlay-get card-ov 'omnidiff-image-picture))
            (state (omnidiff-image--state-for file))
@@ -3710,7 +3800,7 @@ Returns non-nil if handled."
                         (omnidiff-file-path file)
                       (omnidiff-file-target-path file)))
                (full (when (and repo-dir rel (not (string-empty-p rel)))
-                       (omnidiff-image--expand-path rel repo-dir))))
+                       (omnidiff-engine-expand-repo-path rel repo-dir))))
           (cond
            ;; Direct disk-path pair (non-Git or extracted member) when OID is nil.
            ((and (null oid)
@@ -3720,7 +3810,8 @@ Returns non-nil if handled."
            ;; (or open decoded blob if temporary or a Git LFS pointer).
            ((and (eq side 'after)
                  (or (null oid)
-                     (omnidiff-image--unstaged-worktree-diff-p))
+                     (omnidiff-engine-unstaged-worktree-diff-p
+                      (and (boundp 'omnidiff--command) omnidiff--command)))
                  full
                  (omnidiff-image--valid-disk-path full))
             (omnidiff-image--open-disk-path-other-window full side file repo-dir))
@@ -3729,7 +3820,8 @@ Returns non-nil if handled."
             t)
            ((and full
                  (omnidiff-image--valid-disk-path full)
-                 (not (omnidiff-image--temp-path-p full))
+                 (not (file-in-directory-p full temporary-file-directory))
+                 (not (and (file-directory-p "/tmp") (file-in-directory-p full "/tmp")))
                  (not (omnidiff-image--disk-file-lfs-pointer-p full)))
             (find-file-other-window full)
             t)
@@ -3737,16 +3829,18 @@ Returns non-nil if handled."
 
 (defun omnidiff-image--external-viewer-argv ()
   "Return base argv list for opening an external image viewer, or nil."
-  (cond
-   ((listp omnidiff-image-external-viewer)
-    omnidiff-image-external-viewer)
-   ((stringp omnidiff-image-external-viewer)
-    (list omnidiff-image-external-viewer))
-   ((and (eq system-type 'darwin) (executable-find "open"))
-    (list (executable-find "open")))
-   ((executable-find "xdg-open")
-    (list (executable-find "xdg-open")))
-   (t nil)))
+  (let (bin)
+    (cond
+     ((consp omnidiff-image-external-viewer)
+      omnidiff-image-external-viewer)
+     ((and (stringp omnidiff-image-external-viewer)
+           (not (string-empty-p omnidiff-image-external-viewer)))
+      (list omnidiff-image-external-viewer))
+     ((and (eq system-type 'darwin) (setq bin (executable-find "open")))
+      (list bin))
+     ((setq bin (executable-find "xdg-open"))
+      (list bin))
+     (t nil))))
 
 (defun omnidiff-image-open-external ()
   "Export the active image version(s) to temp files and open in system viewer."
@@ -3785,7 +3879,10 @@ Returns non-nil if handled."
     (setq paths (nreverse paths))
     (unless paths
       (user-error "No image data available to open externally"))
-    (apply #'start-process "omnidiff-ext-viewer" nil (append viewer paths))
+    (if (string= (file-name-nondirectory (car viewer)) "xdg-open")
+        (dolist (p paths)
+          (apply #'start-process "omnidiff-ext-viewer" nil (append viewer (list p))))
+      (apply #'start-process "omnidiff-ext-viewer" nil (append viewer paths)))
     (message "Opened %s externally" (string-join (mapcar #'file-name-nondirectory paths) ", "))))
 
 ;;; Public entry points for `omnidiff-render' & `omnidiff'
@@ -3821,71 +3918,14 @@ render alongside XML hunks only in graphical frames."
            (image-type-available-p 'svg))
     t))
 
-(defun omnidiff-image--probe-picture-info (path)
-  "Probe `omnidiff-picture-info' for existing regular file PATH, or nil."
-  (when-let* ((valid (omnidiff-image--valid-disk-path path)))
-    (let* ((abs (expand-file-name valid))
-           (attrs (file-attributes (file-truename abs)))
-           (sz (or (and attrs (file-attribute-size attrs)) 0))
-           (head (let ((file-name-handler-alist nil))
-                   (ignore-errors
-                     (with-temp-buffer
-                       (set-buffer-multibyte nil)
-                       (insert-file-contents-literally abs nil 0 65536)
-                       (buffer-string)))))
-           (tm (when head (omnidiff-image--detect-type head abs)))
-           (type (car tm))
-           (dims (or (when (and head type)
-                       (omnidiff-image--probe-bytes-dims head type))
-                     (when (and type
-                                (omnidiff-image--display-graphic-p)
-                                (image-type-available-p type)
-                                (or (<= omnidiff-image-max-bytes 0)
-                                    (<= sz omnidiff-image-max-bytes)))
-                       (ignore-errors
-                         (let ((d (image-size (create-image abs type) t)))
-                           (when (and (consp d) (> (car d) 0) (> (cdr d) 0))
-                             (cons (round (car d)) (round (cdr d)))))))))
-           (fmt (pcase type
-                  ('png "PNG")
-                  ('jpeg "JPEG")
-                  ('gif "GIF")
-                  ('webp "WebP")
-                  ('tiff "TIFF")
-                  ('bmp "BMP")
-                  ('ico "ICO")
-                  ('heic "HEIC")
-                  ('svg "SVG")
-                  (_ (let ((ext (file-name-extension abs)))
-                       (if (and ext (not (string-empty-p ext)))
-                           (upcase ext)
-                         "IMG")))))
-           (color (when (and (eq type 'png) (stringp head) (>= (length head) 26)
-                             (string-prefix-p omnidiff-image--png-magic head))
-                    (let ((depth (aref head 24))
-                          (ctype (aref head 25)))
-                      (pcase ctype
-                        (0 (format "Gray%d" depth))
-                        (2 (format "RGB%d" depth))
-                        (3 "Indexed")
-                        (4 (format "GrayA%d" depth))
-                        (6 (format "RGBA%d" depth))
-                        (_ nil))))))
-      (make-omnidiff-picture-info
-       :format fmt
-       :width (or (car dims) 0)
-       :height (or (cdr dims) 0)
-       :color color
-       :bytes sz))))
-
 (defun omnidiff-image-make-file-from-paths (before-path after-path
                                                         &optional picture display-path)
   "Construct an `omnidiff-file' for a standalone image pair on disk.
 BEFORE-PATH and AFTER-PATH are filesystem paths (or nil / `\"/dev/null\"' for
 added/deleted images).  When PICTURE is provided (e.g. an `omnidiff-picture'
 parsed from JSON), it is attached directly; otherwise a minimal
-`omnidiff-picture' is constructed by probing image headers when possible.
-Optional DISPLAY-PATH overrides `:path' and `:target-path'."
+`omnidiff-picture' is constructed.  Optional DISPLAY-PATH overrides `:path'
+and `:target-path'."
   (let* ((before-present (and (stringp before-path)
                               (not (string-empty-p before-path))
                               (not (string= before-path "/dev/null"))))
@@ -3903,23 +3943,17 @@ Optional DISPLAY-PATH overrides `:path' and `:target-path'."
          (path (or disp before-disk after-disk ""))
          (target (or disp after-disk before-disk ""))
          (pic (or picture
-                  (let* ((b-info (when before-disk
-                                   (omnidiff-image--probe-picture-info before-disk)))
-                         (a-info (when after-disk
-                                   (omnidiff-image--probe-picture-info after-disk)))
-                         (svg-p (or (and b-info (string= (omnidiff-picture-info-format b-info) "SVG"))
-                                    (and a-info (string= (omnidiff-picture-info-format a-info) "SVG"))
-                                    (and (null b-info) (null a-info)
-                                         (or (omnidiff-image--svg-path-p before-disk)
-                                             (omnidiff-image--svg-path-p after-disk)
-                                             (omnidiff-image--svg-path-p disp)))))
+                  (let* ((svg-p (or (omnidiff-image--svg-path-p before-disk)
+                                    (omnidiff-image--svg-path-p after-disk)
+                                    (omnidiff-image--svg-path-p disp)))
+                         (fmt (if svg-p "SVG" ""))
                          (comp (cond
                                 ((memq status '(added deleted)) 'one-sided)
                                 (svg-p 'svg)
                                 (t 'unknown))))
                     (make-omnidiff-picture
-                     :before b-info
-                     :after a-info
+                     :before (when before-disk (make-omnidiff-picture-info :format fmt))
+                     :after (when after-disk (make-omnidiff-picture-info :format fmt))
                      :comparison comp
                      :svg-p svg-p)))))
     (make-omnidiff-file
@@ -3928,11 +3962,11 @@ Optional DISPLAY-PATH overrides `:path' and `:target-path'."
      :status status
      :before-disk-path before-disk
      :after-disk-path after-disk
-     :picture pic)))
+     :json-diff (make-omnidiff-json-diff :picture pic))))
 
 (defun omnidiff-image--menu-state-summary ()
   "Return concise live status header for `omnidiff-image-menu'."
-  (if-let* ((ov (omnidiff-image--card-ov-at))
+  (if-let* ((ov (omnidiff-image-card-ov-at))
             (file (overlay-get ov 'omnidiff-image-file))
             (state (omnidiff-image--state-for file)))
       (let* ((mode (or (omnidiff-image--state-mode state) 'auto))
